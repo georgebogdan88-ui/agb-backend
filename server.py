@@ -503,8 +503,7 @@ async def get_products(
                     # Check if term looks like a model number (4 digits optionally followed by letters)
                     is_model_search = bool(re.match(r'^\d{4}[a-z]*$', term, re.IGNORECASE))
                     
-
-            if is_model_search:
+                    if is_model_search:
                         # For model numbers, search more precisely
                         # Match exact model or model followed by space/end (not followed by more letters)
                         # This prevents "6210" from matching "6210R" but allows "6210" to match "6210 M" or "6210"
