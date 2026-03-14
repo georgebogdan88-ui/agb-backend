@@ -503,7 +503,6 @@ async def get_products(
                     # Check if term looks like a model number (4 digits optionally followed by letters)
                     is_model_search = bool(re.match(r'^\d{4}[a-z]*$', term, re.IGNORECASE))
                     
-                    4. Găsește acest bloc (în jurul liniei 506-515):
 
             if is_model_search:
                         # For model numbers, search more precisely
