@@ -206,15 +206,33 @@ def extract_compatible_models(description: str) -> List[str]:
     
     models = set()
     
+    # Normalize "PR" to "Premium" for consistent indexing
+    description_normalized = re.sub(r'\b(\d{4})\s*PR\b', r'\1 Premium', description, flags=re.IGNORECASE)
+    
+    # First, try to split by comma and extract individual models
+    # This handles format like "6810, 6910, 6910S" or "6820, 6920, 6920S"
+    parts = description_normalized.split(',')
+    for part in parts:
+        part = part.strip()
+        # Check if this looks like a model number
+        if re.match(r'^[\d]{3,4}[A-Za-z]*\s*[A-Za-z]*$', part):
+            # Clean up spaces
+            model = part.replace(' ', '')
+            if len(model) >= 3 and len(model) <= 20:
+                models.add(model)
+        # Also check for SE models
+        elif re.match(r'^SE\d{4}$', part, re.IGNORECASE):
+            models.add(part.upper())
+    
     # Pattern 1: Extract full model names between commas (e.g., "6150 M", "7530 Premium")
     # Look for patterns like ", 6150 M ," or ", 7530 Premium ,"
     comma_pattern = r',\s*(\d{4}\s*[A-Za-z]*(?:\s+[A-Za-z]+)?)\s*,'
-    comma_matches = re.findall(comma_pattern, description, re.IGNORECASE)
+    comma_matches = re.findall(comma_pattern, description_normalized, re.IGNORECASE)
     for match in comma_matches:
         # Clean up: remove extra spaces and format properly
         model = ' '.join(match.split())  # Normalize spaces
         model = model.replace(' ', '')  # Remove spaces for storage (e.g., "6150 M" -> "6150M")
-        if len(model) >= 4:
+        if len(model) >= 3:
             models.add(model)
     
     # Pattern 2: Standard model patterns with full text
@@ -223,18 +241,21 @@ def extract_compatible_models(description: str) -> List[str]:
         r'\b(\d{4}\s*Premium)\b',          # e.g., "7530 Premium"
         r'\b(\d{4}\s*[A-Z]\s*Premium)\b',  # e.g., "6150 M Premium"
         r'\b(SE\s*\d{4})\b',               # e.g., "SE6400"
-        r'\b(\d{4}[RMEST]?)\b',            # e.g., "6630", "6630R", "6630M"
+        r'\b(\d{4}[RMESTXDNJHL]?)\b',      # e.g., "6630", "6630R", "6920S", "6920"
+        r'\b(\d{3,4}[A-Z]{0,2})\b',        # e.g., "6920", "6920S", "5045D"
     ]
     
     for pattern in patterns:
-        matches = re.findall(pattern, description, re.IGNORECASE)
+        matches = re.findall(pattern, description_normalized, re.IGNORECASE)
         for match in matches:
             # Clean up: remove extra spaces
             model = match.replace(' ', '')
-            if len(model) >= 4:
-                models.add(model)
+            if len(model) >= 3 and len(model) <= 15:
+                # Exclude things that are clearly not models (years, random numbers)
+                if not model.isdigit() or (len(model) == 4 and 1000 <= int(model) <= 9999):
+                    models.add(model)
     
-    return list(models)[:50]
+    return list(models)[:100]  # Increased limit to 100
 
 # ==================== SHOPIFY SYNC ====================
 
@@ -330,7 +351,18 @@ def parse_shopify_node(node: dict) -> dict:
     
     title = node.get("title", "")
     description = node.get("description", "")
+    tags = node.get("tags", [])
+    
+    # Extract compatible models from description AND tags
     compatible_models = extract_compatible_models(description)
+    
+    # Also extract models from tags
+    for tag in tags:
+        tag_models = extract_compatible_models(tag)
+        for m in tag_models:
+            if m not in compatible_models:
+                compatible_models.append(m)
+    
     product_id = node["id"].replace("gid://shopify/Product/", "")
     
     # Determine stock status
