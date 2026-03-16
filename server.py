@@ -525,8 +525,19 @@ async def get_products(
             query["product_type"] = product_type
         
         if search:
-            # Normalize search terms
+            # Normalize search terms and handle "Premium" variations
+            # Convert "6930 Premium" to search for both "6930Premium" and "6930PR"
+            search_normalized = search
+            
+            # Handle "Premium" -> also search for "PR" variant
+            premium_pattern = re.compile(r'(\d{4})\s*Premium', re.IGNORECASE)
+            premium_matches = premium_pattern.findall(search)
+            
             search_terms = [normalize_text(term) for term in search.split() if term.strip()]
+            
+            # Remove "premium" from search terms if it was part of a model number
+            if premium_matches:
+                search_terms = [t for t in search_terms if t.lower() != 'premium']
             
             if search_terms:
                 # Build regex patterns for each term
@@ -540,13 +551,22 @@ async def get_products(
                         # Match exact model or model followed by space/end (not followed by more letters)
                         # This prevents "6210" from matching "6210R" but allows "6210" to match "6210 M" or "6210"
                         model_regex = f"^{term}(?![A-Za-z])"  # Negative lookahead: not followed by letters
-                        regex_conditions.append({
-                            "$or": [
-                                {"title_normalized": {"$regex": f"\\b{term}\\b", "$options": "i"}},
-                                {"description_normalized": {"$regex": f"\\b{term}\\b", "$options": "i"}},
-                                {"compatible_models": {"$regex": model_regex, "$options": "i"}},
-                            ]
-                        })
+                        
+                        # Also search for Premium variant if this model was part of "XXXX Premium" search
+                        model_conditions = [
+                            {"title_normalized": {"$regex": f"\\b{term}\\b", "$options": "i"}},
+                            {"description_normalized": {"$regex": f"\\b{term}\\b", "$options": "i"}},
+                            {"compatible_models": {"$regex": model_regex, "$options": "i"}},
+                        ]
+                        
+                        # If searching for a model that was part of "Premium" search, also look for Premium/PR variants
+                        if term in [m.lower() for m in premium_matches]:
+                            model_conditions.extend([
+                                {"compatible_models": {"$regex": f"^{term}Premium", "$options": "i"}},
+                                {"compatible_models": {"$regex": f"^{term}PR", "$options": "i"}},
+                            ])
+                        
+                        regex_conditions.append({"$or": model_conditions})
                     else:
                         # For regular terms, search normally
                         regex_conditions.append({
