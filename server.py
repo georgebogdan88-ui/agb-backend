@@ -33,7 +33,7 @@ SHOPIFY_API_VERSION = os.environ.get('SHOPIFY_API_VERSION', '2024-01')
 SHOPIFY_WEBHOOK_SECRET = os.environ.get('SHOPIFY_WEBHOOK_SECRET', '')
 
 # Auto-sync configuration
-AUTO_SYNC_INTERVAL_HOURS = int(os.environ.get('AUTO_SYNC_INTERVAL_HOURS', '6'))
+AUTO_SYNC_INTERVAL_MINUTES = int(os.environ.get('AUTO_SYNC_INTERVAL_MINUTES', '5'))  # Default 5 minutes
 
 # Create the main app without a prefix
 app = FastAPI()
@@ -1967,7 +1967,7 @@ async def get_webhook_status():
     return {
         "webhook_secret_configured": bool(SHOPIFY_WEBHOOK_SECRET),
         "auto_sync_enabled": True,
-        "auto_sync_interval_hours": AUTO_SYNC_INTERVAL_HOURS,
+        "auto_sync_interval_minutes": AUTO_SYNC_INTERVAL_MINUTES,
         "webhook_url": "/api/webhooks/shopify",
         "supported_topics": [
             "products/create",
@@ -2536,10 +2536,10 @@ async def auto_sync_loop():
     """Background task that syncs products periodically"""
     while True:
         try:
-            await asyncio.sleep(AUTO_SYNC_INTERVAL_HOURS * 3600)
+            await asyncio.sleep(AUTO_SYNC_INTERVAL_MINUTES * 60)  # Convert minutes to seconds
             
             if not sync_status["is_syncing"]:
-                logger.info(f"Auto-sync starting (every {AUTO_SYNC_INTERVAL_HOURS} hours)...")
+                logger.info(f"Auto-sync starting (every {AUTO_SYNC_INTERVAL_MINUTES} minutes)...")
                 await sync_all_products()
                 logger.info("Auto-sync completed")
         except asyncio.CancelledError:
@@ -2555,7 +2555,7 @@ async def startup_event():
     global auto_sync_task
     
     auto_sync_task = asyncio.create_task(auto_sync_loop())
-    logger.info(f"Auto-sync enabled: every {AUTO_SYNC_INTERVAL_HOURS} hours")
+    logger.info(f"Auto-sync enabled: every {AUTO_SYNC_INTERVAL_MINUTES} minutes")
     logger.info("=== WEBHOOK SETUP ===")
     logger.info("Add webhooks in Shopify Admin -> Settings -> Notifications -> Webhooks")
     logger.info(f"  URL: https://YOUR_DOMAIN/api/webhooks/shopify")
