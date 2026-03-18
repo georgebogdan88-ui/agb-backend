@@ -2535,9 +2535,6 @@ async def create_shopify_order(order_data: ShopifyOrderCreate):
         logger.error(f"Error creating Shopify order: {e}")
         raise HTTPException(status_code=500, detail=f"Eroare la crearea comenzii: {str(e)}")
 
-# Include the router in the main app
-app.include_router(api_router)
-
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
@@ -3067,3 +3064,6 @@ async def get_mobile_orders(limit: int = 50):
     for order in orders:
         order["_id"] = str(order["_id"])
     return orders
+
+# Include the router in the main app - MUST be after all route definitions
+app.include_router(api_router)
