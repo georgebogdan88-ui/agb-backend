@@ -255,7 +255,7 @@ def extract_compatible_models(description: str) -> List[str]:
                 if not model.isdigit() or (len(model) == 4 and 1000 <= int(model) <= 9999):
                     models.add(model)
     
-    return list(models)[:100]  # Increased limit to 100
+    return list(models)  # No limit on models
 
 # ==================== SHOPIFY SYNC ====================
 
