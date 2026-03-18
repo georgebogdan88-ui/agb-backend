@@ -568,15 +568,28 @@ async def get_products(
                         
                         regex_conditions.append({"$or": model_conditions})
                     else:
-                        # For regular terms, search normally
-                        regex_conditions.append({
-                            "$or": [
-                                {"title_normalized": {"$regex": term, "$options": "i"}},
-                                {"description_normalized": {"$regex": term, "$options": "i"}},
-                                {"compatible_models": {"$regex": term, "$options": "i"}},
-                                {"sku": {"$regex": term, "$options": "i"}}
-                            ]
-                        })
+                        # For regular terms (non-model numbers)
+                        # Short terms (<=4 chars) should use word boundaries to avoid false matches
+                        # e.g., "usa" should not match inside other words like "caUzA"
+                        if len(term) <= 4:
+                            # Short terms - search with word boundary, prioritize title
+                            regex_conditions.append({
+                                "$or": [
+                                    {"title_normalized": {"$regex": f"\\b{term}\\b", "$options": "i"}},
+                                    {"description_normalized": {"$regex": f"\\b{term}\\b", "$options": "i"}},
+                                    {"sku": {"$regex": f"\\b{term}\\b", "$options": "i"}}
+                                ]
+                            })
+                        else:
+                            # Longer terms - search normally
+                            regex_conditions.append({
+                                "$or": [
+                                    {"title_normalized": {"$regex": term, "$options": "i"}},
+                                    {"description_normalized": {"$regex": term, "$options": "i"}},
+                                    {"compatible_models": {"$regex": term, "$options": "i"}},
+                                    {"sku": {"$regex": term, "$options": "i"}}
+                                ]
+                            })
                 
                 if regex_conditions:
                     query["$and"] = regex_conditions
