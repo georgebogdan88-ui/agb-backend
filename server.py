@@ -32,6 +32,11 @@ SHOPIFY_STOREFRONT_TOKEN = os.environ.get('SHOPIFY_STOREFRONT_TOKEN', '')
 SHOPIFY_API_VERSION = os.environ.get('SHOPIFY_API_VERSION', '2024-01')
 SHOPIFY_WEBHOOK_SECRET = os.environ.get('SHOPIFY_WEBHOOK_SECRET', '')
 
+# Shopify Admin API OAuth Configuration
+SHOPIFY_CLIENT_ID = os.environ.get('SHOPIFY_CLIENT_ID', '38d338d6b94e38743c88c38ece3b6b21')
+SHOPIFY_CLIENT_SECRET = os.environ.get('SHOPIFY_CLIENT_SECRET', '')
+SHOPIFY_ADMIN_TOKEN = os.environ.get('SHOPIFY_ADMIN_TOKEN', '')  # Will be set after OAuth
+
 # Auto-sync configuration
 AUTO_SYNC_INTERVAL_MINUTES = int(os.environ.get('AUTO_SYNC_INTERVAL_MINUTES', '5'))  # Default 5 minutes
 
@@ -2732,3 +2737,333 @@ async def feature_graphic():
     html_path = ROOT_DIR / "feature_graphic.html"
     with open(html_path, "r", encoding="utf-8") as f:
         return HTMLResponse(content=f.read())
+
+
+# ==================== SHOPIFY OAUTH & ADMIN API ====================
+
+async def get_admin_access_token():
+    """Get the stored admin access token from database or environment"""
+    # First check environment variable
+    if SHOPIFY_ADMIN_TOKEN:
+        return SHOPIFY_ADMIN_TOKEN
+    
+    # Then check database
+    token_doc = await db.shopify_tokens.find_one({"store": SHOPIFY_STORE})
+    if token_doc:
+        return token_doc.get("access_token")
+    
+    return None
+
+@api_router.get("/shopify/install")
+async def shopify_install():
+    """Start the Shopify OAuth flow - redirect to Shopify authorization"""
+    shop = SHOPIFY_STORE
+    scopes = "read_customers,write_customers,read_orders,write_orders,read_products"
+    redirect_uri = f"https://agb-backend.onrender.com/api/shopify/callback"
+    nonce = str(uuid.uuid4())
+    
+    # Store nonce for validation
+    await db.shopify_nonces.insert_one({
+        "nonce": nonce,
+        "created_at": datetime.utcnow(),
+        "expires_at": datetime.utcnow() + timedelta(minutes=10)
+    })
+    
+    auth_url = (
+        f"https://{shop}/admin/oauth/authorize?"
+        f"client_id={SHOPIFY_CLIENT_ID}&"
+        f"scope={scopes}&"
+        f"redirect_uri={redirect_uri}&"
+        f"state={nonce}"
+    )
+    
+    return {"auth_url": auth_url, "message": "Redirect user to auth_url to authorize the app"}
+
+@api_router.get("/shopify/callback")
+async def shopify_oauth_callback(code: str = None, state: str = None, shop: str = None, hmac: str = None):
+    """Handle OAuth callback from Shopify and exchange code for access token"""
+    try:
+        if not code:
+            raise HTTPException(status_code=400, detail="No authorization code provided")
+        
+        # Exchange code for access token
+        token_url = f"https://{SHOPIFY_STORE}/admin/oauth/access_token"
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(token_url, json={
+                "client_id": SHOPIFY_CLIENT_ID,
+                "client_secret": SHOPIFY_CLIENT_SECRET,
+                "code": code
+            })
+            
+            if response.status_code != 200:
+                logger.error(f"OAuth token exchange failed: {response.text}")
+                raise HTTPException(status_code=400, detail=f"Failed to exchange code: {response.text}")
+            
+            token_data = response.json()
+            access_token = token_data.get("access_token")
+            
+            if not access_token:
+                raise HTTPException(status_code=400, detail="No access token in response")
+            
+            # Store the token in database
+            await db.shopify_tokens.update_one(
+                {"store": SHOPIFY_STORE},
+                {
+                    "$set": {
+                        "access_token": access_token,
+                        "scope": token_data.get("scope"),
+                        "updated_at": datetime.utcnow()
+                    }
+                },
+                upsert=True
+            )
+            
+            logger.info(f"Successfully obtained and stored Shopify Admin API token")
+            
+            # Return success HTML page
+            html = f"""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>AGB Mobile API - Succes!</title>
+                <style>
+                    body {{ font-family: Arial, sans-serif; text-align: center; padding: 50px; background: #1a1a1a; color: #fff; }}
+                    .success {{ color: #367c2b; font-size: 24px; margin-bottom: 20px; }}
+                    .token {{ background: #2a2a2a; padding: 20px; border-radius: 8px; margin: 20px auto; max-width: 600px; word-break: break-all; }}
+                    .note {{ color: #f5a623; margin-top: 20px; }}
+                </style>
+            </head>
+            <body>
+                <h1 class="success">✅ Autorizare Reușită!</h1>
+                <p>Aplicația AGB Mobile API a fost autorizată cu succes.</p>
+                <div class="token">
+                    <strong>Access Token (salvat în baza de date):</strong><br><br>
+                    <code>{access_token[:20]}...{access_token[-10:]}</code>
+                </div>
+                <p class="note">⚠️ Pentru siguranță, adăugați acest token ca variabilă de mediu SHOPIFY_ADMIN_TOKEN în Render.</p>
+                <p>Token complet: <code>{access_token}</code></p>
+                <p>Puteți închide această pagină.</p>
+            </body>
+            </html>
+            """
+            return HTMLResponse(content=html)
+            
+    except Exception as e:
+        logger.error(f"OAuth callback error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@api_router.get("/shopify/token-status")
+async def shopify_token_status():
+    """Check if we have a valid Shopify Admin API token"""
+    token = await get_admin_access_token()
+    
+    if not token:
+        return {
+            "has_token": False,
+            "message": "No Admin API token found. Visit /api/shopify/install to authorize.",
+            "install_url": "https://agb-backend.onrender.com/api/shopify/install"
+        }
+    
+    # Test the token
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"https://{SHOPIFY_STORE}/admin/api/{SHOPIFY_API_VERSION}/shop.json",
+                headers={"X-Shopify-Access-Token": token}
+            )
+            
+            if response.status_code == 200:
+                shop_data = response.json().get("shop", {})
+                return {
+                    "has_token": True,
+                    "valid": True,
+                    "shop_name": shop_data.get("name"),
+                    "shop_email": shop_data.get("email")
+                }
+            else:
+                return {
+                    "has_token": True,
+                    "valid": False,
+                    "error": f"Token invalid: {response.status_code}"
+                }
+    except Exception as e:
+        return {
+            "has_token": True,
+            "valid": False,
+            "error": str(e)
+        }
+
+# ==================== SHOPIFY ORDER CREATION ====================
+
+class ShopifyOrderItem(BaseModel):
+    variant_id: Optional[str] = None
+    product_id: str
+    title: str
+    quantity: int
+    price: float
+
+class ShopifyOrderCustomer(BaseModel):
+    email: str
+    first_name: str
+    last_name: str
+    phone: Optional[str] = None
+
+class ShopifyOrderAddress(BaseModel):
+    first_name: str
+    last_name: str
+    address1: str
+    city: str
+    province: str  # County/State
+    zip: str
+    country: str = "RO"
+    phone: Optional[str] = None
+
+class CreateShopifyOrderRequest(BaseModel):
+    items: List[ShopifyOrderItem]
+    customer: ShopifyOrderCustomer
+    shipping_address: ShopifyOrderAddress
+    billing_address: Optional[ShopifyOrderAddress] = None
+    note: Optional[str] = None
+    payment_method: str = "bank_transfer"  # or "cash_on_delivery"
+
+@api_router.post("/orders/shopify")
+async def create_shopify_order(request: CreateShopifyOrderRequest):
+    """
+    Create an order directly in Shopify Admin using the Admin API.
+    This will make the order appear in Shopify's Orders dashboard.
+    """
+    token = await get_admin_access_token()
+    
+    if not token:
+        raise HTTPException(
+            status_code=503, 
+            detail="Shopify Admin API not configured. Please authorize the app first."
+        )
+    
+    try:
+        # Build line items - we need to find variant IDs for products
+        line_items = []
+        for item in request.items:
+            # Try to get variant ID from product
+            variant_id = item.variant_id
+            
+            if not variant_id:
+                # Look up the product to get variant ID
+                product_doc = await db.shopify_products.find_one({"id": item.product_id})
+                if product_doc and product_doc.get("variant_id"):
+                    variant_id = product_doc.get("variant_id")
+            
+            if variant_id:
+                # Use variant_id if available
+                line_items.append({
+                    "variant_id": int(variant_id.split("/")[-1]) if "/" in str(variant_id) else int(variant_id),
+                    "quantity": item.quantity
+                })
+            else:
+                # Fallback: create custom line item
+                line_items.append({
+                    "title": item.title,
+                    "quantity": item.quantity,
+                    "price": str(item.price),
+                    "requires_shipping": True
+                })
+        
+        # Build order payload
+        order_payload = {
+            "order": {
+                "line_items": line_items,
+                "customer": {
+                    "first_name": request.customer.first_name,
+                    "last_name": request.customer.last_name,
+                    "email": request.customer.email,
+                    "phone": request.customer.phone
+                },
+                "shipping_address": {
+                    "first_name": request.shipping_address.first_name,
+                    "last_name": request.shipping_address.last_name,
+                    "address1": request.shipping_address.address1,
+                    "city": request.shipping_address.city,
+                    "province": request.shipping_address.province,
+                    "zip": request.shipping_address.zip,
+                    "country": request.shipping_address.country,
+                    "phone": request.shipping_address.phone
+                },
+                "billing_address": {
+                    "first_name": (request.billing_address or request.shipping_address).first_name,
+                    "last_name": (request.billing_address or request.shipping_address).last_name,
+                    "address1": (request.billing_address or request.shipping_address).address1,
+                    "city": (request.billing_address or request.shipping_address).city,
+                    "province": (request.billing_address or request.shipping_address).province,
+                    "zip": (request.billing_address or request.shipping_address).zip,
+                    "country": (request.billing_address or request.shipping_address).country,
+                    "phone": (request.billing_address or request.shipping_address).phone
+                },
+                "financial_status": "pending",  # Payment not yet received
+                "note": request.note or f"Comandă din aplicația mobilă AGB. Metoda de plată: {request.payment_method}",
+                "tags": ["mobile-app", f"payment-{request.payment_method}"],
+                "source_name": "AGB Mobile App"
+            }
+        }
+        
+        # Create order via Admin API
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"https://{SHOPIFY_STORE}/admin/api/{SHOPIFY_API_VERSION}/orders.json",
+                headers={
+                    "X-Shopify-Access-Token": token,
+                    "Content-Type": "application/json"
+                },
+                json=order_payload
+            )
+            
+            if response.status_code not in [200, 201]:
+                logger.error(f"Shopify order creation failed: {response.text}")
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=f"Failed to create Shopify order: {response.text}"
+                )
+            
+            shopify_order = response.json().get("order", {})
+            
+            # Store order reference in our database
+            order_record = {
+                "shopify_order_id": shopify_order.get("id"),
+                "shopify_order_number": shopify_order.get("order_number"),
+                "shopify_order_name": shopify_order.get("name"),
+                "customer_email": request.customer.email,
+                "total_price": shopify_order.get("total_price"),
+                "currency": shopify_order.get("currency"),
+                "items_count": len(request.items),
+                "payment_method": request.payment_method,
+                "created_at": datetime.utcnow(),
+                "source": "mobile_app"
+            }
+            await db.mobile_orders.insert_one(order_record)
+            
+            logger.info(f"Successfully created Shopify order #{shopify_order.get('order_number')}")
+            
+            return {
+                "success": True,
+                "order_id": shopify_order.get("id"),
+                "order_number": shopify_order.get("order_number"),
+                "order_name": shopify_order.get("name"),
+                "total_price": shopify_order.get("total_price"),
+                "currency": shopify_order.get("currency"),
+                "status_url": shopify_order.get("order_status_url"),
+                "message": f"Comanda #{shopify_order.get('order_number')} a fost creată cu succes în Shopify!"
+            }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating Shopify order: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@api_router.get("/orders/mobile")
+async def get_mobile_orders(limit: int = 50):
+    """Get orders created from the mobile app"""
+    orders = await db.mobile_orders.find().sort("created_at", -1).limit(limit).to_list(limit)
+    for order in orders:
+        order["_id"] = str(order["_id"])
+    return orders
