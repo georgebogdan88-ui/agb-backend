@@ -2121,14 +2121,15 @@ async def shopify_oauth_start(request: Request):
     
     return HTMLResponse(content=html_content)
 
-@api_router.get("/shopify/callback")
-async def shopify_oauth_callback(
+# DISABLED - Using the callback at the end of the file instead
+# @api_router.get("/shopify/callback")
+async def shopify_oauth_callback_OLD(
     code: Optional[str] = None,
     shop: Optional[str] = None,
     error: Optional[str] = None,
     error_description: Optional[str] = None
 ):
-    """Handle Shopify OAuth callback - exchange code for access token"""
+    """DISABLED - Handle Shopify OAuth callback - exchange code for access token"""
     
     if error:
         logger.error(f"Shopify OAuth error: {error} - {error_description}")
