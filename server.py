@@ -2785,15 +2785,31 @@ async def shopify_oauth_callback(code: str = None, state: str = None, shop: str 
             raise HTTPException(status_code=400, detail="No authorization code provided")
         
         # Exchange code for access token
-        token_url = f"https://{SHOPIFY_STORE}/admin/oauth/access_token"
+        # Use shop domain from callback or fallback to configured store
+        shop_domain = shop if shop else SHOPIFY_STORE
+        if shop_domain and not shop_domain.endswith('.myshopify.com'):
+            shop_domain = f"{shop_domain}.myshopify.com"
+        
+        token_url = f"https://{shop_domain}/admin/oauth/access_token"
+        
+        logger.info(f"Exchanging code at: {token_url}")
+        logger.info(f"Client ID: {SHOPIFY_CLIENT_ID[:10]}...")
+        logger.info(f"Client Secret configured: {bool(SHOPIFY_CLIENT_SECRET)}")
         
         async with httpx.AsyncClient() as client:
-            # IMPORTANT: Shopify requires form-urlencoded data, NOT JSON!
-            response = await client.post(token_url, data={
-                "client_id": SHOPIFY_CLIENT_ID,
-                "client_secret": SHOPIFY_CLIENT_SECRET,
-                "code": code
-            })
+            # IMPORTANT: Shopify requires form-urlencoded data with explicit Content-Type
+            response = await client.post(
+                token_url, 
+                data={
+                    "client_id": SHOPIFY_CLIENT_ID,
+                    "client_secret": SHOPIFY_CLIENT_SECRET,
+                    "code": code
+                },
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept": "application/json"
+                }
+            )
             
             if response.status_code != 200:
                 logger.error(f"OAuth token exchange failed: {response.text}")
