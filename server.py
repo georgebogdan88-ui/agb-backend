@@ -2788,7 +2788,8 @@ async def shopify_oauth_callback(code: str = None, state: str = None, shop: str 
         token_url = f"https://{SHOPIFY_STORE}/admin/oauth/access_token"
         
         async with httpx.AsyncClient() as client:
-            response = await client.post(token_url, json={
+            # IMPORTANT: Shopify requires form-urlencoded data, NOT JSON!
+            response = await client.post(token_url, data={
                 "client_id": SHOPIFY_CLIENT_ID,
                 "client_secret": SHOPIFY_CLIENT_SECRET,
                 "code": code
