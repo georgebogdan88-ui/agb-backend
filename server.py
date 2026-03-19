@@ -2219,7 +2219,8 @@ async def shopify_oauth_callback(
     
     try:
         async with httpx.AsyncClient() as client:
-            response = await client.post(token_url, json=payload, timeout=30.0)
+            # IMPORTANT: Shopify requires form-urlencoded data, NOT JSON!
+            response = await client.post(token_url, data=payload, timeout=30.0)
             
             logger.info(f"Token exchange response status: {response.status_code}")
             logger.info(f"Token exchange response: {response.text}")
