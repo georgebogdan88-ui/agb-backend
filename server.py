@@ -3018,7 +3018,9 @@ async def create_shopify_order(request: CreateShopifyOrderRequest):
                 "financial_status": "pending",  # Payment not yet received
                 "note": request.note or f"Comandă din aplicația mobilă AGB. Metoda de plată: {request.payment_method}",
                 "tags": ["mobile-app", f"payment-{request.payment_method}"],
-                "source_name": "AGB Mobile App"
+                "source_name": "AGB Mobile App",
+                "send_receipt": True,  # Send order confirmation email to customer
+                "send_fulfillment_receipt": True  # Send shipping notification when fulfilled
             }
         }
         
