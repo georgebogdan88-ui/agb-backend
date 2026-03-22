@@ -297,6 +297,7 @@ async def fetch_shopify_products_page(after: Optional[str] = None) -> dict:
                                 id
                                 sku
                                 quantityAvailable
+                                availableForSale
                             }
                         }
                     }
@@ -343,10 +344,12 @@ def parse_shopify_node(node: dict) -> dict:
     
     stock = 0
     sku = None
+    available_for_sale = False
     if node.get("variants", {}).get("edges"):
         variant = node["variants"]["edges"][0]["node"]
         stock = variant.get("quantityAvailable") or 0
         sku = variant.get("sku")
+        available_for_sale = variant.get("availableForSale", False)
     
     price = 0.0
     currency = "RON"
@@ -371,11 +374,15 @@ def parse_shopify_node(node: dict) -> dict:
     product_id = node["id"].replace("gid://shopify/Product/", "")
     
     # Determine stock status
-    # "În stoc furnizor" for products with 0 stock but special mention or specific tags
+    # "În stoc furnizor" for products with 0 stock but availableForSale=true (Continue selling enabled)
     stock_status = "in_stock" if stock > 0 else "out_of_stock"
     tags = node.get("tags", [])
     
-    # Check if product has supplier stock mention in description or tags
+    # If stock is 0 but product is still availableForSale, it means "Continue selling when out of stock" is enabled
+    if stock == 0 and available_for_sale:
+        stock_status = "supplier_stock"
+    
+    # Also check if product has supplier stock mention in description or tags
     desc_lower = description.lower()
     if stock == 0 and ("contactati pentru oferta" in desc_lower or 
                        "stoc furnizor" in desc_lower or 
