@@ -1844,6 +1844,172 @@ async def get_user_orders(request: Request):
     orders = await db.orders.find({"customer.email": user["email"]}).sort("created_at", -1).to_list(100)
     return [Order(**order) for order in orders]
 
+@api_router.get("/auth/shopify-orders")
+async def get_user_shopify_orders(request: Request):
+    """Get orders from Shopify for authenticated user - includes fulfillment status"""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Token lipsă sau invalid")
+    
+    token = auth_header.replace("Bearer ", "")
+    user = await db.users.find_one({"token": token})
+    
+    if not user:
+        raise HTTPException(status_code=401, detail="Token invalid sau expirat")
+    
+    # Check if user has Shopify access token
+    shopify_access_token = user.get("shopify_access_token")
+    
+    if not shopify_access_token:
+        # Return mobile orders from our database if no Shopify connection
+        mobile_orders = await db.mobile_orders.find(
+            {"customer_email": user["email"]}
+        ).sort("created_at", -1).to_list(50)
+        
+        return [{
+            "id": str(order.get("shopify_order_id", order.get("_id"))),
+            "order_number": order.get("shopify_order_number", "N/A"),
+            "order_name": order.get("shopify_order_name", f"#{order.get('shopify_order_number', 'N/A')}"),
+            "total_price": order.get("total_price", "0.00"),
+            "currency": order.get("currency", "RON"),
+            "created_at": order.get("created_at").isoformat() if order.get("created_at") else None,
+            "fulfillment_status": "UNFULFILLED",
+            "status_display": "În așteptare",
+            "items_count": order.get("items_count", 0),
+            "payment_method": order.get("payment_method", "N/A")
+        } for order in mobile_orders]
+    
+    # Query Shopify for orders
+    headers = {
+        "Content-Type": "application/json",
+        "X-Shopify-Storefront-Access-Token": SHOPIFY_STOREFRONT_TOKEN
+    }
+    
+    orders_query = """
+    query getCustomerOrders($customerAccessToken: String!) {
+        customer(customerAccessToken: $customerAccessToken) {
+            orders(first: 50, sortKey: PROCESSED_AT, reverse: true) {
+                edges {
+                    node {
+                        id
+                        orderNumber
+                        name
+                        totalPrice {
+                            amount
+                            currencyCode
+                        }
+                        processedAt
+                        fulfillmentStatus
+                        financialStatus
+                        lineItems(first: 10) {
+                            edges {
+                                node {
+                                    title
+                                    quantity
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    """
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"https://{SHOPIFY_STORE}/api/{SHOPIFY_API_VERSION}/graphql.json",
+                json={
+                    "query": orders_query,
+                    "variables": {"customerAccessToken": shopify_access_token}
+                },
+                headers=headers,
+                timeout=30.0
+            )
+            
+            data = response.json()
+            customer = data.get("data", {}).get("customer")
+            
+            if not customer:
+                # Token might be expired, return mobile orders instead
+                mobile_orders = await db.mobile_orders.find(
+                    {"customer_email": user["email"]}
+                ).sort("created_at", -1).to_list(50)
+                
+                return [{
+                    "id": str(order.get("shopify_order_id", order.get("_id"))),
+                    "order_number": order.get("shopify_order_number", "N/A"),
+                    "order_name": order.get("shopify_order_name", f"#{order.get('shopify_order_number', 'N/A')}"),
+                    "total_price": order.get("total_price", "0.00"),
+                    "currency": order.get("currency", "RON"),
+                    "created_at": order.get("created_at").isoformat() if order.get("created_at") else None,
+                    "fulfillment_status": "UNFULFILLED",
+                    "status_display": "În așteptare",
+                    "items_count": order.get("items_count", 0),
+                    "payment_method": order.get("payment_method", "N/A")
+                } for order in mobile_orders]
+            
+            orders_edges = customer.get("orders", {}).get("edges", [])
+            
+            # Map fulfillment status to Romanian display text
+            status_map = {
+                "FULFILLED": "Trimisă",
+                "PARTIALLY_FULFILLED": "Parțial trimisă",
+                "UNFULFILLED": "În așteptare",
+                "ON_HOLD": "În așteptare",
+                "SCHEDULED": "Programată",
+                "PENDING_FULFILLMENT": "În procesare",
+                None: "În așteptare"
+            }
+            
+            shopify_orders = []
+            for edge in orders_edges:
+                order = edge.get("node", {})
+                fulfillment_status = order.get("fulfillmentStatus")
+                line_items = order.get("lineItems", {}).get("edges", [])
+                
+                shopify_orders.append({
+                    "id": order.get("id", "").replace("gid://shopify/Order/", ""),
+                    "order_number": order.get("orderNumber"),
+                    "order_name": order.get("name"),
+                    "total_price": order.get("totalPrice", {}).get("amount", "0.00"),
+                    "currency": order.get("totalPrice", {}).get("currencyCode", "RON"),
+                    "created_at": order.get("processedAt"),
+                    "fulfillment_status": fulfillment_status or "UNFULFILLED",
+                    "status_display": status_map.get(fulfillment_status, "În așteptare"),
+                    "financial_status": order.get("financialStatus"),
+                    "items_count": len(line_items),
+                    "items": [
+                        {
+                            "title": item.get("node", {}).get("title"),
+                            "quantity": item.get("node", {}).get("quantity")
+                        } for item in line_items
+                    ]
+                })
+            
+            return shopify_orders
+            
+    except Exception as e:
+        logger.error(f"Error fetching Shopify orders: {e}")
+        # Fallback to mobile orders
+        mobile_orders = await db.mobile_orders.find(
+            {"customer_email": user["email"]}
+        ).sort("created_at", -1).to_list(50)
+        
+        return [{
+            "id": str(order.get("shopify_order_id", order.get("_id"))),
+            "order_number": order.get("shopify_order_number", "N/A"),
+            "order_name": order.get("shopify_order_name", f"#{order.get('shopify_order_number', 'N/A')}"),
+            "total_price": order.get("total_price", "0.00"),
+            "currency": order.get("currency", "RON"),
+            "created_at": order.get("created_at").isoformat() if order.get("created_at") else None,
+            "fulfillment_status": "UNFULFILLED",
+            "status_display": "În așteptare",
+            "items_count": order.get("items_count", 0),
+            "payment_method": order.get("payment_method", "N/A")
+        } for order in mobile_orders]
+
 # ==================== WEBHOOK ENDPOINTS ====================
 
 async def verify_shopify_webhook(request: Request) -> bool:
