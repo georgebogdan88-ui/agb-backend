@@ -3259,5 +3259,83 @@ async def get_mobile_orders(limit: int = 50):
         order["_id"] = str(order["_id"])
     return orders
 
+# Privacy Policy endpoint
+@api_router.get("/privacy-policy", response_class=HTMLResponse)
+async def privacy_policy():
+    """Privacy policy page for AGB Agroparts app"""
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="ro">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Politica de Confidențialitate - AGB Agroparts</title>
+        <style>
+            body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; line-height: 1.6; }
+            h1 { color: #367c2b; }
+            h2 { color: #333; margin-top: 30px; }
+            p { color: #555; }
+            .last-updated { color: #888; font-size: 14px; }
+        </style>
+    </head>
+    <body>
+        <h1>Politica de Confidențialitate</h1>
+        <p class="last-updated">Ultima actualizare: Martie 2026</p>
+        
+        <h2>1. Introducere</h2>
+        <p>AGB Agroparts ("noi", "al nostru") respectă confidențialitatea utilizatorilor săi. Această Politică de Confidențialitate explică modul în care colectăm, folosim și protejăm informațiile dumneavoastră personale când utilizați aplicația noastră mobilă.</p>
+        
+        <h2>2. Informații pe care le colectăm</h2>
+        <p>Colectăm următoarele tipuri de informații:</p>
+        <ul>
+            <li><strong>Informații de cont:</strong> nume, adresă de email, număr de telefon</li>
+            <li><strong>Informații de livrare:</strong> adresa de livrare pentru comenzi</li>
+            <li><strong>Informații despre comenzi:</strong> produsele comandate, istoricul achizițiilor</li>
+            <li><strong>Informații despre dispozitiv:</strong> tipul dispozitivului, sistemul de operare</li>
+        </ul>
+        
+        <h2>3. Cum folosim informațiile</h2>
+        <p>Utilizăm informațiile colectate pentru:</p>
+        <ul>
+            <li>Procesarea și livrarea comenzilor</li>
+            <li>Comunicarea cu dumneavoastră despre comenzi</li>
+            <li>Îmbunătățirea serviciilor noastre</li>
+            <li>Trimiterea de oferte și noutăți (doar cu acordul dumneavoastră)</li>
+        </ul>
+        
+        <h2>4. Partajarea informațiilor</h2>
+        <p>Nu vindem și nu închiriem informațiile dumneavoastră personale terților. Putem partaja informațiile doar cu:</p>
+        <ul>
+            <li>Furnizori de servicii de livrare pentru procesarea comenzilor</li>
+            <li>Procesatori de plăți pentru tranzacții sigure</li>
+            <li>Autorități legale, când suntem obligați prin lege</li>
+        </ul>
+        
+        <h2>5. Securitatea datelor</h2>
+        <p>Implementăm măsuri tehnice și organizatorice adecvate pentru a proteja datele dumneavoastră împotriva accesului neautorizat, modificării, divulgării sau distrugerii.</p>
+        
+        <h2>6. Drepturile dumneavoastră</h2>
+        <p>Aveți dreptul să:</p>
+        <ul>
+            <li>Accesați datele personale pe care le deținem despre dumneavoastră</li>
+            <li>Solicitați corectarea datelor incorecte</li>
+            <li>Solicitați ștergerea datelor dumneavoastră</li>
+            <li>Vă retrageți consimțământul în orice moment</li>
+        </ul>
+        
+        <h2>7. Contact</h2>
+        <p>Pentru întrebări despre această politică de confidențialitate sau despre datele dumneavoastră, ne puteți contacta la:</p>
+        <ul>
+            <li>Email: contact@agbagroparts.ro</li>
+            <li>WhatsApp: +40 725 088 655</li>
+        </ul>
+        
+        <h2>8. Modificări ale politicii</h2>
+        <p>Ne rezervăm dreptul de a actualiza această politică periodic. Vă vom notifica despre orice modificări semnificative prin aplicație sau email.</p>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
+
 # Include the router in the main app - MUST be after all route definitions
 app.include_router(api_router)
