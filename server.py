@@ -2055,13 +2055,13 @@ async def sync_equipment_to_shopify_notes(user_email: str, equipment_list: list)
             for i, eq in enumerate(equipment_list, 1):
                 notes_lines.append(f"{i}. {eq.get('model', 'N/A')}")
                 if eq.get('chassis_serial'):
-                    notes_lines.append(f"   • Șasiu: {eq['chassis_serial']}")
+                    notes_lines.append(f"   • Serie șasiu: {eq['chassis_serial']}")
                 if eq.get('engine_serial'):
-                    notes_lines.append(f"   • Motor: {eq['engine_serial']}")
+                    notes_lines.append(f"   • Serie motor: {eq['engine_serial']}")
                 if eq.get('engine_type'):
-                    notes_lines.append(f"   • Tip motor: {eq['engine_type']}")
+                    notes_lines.append(f"   • Model motor: {eq['engine_type']}")
                 if eq.get('transmission_type'):
-                    notes_lines.append(f"   • Cutie: {eq['transmission_type']}")
+                    notes_lines.append(f"   • Model cutie: {eq['transmission_type']}")
                 notes_lines.append("")
             notes_text = "\n".join(notes_lines)
         
