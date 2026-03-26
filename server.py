@@ -165,6 +165,34 @@ class UserUpdate(BaseModel):
     reg_com: Optional[str] = None
     company_address: Optional[str] = None
 
+# ==================== EQUIPMENT MODELS ====================
+
+class Equipment(BaseModel):
+    """Model for customer's equipment/tractors"""
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    model: str  # Ex: John Deere 6150R
+    chassis_serial: Optional[str] = None  # Serie șasiu
+    engine_serial: Optional[str] = None  # Serie motor
+    engine_type: Optional[str] = None  # Tip motor
+    transmission_type: Optional[str] = None  # Tip cutie viteze
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+class EquipmentCreate(BaseModel):
+    """Create equipment request"""
+    model: str
+    chassis_serial: Optional[str] = None
+    engine_serial: Optional[str] = None
+    engine_type: Optional[str] = None
+    transmission_type: Optional[str] = None
+
+class EquipmentUpdate(BaseModel):
+    """Update equipment request"""
+    model: Optional[str] = None
+    chassis_serial: Optional[str] = None
+    engine_serial: Optional[str] = None
+    engine_type: Optional[str] = None
+    transmission_type: Optional[str] = None
+
 class UserResponse(BaseModel):
     id: str
     email: str
@@ -2009,6 +2037,251 @@ async def get_user_shopify_orders(request: Request):
             "items_count": order.get("items_count", 0),
             "payment_method": order.get("payment_method", "N/A")
         } for order in mobile_orders]
+
+# ==================== EQUIPMENT/UTILAJE ENDPOINTS ====================
+
+async def sync_equipment_to_shopify_notes(user_email: str, equipment_list: list):
+    """Sync user's equipment to Shopify customer notes"""
+    try:
+        if not SHOPIFY_ADMIN_TOKEN:
+            logger.warning("SHOPIFY_ADMIN_TOKEN not configured - skipping Shopify sync")
+            return False
+        
+        # Build notes text
+        if not equipment_list:
+            notes_text = "🚜 UTILAJELE CLIENTULUI:\n(Niciun utilaj adăugat)"
+        else:
+            notes_lines = ["🚜 UTILAJELE CLIENTULUI:", ""]
+            for i, eq in enumerate(equipment_list, 1):
+                notes_lines.append(f"{i}. {eq.get('model', 'N/A')}")
+                if eq.get('chassis_serial'):
+                    notes_lines.append(f"   • Șasiu: {eq['chassis_serial']}")
+                if eq.get('engine_serial'):
+                    notes_lines.append(f"   • Motor: {eq['engine_serial']}")
+                if eq.get('engine_type'):
+                    notes_lines.append(f"   • Tip motor: {eq['engine_type']}")
+                if eq.get('transmission_type'):
+                    notes_lines.append(f"   • Cutie: {eq['transmission_type']}")
+                notes_lines.append("")
+            notes_text = "\n".join(notes_lines)
+        
+        # Find Shopify customer by email
+        headers = {
+            "Content-Type": "application/json",
+            "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN
+        }
+        
+        # Search for customer
+        search_query = """
+        query findCustomer($email: String!) {
+            customers(first: 1, query: $email) {
+                edges {
+                    node {
+                        id
+                        email
+                        note
+                    }
+                }
+            }
+        }
+        """
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"https://{SHOPIFY_STORE}/admin/api/2024-01/graphql.json",
+                json={"query": search_query, "variables": {"email": f"email:{user_email}"}},
+                headers=headers,
+                timeout=30.0
+            )
+            
+            data = response.json()
+            customers = data.get("data", {}).get("customers", {}).get("edges", [])
+            
+            if not customers:
+                logger.info(f"Customer {user_email} not found in Shopify - cannot sync equipment")
+                return False
+            
+            customer_id = customers[0]["node"]["id"]
+            
+            # Update customer notes
+            update_mutation = """
+            mutation updateCustomer($input: CustomerInput!) {
+                customerUpdate(input: $input) {
+                    customer {
+                        id
+                        note
+                    }
+                    userErrors {
+                        field
+                        message
+                    }
+                }
+            }
+            """
+            
+            response = await client.post(
+                f"https://{SHOPIFY_STORE}/admin/api/2024-01/graphql.json",
+                json={
+                    "query": update_mutation,
+                    "variables": {
+                        "input": {
+                            "id": customer_id,
+                            "note": notes_text
+                        }
+                    }
+                },
+                headers=headers,
+                timeout=30.0
+            )
+            
+            result = response.json()
+            errors = result.get("data", {}).get("customerUpdate", {}).get("userErrors", [])
+            
+            if errors:
+                logger.error(f"Error updating Shopify customer notes: {errors}")
+                return False
+            
+            logger.info(f"Successfully synced equipment to Shopify for {user_email}")
+            return True
+            
+    except Exception as e:
+        logger.error(f"Error syncing equipment to Shopify: {e}")
+        return False
+
+@api_router.get("/auth/equipment")
+async def get_user_equipment(request: Request):
+    """Get all equipment for authenticated user"""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Token lipsă sau invalid")
+    
+    token = auth_header.replace("Bearer ", "")
+    user = await db.users.find_one({"token": token})
+    
+    if not user:
+        raise HTTPException(status_code=401, detail="Token invalid sau expirat")
+    
+    # Get equipment from user's equipment array or separate collection
+    equipment = user.get("equipment", [])
+    return {"equipment": equipment, "count": len(equipment), "max_allowed": 10}
+
+@api_router.post("/auth/equipment")
+async def add_user_equipment(request: Request, equipment_data: EquipmentCreate):
+    """Add new equipment for authenticated user (max 10)"""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Token lipsă sau invalid")
+    
+    token = auth_header.replace("Bearer ", "")
+    user = await db.users.find_one({"token": token})
+    
+    if not user:
+        raise HTTPException(status_code=401, detail="Token invalid sau expirat")
+    
+    # Check current equipment count
+    current_equipment = user.get("equipment", [])
+    if len(current_equipment) >= 10:
+        raise HTTPException(status_code=400, detail="Ați atins limita maximă de 10 utilaje")
+    
+    # Create new equipment entry
+    new_equipment = {
+        "id": str(uuid.uuid4()),
+        "model": equipment_data.model,
+        "chassis_serial": equipment_data.chassis_serial,
+        "engine_serial": equipment_data.engine_serial,
+        "engine_type": equipment_data.engine_type,
+        "transmission_type": equipment_data.transmission_type,
+        "created_at": datetime.utcnow().isoformat()
+    }
+    
+    # Add to user's equipment array
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {"$push": {"equipment": new_equipment}}
+    )
+    
+    # Sync to Shopify
+    updated_equipment = current_equipment + [new_equipment]
+    await sync_equipment_to_shopify_notes(user["email"], updated_equipment)
+    
+    return {"message": "Utilaj adăugat cu succes", "equipment": new_equipment}
+
+@api_router.put("/auth/equipment/{equipment_id}")
+async def update_user_equipment(request: Request, equipment_id: str, equipment_data: EquipmentUpdate):
+    """Update existing equipment"""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Token lipsă sau invalid")
+    
+    token = auth_header.replace("Bearer ", "")
+    user = await db.users.find_one({"token": token})
+    
+    if not user:
+        raise HTTPException(status_code=401, detail="Token invalid sau expirat")
+    
+    # Find and update equipment
+    equipment_list = user.get("equipment", [])
+    equipment_found = False
+    
+    for eq in equipment_list:
+        if eq.get("id") == equipment_id:
+            if equipment_data.model is not None:
+                eq["model"] = equipment_data.model
+            if equipment_data.chassis_serial is not None:
+                eq["chassis_serial"] = equipment_data.chassis_serial
+            if equipment_data.engine_serial is not None:
+                eq["engine_serial"] = equipment_data.engine_serial
+            if equipment_data.engine_type is not None:
+                eq["engine_type"] = equipment_data.engine_type
+            if equipment_data.transmission_type is not None:
+                eq["transmission_type"] = equipment_data.transmission_type
+            equipment_found = True
+            break
+    
+    if not equipment_found:
+        raise HTTPException(status_code=404, detail="Utilajul nu a fost găsit")
+    
+    # Save updated equipment list
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {"$set": {"equipment": equipment_list}}
+    )
+    
+    # Sync to Shopify
+    await sync_equipment_to_shopify_notes(user["email"], equipment_list)
+    
+    return {"message": "Utilaj actualizat cu succes", "equipment": equipment_list}
+
+@api_router.delete("/auth/equipment/{equipment_id}")
+async def delete_user_equipment(request: Request, equipment_id: str):
+    """Delete equipment"""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Token lipsă sau invalid")
+    
+    token = auth_header.replace("Bearer ", "")
+    user = await db.users.find_one({"token": token})
+    
+    if not user:
+        raise HTTPException(status_code=401, detail="Token invalid sau expirat")
+    
+    # Remove equipment from list
+    equipment_list = user.get("equipment", [])
+    new_equipment_list = [eq for eq in equipment_list if eq.get("id") != equipment_id]
+    
+    if len(new_equipment_list) == len(equipment_list):
+        raise HTTPException(status_code=404, detail="Utilajul nu a fost găsit")
+    
+    # Save updated equipment list
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {"$set": {"equipment": new_equipment_list}}
+    )
+    
+    # Sync to Shopify
+    await sync_equipment_to_shopify_notes(user["email"], new_equipment_list)
+    
+    return {"message": "Utilaj șters cu succes", "remaining_count": len(new_equipment_list)}
 
 # ==================== WEBHOOK ENDPOINTS ====================
 
