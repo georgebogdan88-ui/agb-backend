@@ -2156,7 +2156,13 @@ async def get_user_equipment(request: Request):
         raise HTTPException(status_code=401, detail="Token lipsă sau invalid")
     
     token = auth_header.replace("Bearer ", "")
-    user = await db.users.find_one({"token": token})
+    # Search by both token types (our token and Shopify access token)
+    user = await db.users.find_one({
+        "$or": [
+            {"token": token},
+            {"shopify_access_token": token}
+        ]
+    })
     
     if not user:
         raise HTTPException(status_code=401, detail="Token invalid sau expirat")
@@ -2173,7 +2179,13 @@ async def add_user_equipment(request: Request, equipment_data: EquipmentCreate):
         raise HTTPException(status_code=401, detail="Token lipsă sau invalid")
     
     token = auth_header.replace("Bearer ", "")
-    user = await db.users.find_one({"token": token})
+    # Search by both token types (our token and Shopify access token)
+    user = await db.users.find_one({
+        "$or": [
+            {"token": token},
+            {"shopify_access_token": token}
+        ]
+    })
     
     if not user:
         raise HTTPException(status_code=401, detail="Token invalid sau expirat")
@@ -2214,7 +2226,13 @@ async def update_user_equipment(request: Request, equipment_id: str, equipment_d
         raise HTTPException(status_code=401, detail="Token lipsă sau invalid")
     
     token = auth_header.replace("Bearer ", "")
-    user = await db.users.find_one({"token": token})
+    # Search by both token types (our token and Shopify access token)
+    user = await db.users.find_one({
+        "$or": [
+            {"token": token},
+            {"shopify_access_token": token}
+        ]
+    })
     
     if not user:
         raise HTTPException(status_code=401, detail="Token invalid sau expirat")
@@ -2260,7 +2278,13 @@ async def delete_user_equipment(request: Request, equipment_id: str):
         raise HTTPException(status_code=401, detail="Token lipsă sau invalid")
     
     token = auth_header.replace("Bearer ", "")
-    user = await db.users.find_one({"token": token})
+    # Search by both token types (our token and Shopify access token)
+    user = await db.users.find_one({
+        "$or": [
+            {"token": token},
+            {"shopify_access_token": token}
+        ]
+    })
     
     if not user:
         raise HTTPException(status_code=401, detail="Token invalid sau expirat")
