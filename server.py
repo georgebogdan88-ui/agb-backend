@@ -173,8 +173,9 @@ class Equipment(BaseModel):
     model: str  # Ex: John Deere 6150R
     chassis_serial: Optional[str] = None  # Serie șasiu
     engine_serial: Optional[str] = None  # Serie motor
-    engine_type: Optional[str] = None  # Tip motor
-    transmission_type: Optional[str] = None  # Tip cutie viteze
+    engine_type: Optional[str] = None  # Model motor
+    transmission_type: Optional[str] = None  # Model cutie viteze
+    features: Optional[List[str]] = None  # Echipări selectate
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 class EquipmentCreate(BaseModel):
@@ -184,6 +185,7 @@ class EquipmentCreate(BaseModel):
     engine_serial: Optional[str] = None
     engine_type: Optional[str] = None
     transmission_type: Optional[str] = None
+    features: Optional[List[str]] = None
 
 class EquipmentUpdate(BaseModel):
     """Update equipment request"""
@@ -192,6 +194,7 @@ class EquipmentUpdate(BaseModel):
     engine_serial: Optional[str] = None
     engine_type: Optional[str] = None
     transmission_type: Optional[str] = None
+    features: Optional[List[str]] = None
 
 class UserResponse(BaseModel):
     id: str
@@ -2062,6 +2065,8 @@ async def sync_equipment_to_shopify_notes(user_email: str, equipment_list: list)
                     notes_lines.append(f"   • Model motor: {eq['engine_type']}")
                 if eq.get('transmission_type'):
                     notes_lines.append(f"   • Model cutie: {eq['transmission_type']}")
+                if eq.get('features') and len(eq['features']) > 0:
+                    notes_lines.append(f"   • Echipare: {', '.join(eq['features'])}")
                 notes_lines.append("")
             notes_text = "\n".join(notes_lines)
         
@@ -2203,6 +2208,7 @@ async def add_user_equipment(request: Request, equipment_data: EquipmentCreate):
         "engine_serial": equipment_data.engine_serial,
         "engine_type": equipment_data.engine_type,
         "transmission_type": equipment_data.transmission_type,
+        "features": equipment_data.features,
         "created_at": datetime.utcnow().isoformat()
     }
     
@@ -2253,6 +2259,8 @@ async def update_user_equipment(request: Request, equipment_id: str, equipment_d
                 eq["engine_type"] = equipment_data.engine_type
             if equipment_data.transmission_type is not None:
                 eq["transmission_type"] = equipment_data.transmission_type
+            if equipment_data.features is not None:
+                eq["features"] = equipment_data.features
             equipment_found = True
             break
     
