@@ -2350,30 +2350,24 @@ async def get_user_equipment(request: Request):
     # Get equipment from user's equipment array
     local_equipment = user.get("equipment", [])
     
-    # Try to sync from Shopify notes
+    # Try to sync from Shopify notes - ALWAYS prioritize Shopify data
     try:
         shopify_notes = await get_shopify_customer_notes(user.get("email", ""))
+        logger.info(f"Shopify notes for {user.get('email')}: {shopify_notes[:200] if shopify_notes else 'empty'}...")
+        
         if shopify_notes and "UTILAJELE CLIENTULUI:" in shopify_notes:
             shopify_equipment = await parse_equipment_from_shopify_notes(shopify_notes)
+            logger.info(f"Parsed {len(shopify_equipment)} equipment from Shopify notes")
             
-            # If Shopify has equipment and local doesn't, sync from Shopify
-            if shopify_equipment and not local_equipment:
-                # Save to local DB
+            if shopify_equipment:
+                # Always update from Shopify if notes contain equipment data
+                # This ensures edits made in Shopify are reflected in the app
                 await db.users.update_one(
                     {"_id": user["_id"]},
                     {"$set": {"equipment": shopify_equipment}}
                 )
                 local_equipment = shopify_equipment
-                logger.info(f"Synced {len(shopify_equipment)} equipment from Shopify for {user.get('email')}")
-            
-            # If counts differ and Shopify has more, update from Shopify
-            elif shopify_equipment and len(shopify_equipment) > len(local_equipment):
-                await db.users.update_one(
-                    {"_id": user["_id"]},
-                    {"$set": {"equipment": shopify_equipment}}
-                )
-                local_equipment = shopify_equipment
-                logger.info(f"Updated equipment from Shopify ({len(shopify_equipment)} items) for {user.get('email')}")
+                logger.info(f"Synced equipment from Shopify for {user.get('email')}")
     except Exception as e:
         logger.error(f"Error syncing from Shopify: {e}")
     
