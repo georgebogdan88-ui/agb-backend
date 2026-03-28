@@ -3957,11 +3957,20 @@ async def debug_customer_notes(email: str):
         return {"error": "SHOPIFY_ADMIN_TOKEN not set", "notes": None}
     
     notes = await get_shopify_customer_notes(email)
+    
+    # Also test parsing
+    parsed_equipment = []
+    if notes:
+        parsed_equipment = await parse_equipment_from_shopify_notes(notes)
+    
     return {
         "email": email,
         "has_notes": bool(notes),
-        "notes_preview": notes[:300] if notes else None,
-        "contains_equipment": "UTILAJELE CLIENTULUI:" in notes if notes else False
+        "notes_preview": notes[:500] if notes else None,
+        "notes_full_length": len(notes) if notes else 0,
+        "contains_equipment": "UTILAJELE CLIENTULUI:" in notes if notes else False,
+        "parsed_equipment_count": len(parsed_equipment),
+        "parsed_equipment": parsed_equipment
     }
 
 # ==================== EMAIL NOTIFICATIONS (BREVO) ====================
