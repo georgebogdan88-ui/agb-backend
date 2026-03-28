@@ -3939,6 +3939,24 @@ async def get_news():
                     tags = node.get("tags", []) or []
                     normalized_tags = [tag.strip().lower() for tag in tags]
                     
+                    # Convert HTML to formatted plain text for old app versions
+                    content_html = node.get("contentHtml", "")
+                    content_formatted = content_html
+                    if content_html:
+                        import html
+                        # Convert HTML to plain text with proper line breaks
+                        content_formatted = content_html
+                        content_formatted = re.sub(r'<br\s*/?>', '\n', content_formatted)
+                        content_formatted = re.sub(r'</p>', '\n\n', content_formatted)
+                        content_formatted = re.sub(r'</div>', '\n', content_formatted)
+                        content_formatted = re.sub(r'<li[^>]*>', '\n• ', content_formatted)
+                        content_formatted = re.sub(r'<h[1-6][^>]*>', '\n\n', content_formatted)
+                        content_formatted = re.sub(r'</h[1-6]>', '\n', content_formatted)
+                        content_formatted = re.sub(r'<[^>]+>', '', content_formatted)  # Remove all HTML tags
+                        content_formatted = html.unescape(content_formatted)  # Decode HTML entities
+                        content_formatted = re.sub(r'\n{3,}', '\n\n', content_formatted)  # Clean multiple newlines
+                        content_formatted = content_formatted.strip()
+                    
                     articles.append({
                         "id": node.get("id", ""),
                         "title": node.get("title", ""),
@@ -3946,8 +3964,8 @@ async def get_news():
                         "published_at": node.get("publishedAt", ""),
                         "excerpt": node.get("excerpt", ""),
                         "excerpt_html": node.get("excerptHtml", ""),
-                        "content": node.get("content", ""),  # Plain text for old app versions
-                        "content_html": node.get("contentHtml", ""),  # HTML for new app versions
+                        "content": content_formatted,  # Formatted plain text for old app versions
+                        "content_html": content_html,  # HTML for new app versions
                         "image_url": node.get("image", {}).get("url") if node.get("image") else None,
                         "blog_title": node.get("blog", {}).get("title", "News"),
                         "tags": tags,  # Original tags
