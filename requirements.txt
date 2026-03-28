@@ -11,3 +11,4 @@ httpx==0.28.1
 pydantic==2.12.5
 email-validator==2.3.0
 python-multipart==0.0.22
+sib-api-v3-sdk==7.6.0

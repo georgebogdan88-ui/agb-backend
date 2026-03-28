@@ -37,6 +37,9 @@ SHOPIFY_CLIENT_ID = os.environ.get('SHOPIFY_CLIENT_ID', '38d338d6b94e38743c88c38
 SHOPIFY_CLIENT_SECRET = os.environ.get('SHOPIFY_CLIENT_SECRET', '')
 SHOPIFY_ADMIN_TOKEN = os.environ.get('SHOPIFY_ADMIN_TOKEN', '')  # Will be set after OAuth
 
+# Brevo Email Configuration
+BREVO_API_KEY = os.environ.get('BREVO_API_KEY', '')
+
 # Auto-sync configuration
 AUTO_SYNC_INTERVAL_MINUTES = int(os.environ.get('AUTO_SYNC_INTERVAL_MINUTES', '5'))  # Default 5 minutes
 
@@ -3958,6 +3961,130 @@ async def debug_customer_notes(email: str):
         "notes_preview": notes[:300] if notes else None,
         "contains_equipment": "UTILAJELE CLIENTULUI:" in notes if notes else False
     }
+
+# ==================== EMAIL NOTIFICATIONS (BREVO) ====================
+
+async def send_blog_notification_email(recipient_email: str, recipient_name: str, blog_title: str, blog_excerpt: str, blog_url: str):
+    """Send email notification about new blog post using Brevo API"""
+    try:
+        if not BREVO_API_KEY:
+            logger.warning("BREVO_API_KEY not set - skipping email")
+            return False
+        
+        import sib_api_v3_sdk
+        from sib_api_v3_sdk.rest import ApiException
+        
+        configuration = sib_api_v3_sdk.Configuration()
+        configuration.api_key['api-key'] = BREVO_API_KEY
+        
+        api_instance = sib_api_v3_sdk.TransactionalEmailsApi(sib_api_v3_sdk.ApiClient(configuration))
+        
+        # Clean excerpt
+        clean_excerpt = blog_excerpt.replace('<[^>]*>', '')[:200] if blog_excerpt else ''
+        
+        html_content = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif; background-color: #f5f5f5; padding: 20px;">
+            <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 10px; overflow: hidden;">
+                <div style="background-color: #367c2b; padding: 20px; text-align: center;">
+                    <h1 style="color: #ffffff; margin: 0;">🚜 AGB Agroparts</h1>
+                </div>
+                <div style="padding: 30px;">
+                    <h2 style="color: #333;">Noutate pentru utilajul tău!</h2>
+                    <h3 style="color: #367c2b;">{blog_title}</h3>
+                    <p style="color: #666; line-height: 1.6;">{clean_excerpt}...</p>
+                    <div style="text-align: center; margin-top: 30px;">
+                        <a href="{blog_url}" style="background-color: #367c2b; color: #ffffff; padding: 15px 30px; text-decoration: none; border-radius: 5px; font-weight: bold;">
+                            Citește articolul
+                        </a>
+                    </div>
+                </div>
+                <div style="background-color: #f0f0f0; padding: 15px; text-align: center; font-size: 12px; color: #999;">
+                    <p>Primești acest email pentru că ai un utilaj înregistrat în aplicația AGB Agroparts.</p>
+                    <p>AGB Agroparts Solution S.R.L.</p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        
+        send_smtp_email = sib_api_v3_sdk.SendSmtpEmail(
+            to=[{"email": recipient_email, "name": recipient_name}],
+            sender={"email": "noreply@agb-agroparts.ro", "name": "AGB Agroparts"},
+            subject=f"🚜 Noutate: {blog_title}",
+            html_content=html_content
+        )
+        
+        api_instance.send_transac_email(send_smtp_email)
+        logger.info(f"Email sent to {recipient_email} for blog: {blog_title}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error sending email to {recipient_email}: {e}")
+        return False
+
+@api_router.post("/notifications/send-blog-emails")
+async def send_blog_notification_to_matching_users(
+    blog_title: str,
+    blog_excerpt: str = "",
+    blog_url: str = "",
+    model_tags: list = []
+):
+    """Send email notifications to users whose equipment matches the blog tags"""
+    try:
+        if not BREVO_API_KEY:
+            raise HTTPException(status_code=500, detail="BREVO_API_KEY not configured")
+        
+        # Get all users with equipment
+        users_with_equipment = await db.users.find(
+            {"equipment": {"$exists": True, "$ne": []}},
+            {"email": 1, "name": 1, "equipment": 1}
+        ).to_list(1000)
+        
+        sent_count = 0
+        matched_users = []
+        
+        for user in users_with_equipment:
+            user_email = user.get("email", "")
+            user_name = user.get("name", "Client")
+            user_equipment = user.get("equipment", [])
+            
+            # Get user's equipment models
+            user_models = [eq.get("model", "").lower().strip() for eq in user_equipment if eq.get("model")]
+            
+            # If no tags specified, send to all users with equipment
+            if not model_tags:
+                should_send = True
+            else:
+                # Check if any user model matches any blog tag
+                normalized_tags = [tag.lower().strip() for tag in model_tags]
+                should_send = any(
+                    any(tag in model or model in tag for tag in normalized_tags)
+                    for model in user_models
+                )
+            
+            if should_send and user_email:
+                success = await send_blog_notification_email(
+                    recipient_email=user_email,
+                    recipient_name=user_name,
+                    blog_title=blog_title,
+                    blog_excerpt=blog_excerpt,
+                    blog_url=blog_url
+                )
+                if success:
+                    sent_count += 1
+                    matched_users.append(user_email)
+        
+        return {
+            "success": True,
+            "emails_sent": sent_count,
+            "matched_users": matched_users,
+            "model_tags_used": model_tags
+        }
+        
+    except Exception as e:
+        logger.error(f"Error sending blog notifications: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # Include the router in the main app - MUST be after all route definitions
 app.include_router(api_router)
