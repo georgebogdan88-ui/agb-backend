@@ -1306,11 +1306,30 @@ async def register_user(user_data: UserRegister):
         if errors:
             error_msg = errors[0].get("message", "Eroare la înregistrare")
             error_code = errors[0].get("code", "")
+            error_field = errors[0].get("field", [""])[0] if errors[0].get("field") else ""
             
-            if error_code == "TAKEN" or "already" in error_msg.lower():
-                raise HTTPException(status_code=400, detail="Adresa de email este deja înregistrată")
+            logger.info(f"Registration error - code: {error_code}, field: {error_field}, msg: {error_msg}")
+            
+            if error_code == "TAKEN":
+                if error_field == "phone" or "phone" in error_msg.lower():
+                    raise HTTPException(status_code=400, detail="Numărul de telefon este deja înregistrat pe alt cont")
+                elif error_field == "email" or "email" in error_msg.lower():
+                    # Check if user exists in local DB but was deleted from Shopify
+                    existing_user = await db.users.find_one({"email": user_data.email.lower()})
+                    if existing_user:
+                        # Delete from local DB to allow re-registration
+                        await db.users.delete_one({"email": user_data.email.lower()})
+                        logger.info(f"Deleted orphaned local user: {user_data.email}")
+                    raise HTTPException(status_code=400, detail="Adresa de email este deja înregistrată în Shopify")
+                else:
+                    raise HTTPException(status_code=400, detail="Email-ul sau telefonul este deja înregistrat")
             if error_code == "TOO_SHORT":
                 raise HTTPException(status_code=400, detail="Parola trebuie să aibă minim 5 caractere")
+            if error_code == "INVALID":
+                if "phone" in error_field.lower() or "phone" in error_msg.lower():
+                    raise HTTPException(status_code=400, detail="Numărul de telefon este invalid. Folosiți formatul +40XXXXXXXXX")
+                elif "email" in error_field.lower() or "email" in error_msg.lower():
+                    raise HTTPException(status_code=400, detail="Adresa de email este invalidă")
             raise HTTPException(status_code=400, detail=error_msg)
         
         customer = result.get("customer")
