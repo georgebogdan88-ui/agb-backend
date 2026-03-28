@@ -2466,6 +2466,8 @@ async def update_user_equipment(request: Request, equipment_id: str, equipment_d
                 eq["engine_type"] = equipment_data.engine_type
             if equipment_data.transmission_type is not None:
                 eq["transmission_type"] = equipment_data.transmission_type
+            if equipment_data.front_axle_model is not None:
+                eq["front_axle_model"] = equipment_data.front_axle_model
             if equipment_data.features is not None:
                 eq["features"] = equipment_data.features
             equipment_found = True
