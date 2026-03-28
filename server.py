@@ -3878,6 +3878,7 @@ async def get_news():
                                     publishedAt
                                     excerpt
                                     content
+                                    tags
                                     image {
                                         url
                                     }
@@ -3915,6 +3916,10 @@ async def get_news():
                 blog_articles = blog.get("node", {}).get("articles", {}).get("edges", [])
                 for article in blog_articles:
                     node = article.get("node", {})
+                    # Get tags and normalize them (lowercase, trimmed)
+                    tags = node.get("tags", []) or []
+                    normalized_tags = [tag.strip().lower() for tag in tags]
+                    
                     articles.append({
                         "id": node.get("id", ""),
                         "title": node.get("title", ""),
@@ -3923,7 +3928,9 @@ async def get_news():
                         "excerpt": node.get("excerpt", ""),
                         "content": node.get("content", ""),
                         "image_url": node.get("image", {}).get("url") if node.get("image") else None,
-                        "blog_title": node.get("blog", {}).get("title", "News")
+                        "blog_title": node.get("blog", {}).get("title", "News"),
+                        "tags": tags,  # Original tags
+                        "model_tags": normalized_tags  # Normalized for matching
                     })
             
             # Sort by published date
