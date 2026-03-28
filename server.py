@@ -19,7 +19,8 @@ import hashlib
 import hmac
 
 ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / '.env')
+# Load .env but don't override existing environment variables (important for Render deployment)
+load_dotenv(ROOT_DIR / '.env', override=False)
 
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
@@ -2700,11 +2701,6 @@ async def get_webhook_status():
 
 # ==================== SHOPIFY OAUTH2 FOR ADMIN API ====================
 
-# Load OAuth credentials
-SHOPIFY_CLIENT_ID = os.environ.get('SHOPIFY_CLIENT_ID', '')
-SHOPIFY_CLIENT_SECRET = os.environ.get('SHOPIFY_CLIENT_SECRET', '')
-SHOPIFY_ADMIN_TOKEN = os.environ.get('SHOPIFY_ADMIN_TOKEN', '')
-
 # OAuth scopes needed for order creation
 SHOPIFY_OAUTH_SCOPES = "write_orders,read_orders,read_products,write_products"
 
@@ -3899,6 +3895,7 @@ async def get_news():
                                     publishedAt
                                     excerpt
                                     excerptHtml
+                                    content
                                     contentHtml
                                     tags
                                     image {
@@ -3949,7 +3946,8 @@ async def get_news():
                         "published_at": node.get("publishedAt", ""),
                         "excerpt": node.get("excerpt", ""),
                         "excerpt_html": node.get("excerptHtml", ""),
-                        "content_html": node.get("contentHtml", ""),
+                        "content": node.get("content", ""),  # Plain text for old app versions
+                        "content_html": node.get("contentHtml", ""),  # HTML for new app versions
                         "image_url": node.get("image", {}).get("url") if node.get("image") else None,
                         "blog_title": node.get("blog", {}).get("title", "News"),
                         "tags": tags,  # Original tags
