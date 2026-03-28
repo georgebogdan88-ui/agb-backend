@@ -3853,5 +3853,87 @@ async def privacy_policy():
     """
     return HTMLResponse(content=html_content)
 
+# ==================== BLOG/NEWS NOTIFICATIONS ====================
+
+@api_router.get("/news")
+async def get_news():
+    """Fetch blog posts from Shopify for news/notifications"""
+    try:
+        if not SHOPIFY_STOREFRONT_TOKEN:
+            return {"articles": [], "count": 0}
+        
+        query = """
+        {
+            blogs(first: 5) {
+                edges {
+                    node {
+                        title
+                        handle
+                        articles(first: 10, sortKey: PUBLISHED_AT, reverse: true) {
+                            edges {
+                                node {
+                                    id
+                                    title
+                                    handle
+                                    publishedAt
+                                    excerpt
+                                    content
+                                    image {
+                                        url
+                                    }
+                                    blog {
+                                        title
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        """
+        
+        headers = {
+            "Content-Type": "application/json",
+            "X-Shopify-Storefront-Access-Token": SHOPIFY_STOREFRONT_TOKEN
+        }
+        
+        async with httpx.AsyncClient() as http_client:
+            response = await http_client.post(
+                f"https://{SHOPIFY_STORE}/api/{SHOPIFY_API_VERSION}/graphql.json",
+                json={"query": query},
+                headers=headers,
+                timeout=30.0
+            )
+            
+            data = response.json()
+            
+            articles = []
+            blogs = data.get("data", {}).get("blogs", {}).get("edges", [])
+            
+            for blog in blogs:
+                blog_articles = blog.get("node", {}).get("articles", {}).get("edges", [])
+                for article in blog_articles:
+                    node = article.get("node", {})
+                    articles.append({
+                        "id": node.get("id", ""),
+                        "title": node.get("title", ""),
+                        "handle": node.get("handle", ""),
+                        "published_at": node.get("publishedAt", ""),
+                        "excerpt": node.get("excerpt", ""),
+                        "content": node.get("content", ""),
+                        "image_url": node.get("image", {}).get("url") if node.get("image") else None,
+                        "blog_title": node.get("blog", {}).get("title", "News")
+                    })
+            
+            # Sort by published date
+            articles.sort(key=lambda x: x.get("published_at", ""), reverse=True)
+            
+            return {"articles": articles[:20], "count": len(articles)}
+    
+    except Exception as e:
+        logger.error(f"Error fetching news: {e}")
+        return {"articles": [], "count": 0, "error": str(e)}
+
 # Include the router in the main app - MUST be after all route definitions
 app.include_router(api_router)
