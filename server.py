@@ -3440,15 +3440,24 @@ async def feature_graphic():
 
 async def get_admin_access_token():
     """Get the stored admin access token from database or environment"""
-    # First check environment variable
+    # First check environment variable directly
+    admin_token = os.environ.get('SHOPIFY_ADMIN_TOKEN', '')
+    if admin_token:
+        logger.info(f"Using SHOPIFY_ADMIN_TOKEN from env: {admin_token[:10]}...")
+        return admin_token
+    
+    # Fallback to global variable
     if SHOPIFY_ADMIN_TOKEN:
+        logger.info(f"Using SHOPIFY_ADMIN_TOKEN from global: {SHOPIFY_ADMIN_TOKEN[:10]}...")
         return SHOPIFY_ADMIN_TOKEN
     
     # Then check database
     token_doc = await db.shopify_tokens.find_one({"store": SHOPIFY_STORE})
     if token_doc:
+        logger.info("Using token from database")
         return token_doc.get("access_token")
     
+    logger.warning("No Shopify Admin Token found!")
     return None
 
 @api_router.get("/shopify/install")
