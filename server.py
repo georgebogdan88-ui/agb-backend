@@ -1394,6 +1394,48 @@ async def register_user(user_data: UserRegister):
         }
     }
 
+class ForgotPasswordRequest(BaseModel):
+    email: str
+
+@api_router.post("/auth/forgot-password")
+async def forgot_password(request: ForgotPasswordRequest):
+    """Send password reset email via Shopify"""
+    
+    mutation = """
+    mutation customerRecover($email: String!) {
+        customerRecover(email: $email) {
+            customerUserErrors {
+                code
+                field
+                message
+            }
+        }
+    }
+    """
+    
+    headers = {
+        "Content-Type": "application/json",
+        "X-Shopify-Storefront-Access-Token": SHOPIFY_STOREFRONT_TOKEN
+    }
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"https://{SHOPIFY_STORE}/api/{SHOPIFY_API_VERSION}/graphql.json",
+            json={"query": mutation, "variables": {"email": request.email.lower()}},
+            headers=headers
+        )
+        
+        data = response.json()
+        logger.info(f"Shopify password recovery response: {data}")
+        
+        errors = data.get("data", {}).get("customerRecover", {}).get("customerUserErrors", [])
+        
+        if errors:
+            error_msg = errors[0].get("message", "Eroare la trimiterea emailului")
+            raise HTTPException(status_code=400, detail=error_msg)
+        
+        return {"message": "Email de resetare trimis cu succes"}
+
 @api_router.post("/auth/login")
 async def login_user(credentials: UserLogin):
     """Login a user - Uses Shopify authentication"""
