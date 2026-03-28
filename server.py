@@ -2145,22 +2145,22 @@ async def parse_equipment_from_shopify_notes(notes: str) -> list:
                     "synced_from_shopify": True
                 }
             
-            # Parse equipment details
-            elif current_equipment and line.startswith('•'):
+            # Parse equipment details (lines starting with • or spaces + •)
+            elif current_equipment and '•' in line:
                 detail = line.replace('•', '').strip()
                 
-                if detail.startswith('Serie șasiu:'):
-                    current_equipment["chassis_serial"] = detail.replace('Serie șasiu:', '').strip()
-                elif detail.startswith('Serie motor:'):
-                    current_equipment["engine_serial"] = detail.replace('Serie motor:', '').strip()
-                elif detail.startswith('Model motor:'):
-                    current_equipment["engine_type"] = detail.replace('Model motor:', '').strip()
-                elif detail.startswith('Model cutie:'):
-                    current_equipment["transmission_type"] = detail.replace('Model cutie:', '').strip()
-                elif detail.startswith('Model punte față:'):
-                    current_equipment["front_axle_model"] = detail.replace('Model punte față:', '').strip()
-                elif detail.startswith('Echipare:'):
-                    features_str = detail.replace('Echipare:', '').strip()
+                if 'Serie șasiu:' in detail:
+                    current_equipment["chassis_serial"] = detail.split('Serie șasiu:')[1].strip()
+                elif 'Serie motor:' in detail:
+                    current_equipment["engine_serial"] = detail.split('Serie motor:')[1].strip()
+                elif 'Model motor:' in detail:
+                    current_equipment["engine_type"] = detail.split('Model motor:')[1].strip()
+                elif 'Model cutie:' in detail:
+                    current_equipment["transmission_type"] = detail.split('Model cutie:')[1].strip()
+                elif 'Model punte față:' in detail:
+                    current_equipment["front_axle_model"] = detail.split('Model punte față:')[1].strip()
+                elif 'Echipare:' in detail:
+                    features_str = detail.split('Echipare:')[1].strip()
                     current_equipment["features"] = [f.strip() for f in features_str.split(',') if f.strip()]
         
         # Don't forget the last equipment
