@@ -2046,6 +2046,115 @@ async def get_user_shopify_orders(request: Request):
 
 # ==================== EQUIPMENT/UTILAJE ENDPOINTS ====================
 
+async def parse_equipment_from_shopify_notes(notes: str) -> list:
+    """Parse equipment from Shopify customer notes format"""
+    equipment_list = []
+    
+    if not notes or "UTILAJELE CLIENTULUI:" not in notes:
+        return equipment_list
+    
+    try:
+        # Split by equipment entries (numbered lines like "1. 6820")
+        lines = notes.split('\n')
+        current_equipment = None
+        
+        for line in lines:
+            line = line.strip()
+            
+            # Check for new equipment entry (starts with number followed by .)
+            if line and line[0].isdigit() and '. ' in line:
+                # Save previous equipment if exists
+                if current_equipment:
+                    equipment_list.append(current_equipment)
+                
+                # Extract model name
+                parts = line.split('. ', 1)
+                model = parts[1] if len(parts) > 1 else line
+                
+                current_equipment = {
+                    "id": str(uuid.uuid4()),
+                    "model": model,
+                    "chassis_serial": "",
+                    "engine_serial": "",
+                    "engine_type": "",
+                    "transmission_type": "",
+                    "front_axle_model": "",
+                    "features": [],
+                    "created_at": datetime.utcnow().isoformat(),
+                    "synced_from_shopify": True
+                }
+            
+            # Parse equipment details
+            elif current_equipment and line.startswith('•'):
+                detail = line.replace('•', '').strip()
+                
+                if detail.startswith('Serie șasiu:'):
+                    current_equipment["chassis_serial"] = detail.replace('Serie șasiu:', '').strip()
+                elif detail.startswith('Serie motor:'):
+                    current_equipment["engine_serial"] = detail.replace('Serie motor:', '').strip()
+                elif detail.startswith('Model motor:'):
+                    current_equipment["engine_type"] = detail.replace('Model motor:', '').strip()
+                elif detail.startswith('Model cutie:'):
+                    current_equipment["transmission_type"] = detail.replace('Model cutie:', '').strip()
+                elif detail.startswith('Model punte față:'):
+                    current_equipment["front_axle_model"] = detail.replace('Model punte față:', '').strip()
+                elif detail.startswith('Echipare:'):
+                    features_str = detail.replace('Echipare:', '').strip()
+                    current_equipment["features"] = [f.strip() for f in features_str.split(',') if f.strip()]
+        
+        # Don't forget the last equipment
+        if current_equipment:
+            equipment_list.append(current_equipment)
+        
+        return equipment_list
+    except Exception as e:
+        logger.error(f"Error parsing equipment from Shopify notes: {e}")
+        return []
+
+async def get_shopify_customer_notes(user_email: str) -> str:
+    """Get customer notes from Shopify"""
+    try:
+        if not SHOPIFY_ADMIN_TOKEN:
+            return ""
+        
+        headers = {
+            "Content-Type": "application/json",
+            "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN
+        }
+        
+        search_query = """
+        query findCustomer($email: String!) {
+            customers(first: 1, query: $email) {
+                edges {
+                    node {
+                        id
+                        email
+                        note
+                    }
+                }
+            }
+        }
+        """
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"https://{SHOPIFY_STORE}/admin/api/2024-01/graphql.json",
+                json={"query": search_query, "variables": {"email": f"email:{user_email}"}},
+                headers=headers,
+                timeout=30.0
+            )
+            
+            data = response.json()
+            customers = data.get("data", {}).get("customers", {}).get("edges", [])
+            
+            if customers:
+                return customers[0]["node"].get("note", "") or ""
+        
+        return ""
+    except Exception as e:
+        logger.error(f"Error getting Shopify customer notes: {e}")
+        return ""
+
 async def sync_equipment_to_shopify_notes(user_email: str, equipment_list: list):
     """Sync user's equipment to Shopify customer notes"""
     try:
@@ -2068,6 +2177,8 @@ async def sync_equipment_to_shopify_notes(user_email: str, equipment_list: list)
                     notes_lines.append(f"   • Model motor: {eq['engine_type']}")
                 if eq.get('transmission_type'):
                     notes_lines.append(f"   • Model cutie: {eq['transmission_type']}")
+                if eq.get('front_axle_model'):
+                    notes_lines.append(f"   • Model punte față: {eq['front_axle_model']}")
                 if eq.get('features') and len(eq['features']) > 0:
                     notes_lines.append(f"   • Echipare: {', '.join(eq['features'])}")
                 notes_lines.append("")
@@ -2158,7 +2269,7 @@ async def sync_equipment_to_shopify_notes(user_email: str, equipment_list: list)
 
 @api_router.get("/auth/equipment")
 async def get_user_equipment(request: Request):
-    """Get all equipment for authenticated user"""
+    """Get all equipment for authenticated user - syncs from Shopify if notes changed"""
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Token lipsă sau invalid")
@@ -2175,9 +2286,37 @@ async def get_user_equipment(request: Request):
     if not user:
         raise HTTPException(status_code=401, detail="Token invalid sau expirat")
     
-    # Get equipment from user's equipment array or separate collection
-    equipment = user.get("equipment", [])
-    return {"equipment": equipment, "count": len(equipment), "max_allowed": 10}
+    # Get equipment from user's equipment array
+    local_equipment = user.get("equipment", [])
+    
+    # Try to sync from Shopify notes
+    try:
+        shopify_notes = await get_shopify_customer_notes(user.get("email", ""))
+        if shopify_notes and "UTILAJELE CLIENTULUI:" in shopify_notes:
+            shopify_equipment = await parse_equipment_from_shopify_notes(shopify_notes)
+            
+            # If Shopify has equipment and local doesn't, sync from Shopify
+            if shopify_equipment and not local_equipment:
+                # Save to local DB
+                await db.users.update_one(
+                    {"_id": user["_id"]},
+                    {"$set": {"equipment": shopify_equipment}}
+                )
+                local_equipment = shopify_equipment
+                logger.info(f"Synced {len(shopify_equipment)} equipment from Shopify for {user.get('email')}")
+            
+            # If counts differ and Shopify has more, update from Shopify
+            elif shopify_equipment and len(shopify_equipment) > len(local_equipment):
+                await db.users.update_one(
+                    {"_id": user["_id"]},
+                    {"$set": {"equipment": shopify_equipment}}
+                )
+                local_equipment = shopify_equipment
+                logger.info(f"Updated equipment from Shopify ({len(shopify_equipment)} items) for {user.get('email')}")
+    except Exception as e:
+        logger.error(f"Error syncing from Shopify: {e}")
+    
+    return {"equipment": local_equipment, "count": len(local_equipment), "max_allowed": 10}
 
 @api_router.post("/auth/equipment")
 async def add_user_equipment(request: Request, equipment_data: EquipmentCreate):
