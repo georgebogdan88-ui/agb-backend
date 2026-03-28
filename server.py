@@ -2368,7 +2368,23 @@ async def get_user_equipment(request: Request):
     except Exception as e:
         logger.error(f"Error syncing from Shopify: {e}")
     
-    return {"equipment": local_equipment, "count": len(local_equipment), "max_allowed": 10}
+    # Convert None values to empty strings for frontend
+    cleaned_equipment = []
+    for eq in local_equipment:
+        cleaned_eq = {
+            "id": eq.get("id", ""),
+            "model": eq.get("model", ""),
+            "chassis_serial": eq.get("chassis_serial") or "",
+            "engine_serial": eq.get("engine_serial") or "",
+            "engine_type": eq.get("engine_type") or "",
+            "transmission_type": eq.get("transmission_type") or "",
+            "front_axle_model": eq.get("front_axle_model") or "",
+            "features": eq.get("features") or [],
+            "created_at": eq.get("created_at", ""),
+        }
+        cleaned_equipment.append(cleaned_eq)
+    
+    return {"equipment": cleaned_equipment, "count": len(cleaned_equipment), "max_allowed": 10}
 
 @api_router.post("/auth/equipment")
 async def add_user_equipment(request: Request, equipment_data: EquipmentCreate):
