@@ -3898,7 +3898,8 @@ async def get_news():
                                     handle
                                     publishedAt
                                     excerpt
-                                    content
+                                    excerptHtml
+                                    contentHtml
                                     tags
                                     image {
                                         url
@@ -3947,7 +3948,8 @@ async def get_news():
                         "handle": node.get("handle", ""),
                         "published_at": node.get("publishedAt", ""),
                         "excerpt": node.get("excerpt", ""),
-                        "content": node.get("content", ""),
+                        "excerpt_html": node.get("excerptHtml", ""),
+                        "content_html": node.get("contentHtml", ""),
                         "image_url": node.get("image", {}).get("url") if node.get("image") else None,
                         "blog_title": node.get("blog", {}).get("title", "News"),
                         "tags": tags,  # Original tags
