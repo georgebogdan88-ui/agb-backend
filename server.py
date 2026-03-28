@@ -2173,9 +2173,10 @@ async def parse_equipment_from_shopify_notes(notes: str) -> list:
         return []
 
 async def get_shopify_customer_notes(user_email: str) -> str:
-    """Get customer notes from Shopify"""
+    """Get customer notes from Shopify using Admin API"""
     try:
         if not SHOPIFY_ADMIN_TOKEN:
+            logger.warning("SHOPIFY_ADMIN_TOKEN not set")
             return ""
         
         headers = {
@@ -2183,33 +2184,25 @@ async def get_shopify_customer_notes(user_email: str) -> str:
             "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN
         }
         
-        search_query = """
-        query findCustomer($email: String!) {
-            customers(first: 1, query: $email) {
-                edges {
-                    node {
-                        id
-                        email
-                        note
-                    }
-                }
-            }
-        }
-        """
+        # Use REST API for customer search - more reliable
+        search_url = f"https://{SHOPIFY_STORE}/admin/api/2024-01/customers/search.json?query=email:{user_email}"
         
         async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"https://{SHOPIFY_STORE}/admin/api/2024-01/graphql.json",
-                json={"query": search_query, "variables": {"email": f"email:{user_email}"}},
+            response = await client.get(
+                search_url,
                 headers=headers,
                 timeout=30.0
             )
             
             data = response.json()
-            customers = data.get("data", {}).get("customers", {}).get("edges", [])
+            customers = data.get("customers", [])
             
             if customers:
-                return customers[0]["node"].get("note", "") or ""
+                note = customers[0].get("note", "") or ""
+                logger.info(f"Shopify notes for {user_email}: {note[:50] if note else 'empty'}...")
+                return note
+            else:
+                logger.info(f"No Shopify customer found for {user_email}")
         
         return ""
     except Exception as e:
