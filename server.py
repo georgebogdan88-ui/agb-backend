@@ -2182,6 +2182,8 @@ async def get_shopify_customer_notes(user_email: str) -> str:
             logger.warning("SHOPIFY_ADMIN_TOKEN not set")
             return ""
         
+        logger.info(f"Fetching Shopify notes for {user_email} using store: {SHOPIFY_STORE}")
+        
         headers = {
             "Content-Type": "application/json",
             "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN
@@ -2189,6 +2191,7 @@ async def get_shopify_customer_notes(user_email: str) -> str:
         
         # Use REST API for customer search - more reliable
         search_url = f"https://{SHOPIFY_STORE}/admin/api/2024-01/customers/search.json?query=email:{user_email}"
+        logger.info(f"Shopify search URL: {search_url}")
         
         async with httpx.AsyncClient() as client:
             response = await client.get(
@@ -2197,19 +2200,27 @@ async def get_shopify_customer_notes(user_email: str) -> str:
                 timeout=30.0
             )
             
+            logger.info(f"Shopify response status: {response.status_code}")
             data = response.json()
+            logger.info(f"Shopify response data keys: {data.keys()}")
+            
             customers = data.get("customers", [])
+            logger.info(f"Found {len(customers)} customers")
             
             if customers:
                 note = customers[0].get("note", "") or ""
-                logger.info(f"Shopify notes for {user_email}: {note[:50] if note else 'empty'}...")
+                logger.info(f"Shopify notes for {user_email}: {note[:100] if note else 'empty'}...")
                 return note
             else:
                 logger.info(f"No Shopify customer found for {user_email}")
+                if "errors" in data:
+                    logger.error(f"Shopify API errors: {data['errors']}")
         
         return ""
     except Exception as e:
         logger.error(f"Error getting Shopify customer notes: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return ""
 
 async def sync_equipment_to_shopify_notes(user_email: str, equipment_list: list):
