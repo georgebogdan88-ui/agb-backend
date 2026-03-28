@@ -3935,5 +3935,29 @@ async def get_news():
         logger.error(f"Error fetching news: {e}")
         return {"articles": [], "count": 0, "error": str(e)}
 
+@api_router.get("/debug/shopify-token")
+async def debug_shopify_token():
+    """Debug endpoint to check if Shopify Admin Token is set"""
+    has_token = bool(SHOPIFY_ADMIN_TOKEN and len(SHOPIFY_ADMIN_TOKEN) > 10)
+    return {
+        "has_shopify_admin_token": has_token,
+        "token_length": len(SHOPIFY_ADMIN_TOKEN) if SHOPIFY_ADMIN_TOKEN else 0,
+        "token_prefix": SHOPIFY_ADMIN_TOKEN[:10] + "..." if has_token else "NOT SET"
+    }
+
+@api_router.get("/debug/customer-notes/{email}")
+async def debug_customer_notes(email: str):
+    """Debug endpoint to fetch customer notes"""
+    if not SHOPIFY_ADMIN_TOKEN:
+        return {"error": "SHOPIFY_ADMIN_TOKEN not set", "notes": None}
+    
+    notes = await get_shopify_customer_notes(email)
+    return {
+        "email": email,
+        "has_notes": bool(notes),
+        "notes_preview": notes[:300] if notes else None,
+        "contains_equipment": "UTILAJELE CLIENTULUI:" in notes if notes else False
+    }
+
 # Include the router in the main app - MUST be after all route definitions
 app.include_router(api_router)
