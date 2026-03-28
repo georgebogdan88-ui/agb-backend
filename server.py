@@ -2178,19 +2178,23 @@ async def parse_equipment_from_shopify_notes(notes: str) -> list:
 async def get_shopify_customer_notes(user_email: str) -> str:
     """Get customer notes from Shopify using Admin API"""
     try:
-        if not SHOPIFY_ADMIN_TOKEN:
+        # Get token directly from environment
+        admin_token = os.environ.get('SHOPIFY_ADMIN_TOKEN', '') or SHOPIFY_ADMIN_TOKEN
+        
+        if not admin_token:
             logger.warning("SHOPIFY_ADMIN_TOKEN not set")
             return ""
         
-        logger.info(f"Fetching Shopify notes for {user_email} using store: {SHOPIFY_STORE}")
+        store = os.environ.get('SHOPIFY_STORE', '43ca3c-3.myshopify.com')
+        logger.info(f"Fetching Shopify notes for {user_email} using store: {store}")
         
         headers = {
             "Content-Type": "application/json",
-            "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN
+            "X-Shopify-Access-Token": admin_token
         }
         
         # Use REST API for customer search - more reliable
-        search_url = f"https://{SHOPIFY_STORE}/admin/api/2024-01/customers/search.json?query=email:{user_email}"
+        search_url = f"https://{store}/admin/api/2024-01/customers/search.json?query=email:{user_email}"
         logger.info(f"Shopify search URL: {search_url}")
         
         async with httpx.AsyncClient() as client:
@@ -2202,7 +2206,6 @@ async def get_shopify_customer_notes(user_email: str) -> str:
             
             logger.info(f"Shopify response status: {response.status_code}")
             data = response.json()
-            logger.info(f"Shopify response data keys: {data.keys()}")
             
             customers = data.get("customers", [])
             logger.info(f"Found {len(customers)} customers")
