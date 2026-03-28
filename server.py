@@ -175,6 +175,7 @@ class Equipment(BaseModel):
     engine_serial: Optional[str] = None  # Serie motor
     engine_type: Optional[str] = None  # Model motor
     transmission_type: Optional[str] = None  # Model cutie viteze
+    front_axle_model: Optional[str] = None  # Model punte față
     features: Optional[List[str]] = None  # Echipări selectate
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
@@ -185,6 +186,7 @@ class EquipmentCreate(BaseModel):
     engine_serial: Optional[str] = None
     engine_type: Optional[str] = None
     transmission_type: Optional[str] = None
+    front_axle_model: Optional[str] = None
     features: Optional[List[str]] = None
 
 class EquipmentUpdate(BaseModel):
@@ -194,6 +196,7 @@ class EquipmentUpdate(BaseModel):
     engine_serial: Optional[str] = None
     engine_type: Optional[str] = None
     transmission_type: Optional[str] = None
+    front_axle_model: Optional[str] = None
     features: Optional[List[str]] = None
 
 class UserResponse(BaseModel):
@@ -2208,6 +2211,7 @@ async def add_user_equipment(request: Request, equipment_data: EquipmentCreate):
         "engine_serial": equipment_data.engine_serial,
         "engine_type": equipment_data.engine_type,
         "transmission_type": equipment_data.transmission_type,
+        "front_axle_model": equipment_data.front_axle_model,
         "features": equipment_data.features,
         "created_at": datetime.utcnow().isoformat()
     }
