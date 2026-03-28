@@ -2223,25 +2223,22 @@ async def sync_equipment_to_shopify_notes(user_email: str, equipment_list: list)
             logger.warning("SHOPIFY_ADMIN_TOKEN not configured - skipping Shopify sync")
             return False
         
-        # Build notes text
+        # Build notes text - ALWAYS include all fields as template
         if not equipment_list:
             notes_text = "🚜 UTILAJELE CLIENTULUI:\n(Niciun utilaj adăugat)"
         else:
             notes_lines = ["🚜 UTILAJELE CLIENTULUI:", ""]
             for i, eq in enumerate(equipment_list, 1):
                 notes_lines.append(f"{i}. {eq.get('model', 'N/A')}")
-                if eq.get('chassis_serial'):
-                    notes_lines.append(f"   • Serie șasiu: {eq['chassis_serial']}")
-                if eq.get('engine_serial'):
-                    notes_lines.append(f"   • Serie motor: {eq['engine_serial']}")
-                if eq.get('engine_type'):
-                    notes_lines.append(f"   • Model motor: {eq['engine_type']}")
-                if eq.get('transmission_type'):
-                    notes_lines.append(f"   • Model cutie: {eq['transmission_type']}")
-                if eq.get('front_axle_model'):
-                    notes_lines.append(f"   • Model punte față: {eq['front_axle_model']}")
-                if eq.get('features') and len(eq['features']) > 0:
-                    notes_lines.append(f"   • Echipare: {', '.join(eq['features'])}")
+                # Always include all fields, even if empty (as template for admin to fill)
+                notes_lines.append(f"   • Serie șasiu: {eq.get('chassis_serial', '')}")
+                notes_lines.append(f"   • Serie motor: {eq.get('engine_serial', '')}")
+                notes_lines.append(f"   • Model motor: {eq.get('engine_type', '')}")
+                notes_lines.append(f"   • Model cutie: {eq.get('transmission_type', '')}")
+                notes_lines.append(f"   • Model punte față: {eq.get('front_axle_model', '')}")
+                features = eq.get('features', [])
+                features_str = ', '.join(features) if features else ''
+                notes_lines.append(f"   • Echipare: {features_str}")
                 notes_lines.append("")
             notes_text = "\n".join(notes_lines)
         
