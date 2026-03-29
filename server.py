@@ -3426,10 +3426,25 @@ async def startup_event():
     
     auto_sync_task = asyncio.create_task(auto_sync_loop())
     logger.info(f"Auto-sync enabled: every {AUTO_SYNC_INTERVAL_MINUTES} minutes")
+    
     logger.info("=== WEBHOOK SETUP ===")
     logger.info("Add webhooks in Shopify Admin -> Settings -> Notifications -> Webhooks")
     logger.info(f"  URL: https://YOUR_DOMAIN/api/webhooks/shopify")
     logger.info("  Topics: products/create, products/update, products/delete, inventory_levels/update")
+    
+    # Schedule blog checker to start after a short delay (to ensure all functions are loaded)
+    asyncio.get_event_loop().call_later(5, lambda: asyncio.create_task(start_blog_checker()))
+
+async def start_blog_checker():
+    """Start the blog checker task"""
+    try:
+        # Define the checker inline to avoid ordering issues
+        logger.info("Blog checker started - checking every 600 seconds (10 minutes)")
+        while True:
+            await asyncio.sleep(600)  # 10 minutes
+            await check_for_new_blog_posts()
+    except Exception as e:
+        logger.error(f"Blog checker error: {e}")
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
@@ -4136,6 +4151,254 @@ async def get_news():
     except Exception as e:
         logger.error(f"Error fetching news: {e}")
         return {"articles": [], "count": 0, "error": str(e)}
+
+# ==================== PUSH NOTIFICATIONS ====================
+
+class PushTokenRequest(BaseModel):
+    push_token: str
+    user_email: Optional[str] = None
+    platform: str = "android"
+
+class PushTokenUnregisterRequest(BaseModel):
+    push_token: str
+
+# Store for tracking last seen blog post
+last_seen_blog_id = None
+blog_check_interval = 600  # 10 minutes
+
+@api_router.post("/push/register")
+async def register_push_token(request: PushTokenRequest):
+    """Register a device for push notifications"""
+    try:
+        # Store the push token in database
+        existing = await db.push_tokens.find_one({"push_token": request.push_token})
+        
+        if existing:
+            # Update existing token
+            await db.push_tokens.update_one(
+                {"push_token": request.push_token},
+                {"$set": {
+                    "user_email": request.user_email,
+                    "platform": request.platform,
+                    "updated_at": datetime.utcnow().isoformat()
+                }}
+            )
+        else:
+            # Insert new token
+            await db.push_tokens.insert_one({
+                "push_token": request.push_token,
+                "user_email": request.user_email,
+                "platform": request.platform,
+                "created_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.utcnow().isoformat()
+            })
+        
+        logger.info(f"Push token registered: {request.push_token[:20]}...")
+        return {"success": True, "message": "Push token registered"}
+    
+    except Exception as e:
+        logger.error(f"Error registering push token: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@api_router.post("/push/unregister")
+async def unregister_push_token(request: PushTokenUnregisterRequest):
+    """Unregister a device from push notifications"""
+    try:
+        result = await db.push_tokens.delete_one({"push_token": request.push_token})
+        logger.info(f"Push token unregistered: {request.push_token[:20]}...")
+        return {"success": True, "deleted": result.deleted_count}
+    
+    except Exception as e:
+        logger.error(f"Error unregistering push token: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@api_router.get("/push/tokens/count")
+async def get_push_tokens_count():
+    """Get count of registered push tokens"""
+    count = await db.push_tokens.count_documents({})
+    return {"count": count}
+
+async def send_push_notification(title: str, body: str, data: dict = None):
+    """Send push notification to all registered devices using Expo Push API"""
+    try:
+        # Get all push tokens
+        tokens = await db.push_tokens.find({}).to_list(1000)
+        
+        if not tokens:
+            logger.info("No push tokens registered")
+            return 0
+        
+        # Prepare messages for Expo Push API
+        messages = []
+        for token_doc in tokens:
+            push_token = token_doc.get("push_token")
+            if push_token and push_token.startswith("ExponentPushToken"):
+                messages.append({
+                    "to": push_token,
+                    "sound": "default",
+                    "title": title,
+                    "body": body,
+                    "data": data or {},
+                    "channelId": "blog",  # Android channel
+                    "priority": "high",
+                })
+        
+        if not messages:
+            logger.info("No valid Expo push tokens found")
+            return 0
+        
+        # Send to Expo Push API in batches of 100
+        sent_count = 0
+        async with httpx.AsyncClient() as http_client:
+            for i in range(0, len(messages), 100):
+                batch = messages[i:i+100]
+                response = await http_client.post(
+                    "https://exp.host/--/api/v2/push/send",
+                    json=batch,
+                    headers={
+                        "Accept": "application/json",
+                        "Content-Type": "application/json",
+                    },
+                    timeout=30.0
+                )
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    sent_count += len(batch)
+                    logger.info(f"Push notifications sent: {len(batch)} messages")
+                else:
+                    logger.error(f"Push API error: {response.status_code} - {response.text}")
+        
+        return sent_count
+    
+    except Exception as e:
+        logger.error(f"Error sending push notifications: {e}")
+        return 0
+
+async def check_for_new_blog_posts():
+    """Check for new blog posts and send push notifications"""
+    global last_seen_blog_id
+    
+    try:
+        if not SHOPIFY_STOREFRONT_TOKEN:
+            return
+        
+        # Fetch latest blog post
+        query = """
+        {
+            blogs(first: 1) {
+                edges {
+                    node {
+                        articles(first: 1, sortKey: PUBLISHED_AT, reverse: true) {
+                            edges {
+                                node {
+                                    id
+                                    title
+                                    excerpt
+                                    publishedAt
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        """
+        
+        headers = {
+            "Content-Type": "application/json",
+            "X-Shopify-Storefront-Access-Token": SHOPIFY_STOREFRONT_TOKEN
+        }
+        
+        async with httpx.AsyncClient() as http_client:
+            response = await http_client.post(
+                f"https://{SHOPIFY_STORE}/api/{SHOPIFY_API_VERSION}/graphql.json",
+                json={"query": query},
+                headers=headers,
+                timeout=30.0
+            )
+            
+            data = response.json()
+            blogs = data.get("data", {}).get("blogs", {}).get("edges", [])
+            
+            if not blogs:
+                return
+            
+            articles = blogs[0].get("node", {}).get("articles", {}).get("edges", [])
+            if not articles:
+                return
+            
+            latest_article = articles[0].get("node", {})
+            article_id = latest_article.get("id")
+            article_title = latest_article.get("title", "Articol nou")
+            article_excerpt = latest_article.get("excerpt", "")[:100]
+            
+            # Check if this is a new article
+            if last_seen_blog_id is None:
+                # First run - just store the ID
+                last_seen_blog_id = article_id
+                # Check database for stored last ID
+                stored = await db.app_state.find_one({"key": "last_seen_blog_id"})
+                if stored:
+                    last_seen_blog_id = stored.get("value")
+                else:
+                    await db.app_state.insert_one({
+                        "key": "last_seen_blog_id",
+                        "value": article_id
+                    })
+                logger.info(f"Blog checker initialized with ID: {article_id}")
+                return
+            
+            if article_id != last_seen_blog_id:
+                # New article detected!
+                logger.info(f"New blog post detected: {article_title}")
+                
+                # Update stored ID
+                last_seen_blog_id = article_id
+                await db.app_state.update_one(
+                    {"key": "last_seen_blog_id"},
+                    {"$set": {"value": article_id}},
+                    upsert=True
+                )
+                
+                # Send push notification
+                sent = await send_push_notification(
+                    title="📰 Articol Nou!",
+                    body=article_title,
+                    data={
+                        "type": "blog",
+                        "articleId": article_id,
+                        "title": article_title
+                    }
+                )
+                
+                logger.info(f"Push notifications sent to {sent} devices")
+    
+    except Exception as e:
+        logger.error(f"Error checking for new blog posts: {e}")
+
+async def blog_checker_task():
+    """Background task to periodically check for new blog posts"""
+    logger.info(f"Blog checker started - checking every {blog_check_interval} seconds")
+    while True:
+        await asyncio.sleep(blog_check_interval)
+        await check_for_new_blog_posts()
+
+@api_router.post("/push/test")
+async def test_push_notification():
+    """Test endpoint to send a push notification to all devices"""
+    sent = await send_push_notification(
+        title="🔔 Test Notificare",
+        body="Aceasta este o notificare de test!",
+        data={"type": "test"}
+    )
+    return {"success": True, "sent_to": sent}
+
+@api_router.post("/push/check-blogs")
+async def trigger_blog_check():
+    """Manually trigger a blog check"""
+    await check_for_new_blog_posts()
+    return {"success": True, "message": "Blog check triggered"}
 
 @api_router.get("/debug/shopify-token")
 async def debug_shopify_token():
