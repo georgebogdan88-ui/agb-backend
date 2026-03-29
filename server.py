@@ -457,6 +457,135 @@ def parse_shopify_node(node: dict) -> dict:
         "synced_at": datetime.utcnow()
     }
 
+async def fetch_shopify_collections() -> list:
+    """Fetch all collections from Shopify Admin API with their products"""
+    collections = []
+    
+    # Use Admin API to get collections with products
+    admin_token = os.environ.get('SHOPIFY_ADMIN_TOKEN', '') or SHOPIFY_ADMIN_TOKEN
+    if not admin_token:
+        logger.warning("SHOPIFY_ADMIN_TOKEN not set, cannot fetch collections")
+        return []
+    
+    headers = {
+        "X-Shopify-Access-Token": admin_token,
+        "Content-Type": "application/json"
+    }
+    
+    async with httpx.AsyncClient() as http_client:
+        # First get all collections
+        page_info = None
+        while True:
+            # Use REST API for collections list
+            url = f"https://{SHOPIFY_STORE}/admin/api/2024-01/custom_collections.json?limit=250"
+            if page_info:
+                url += f"&page_info={page_info}"
+            
+            response = await http_client.get(url, headers=headers, timeout=60.0)
+            
+            if response.status_code != 200:
+                logger.error(f"Error fetching collections: {response.text}")
+                break
+            
+            data = response.json()
+            
+            for collection in data.get("custom_collections", []):
+                collection_id = collection.get("id")
+                collection_title = collection.get("title", "")
+                
+                # Get products in this collection
+                products_url = f"https://{SHOPIFY_STORE}/admin/api/2024-01/collections/{collection_id}/products.json?limit=250"
+                products_response = await http_client.get(products_url, headers=headers, timeout=60.0)
+                
+                product_ids = []
+                if products_response.status_code == 200:
+                    products_data = products_response.json()
+                    for product in products_data.get("products", []):
+                        product_ids.append(str(product.get("id")))
+                
+                collections.append({
+                    "title": collection_title,
+                    "handle": collection.get("handle", ""),
+                    "product_ids": product_ids
+                })
+                
+                logger.info(f"Collection '{collection_title}' has {len(product_ids)} products")
+                await asyncio.sleep(0.1)  # Rate limiting
+            
+            # Check for pagination via Link header
+            link_header = response.headers.get("Link", "")
+            if 'rel="next"' not in link_header:
+                break
+            
+            # Extract page_info from Link header
+            import re
+            match = re.search(r'page_info=([^>&]+).*rel="next"', link_header)
+            if match:
+                page_info = match.group(1)
+            else:
+                break
+            
+            await asyncio.sleep(0.2)
+        
+        # Also get smart collections
+        url = f"https://{SHOPIFY_STORE}/admin/api/2024-01/smart_collections.json?limit=250"
+        response = await http_client.get(url, headers=headers, timeout=60.0)
+        
+        if response.status_code == 200:
+            data = response.json()
+            for collection in data.get("smart_collections", []):
+                collection_id = collection.get("id")
+                collection_title = collection.get("title", "")
+                
+                # Get products in this collection
+                products_url = f"https://{SHOPIFY_STORE}/admin/api/2024-01/collections/{collection_id}/products.json?limit=250"
+                products_response = await http_client.get(products_url, headers=headers, timeout=60.0)
+                
+                product_ids = []
+                if products_response.status_code == 200:
+                    products_data = products_response.json()
+                    for product in products_data.get("products", []):
+                        product_ids.append(str(product.get("id")))
+                
+                collections.append({
+                    "title": collection_title,
+                    "handle": collection.get("handle", ""),
+                    "product_ids": product_ids
+                })
+                
+                logger.info(f"Smart Collection '{collection_title}' has {len(product_ids)} products")
+                await asyncio.sleep(0.1)
+    
+    return collections
+
+async def sync_collections_to_products():
+    """Sync collection names to products in database"""
+    logger.info("Starting collections sync...")
+    
+    collections = await fetch_shopify_collections()
+    logger.info(f"Found {len(collections)} collections")
+    
+    # Create a mapping of product_id -> collection names
+    product_collections = {}
+    for collection in collections:
+        for product_id in collection["product_ids"]:
+            if product_id not in product_collections:
+                product_collections[product_id] = []
+            product_collections[product_id].append(collection["title"])
+    
+    # Update products in batches
+    updates = 0
+    for product_id, collection_names in product_collections.items():
+        result = await db.shopify_products.update_one(
+            {"id": product_id},
+            {"$set": {"collections": collection_names, "collections_normalized": [normalize_text(c) for c in collection_names]}}
+        )
+        if result.modified_count > 0:
+            updates += 1
+    
+    logger.info(f"Updated {updates} products with collection info")
+    return updates
+
 async def sync_all_products():
     """Sync ALL products from Shopify to MongoDB"""
     global sync_status
@@ -514,10 +643,18 @@ async def sync_all_products():
         await db.shopify_products.create_index("description_normalized")
         await db.shopify_products.create_index("product_type")
         await db.shopify_products.create_index("compatible_models")
+        await db.shopify_products.create_index("collections")  # New index for collections
         
         sync_status["total_synced"] = total_products
         sync_status["last_sync"] = datetime.utcnow().isoformat()
         logger.info(f"Sync complete! Total products: {total_products}")
+        
+        # Sync collections in background
+        try:
+            await sync_collections_to_products()
+            logger.info("Collections synced to products")
+        except Exception as ce:
+            logger.error(f"Error syncing collections: {ce}")
         
     except Exception as e:
         sync_status["error"] = str(e)
@@ -548,6 +685,23 @@ async def start_sync(background_tasks: BackgroundTasks):
     
     background_tasks.add_task(sync_all_products)
     return {"message": "Sincronizare pornită! Verificați /api/sync/status pentru progres"}
+
+@api_router.post("/sync/collections")
+async def sync_collections(background_tasks: BackgroundTasks):
+    """Sync only collections to existing products"""
+    background_tasks.add_task(sync_collections_to_products)
+    return {"message": "Sincronizare colecții pornită!"}
+
+@api_router.get("/collections")
+async def get_collections():
+    """Get all unique collections from products"""
+    pipeline = [
+        {"$unwind": "$collections"},
+        {"$group": {"_id": "$collections", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}}
+    ]
+    result = await db.shopify_products.aggregate(pipeline).to_list(100)
+    return [{"name": r["_id"], "product_count": r["count"]} for r in result]
 
 @api_router.get("/products", response_model=List[Product])
 async def get_products(
@@ -627,17 +781,19 @@ async def get_products(
                                 "$or": [
                                     {"title_normalized": {"$regex": f"\\b{term}\\b", "$options": "i"}},
                                     {"description_normalized": {"$regex": f"\\b{term}\\b", "$options": "i"}},
-                                    {"sku": {"$regex": f"\\b{term}\\b", "$options": "i"}}
+                                    {"sku": {"$regex": f"\\b{term}\\b", "$options": "i"}},
+                                    {"collections_normalized": {"$regex": f"\\b{term}\\b", "$options": "i"}}
                                 ]
                             })
                         else:
-                            # Longer terms - search normally
+                            # Longer terms - search normally (including collections)
                             regex_conditions.append({
                                 "$or": [
                                     {"title_normalized": {"$regex": term, "$options": "i"}},
                                     {"description_normalized": {"$regex": term, "$options": "i"}},
                                     {"compatible_models": {"$regex": term, "$options": "i"}},
-                                    {"sku": {"$regex": term, "$options": "i"}}
+                                    {"sku": {"$regex": term, "$options": "i"}},
+                                    {"collections_normalized": {"$regex": term, "$options": "i"}}
                                 ]
                             })
                 
