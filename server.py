@@ -4394,6 +4394,53 @@ async def test_push_notification():
     )
     return {"success": True, "sent_to": sent}
 
+@api_router.get("/push/debug")
+async def debug_push_tokens():
+    """Debug endpoint to see push tokens and test sending"""
+    try:
+        tokens = await db.push_tokens.find({}).to_list(100)
+        token_info = []
+        for t in tokens:
+            token_info.append({
+                "token_preview": t.get("push_token", "")[:30] + "..." if t.get("push_token") else None,
+                "platform": t.get("platform"),
+                "user_email": t.get("user_email"),
+                "created_at": t.get("created_at")
+            })
+        
+        # Test sending to first token
+        test_result = None
+        if tokens and tokens[0].get("push_token"):
+            push_token = tokens[0]["push_token"]
+            async with httpx.AsyncClient() as http_client:
+                response = await http_client.post(
+                    "https://exp.host/--/api/v2/push/send",
+                    json=[{
+                        "to": push_token,
+                        "sound": "default",
+                        "title": "🔔 Debug Test",
+                        "body": "Test direct din debug endpoint",
+                        "priority": "high",
+                    }],
+                    headers={
+                        "Accept": "application/json",
+                        "Content-Type": "application/json",
+                    },
+                    timeout=30.0
+                )
+                test_result = {
+                    "status_code": response.status_code,
+                    "response": response.json() if response.status_code == 200 else response.text
+                }
+        
+        return {
+            "token_count": len(tokens),
+            "tokens": token_info,
+            "test_send_result": test_result
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
 @api_router.post("/push/check-blogs")
 async def trigger_blog_check():
     """Manually trigger a blog check"""
