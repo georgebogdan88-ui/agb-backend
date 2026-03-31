@@ -4219,8 +4219,31 @@ async def get_push_tokens_count():
     return {"count": count}
 
 async def send_push_notification(title: str, body: str, data: dict = None):
-    """Send push notification to all registered devices using Expo Push API"""
+    """Send push notification to all registered devices using Firebase Cloud Messaging"""
     try:
+        import firebase_admin
+        from firebase_admin import credentials, messaging
+        
+        # Initialize Firebase if not already done
+        if not firebase_admin._apps:
+            try:
+                # First try environment variable (for Render)
+                firebase_creds_json = os.environ.get('FIREBASE_SERVICE_ACCOUNT_JSON')
+                if firebase_creds_json:
+                    import json
+                    cred_dict = json.loads(firebase_creds_json)
+                    cred = credentials.Certificate(cred_dict)
+                    firebase_admin.initialize_app(cred)
+                    logger.info("Firebase Admin SDK initialized from environment variable")
+                else:
+                    # Try local file (for development)
+                    cred = credentials.Certificate('/app/backend/firebase-service-account.json')
+                    firebase_admin.initialize_app(cred)
+                    logger.info("Firebase Admin SDK initialized from local file")
+            except Exception as init_error:
+                logger.error(f"Firebase init error: {init_error}")
+                return 0
+        
         # Get all push tokens
         tokens = await db.push_tokens.find({}).to_list(1000)
         
@@ -4228,46 +4251,85 @@ async def send_push_notification(title: str, body: str, data: dict = None):
             logger.info("No push tokens registered")
             return 0
         
-        # Prepare messages for Expo Push API
-        messages = []
+        # Extract FCM tokens (Expo tokens contain the FCM token)
+        fcm_tokens = []
         for token_doc in tokens:
-            push_token = token_doc.get("push_token")
-            if push_token and push_token.startswith("ExponentPushToken"):
-                messages.append({
-                    "to": push_token,
-                    "sound": "default",
-                    "title": title,
-                    "body": body,
-                    "data": data or {},
-                    "channelId": "blog",  # Android channel
-                    "priority": "high",
-                })
+            push_token = token_doc.get("push_token", "")
+            # Expo push tokens look like: ExponentPushToken[xxxxxx]
+            # We need to extract the actual FCM token or use the whole thing
+            if push_token:
+                fcm_tokens.append(push_token)
         
-        if not messages:
-            logger.info("No valid Expo push tokens found")
+        if not fcm_tokens:
+            logger.info("No valid FCM tokens found")
             return 0
         
-        # Send to Expo Push API in batches of 100
+        # Send using Firebase Admin SDK
         sent_count = 0
-        async with httpx.AsyncClient() as http_client:
-            for i in range(0, len(messages), 100):
-                batch = messages[i:i+100]
-                response = await http_client.post(
-                    "https://exp.host/--/api/v2/push/send",
-                    json=batch,
-                    headers={
-                        "Accept": "application/json",
-                        "Content-Type": "application/json",
-                    },
-                    timeout=30.0
+        for token in fcm_tokens:
+            try:
+                message = messaging.Message(
+                    notification=messaging.Notification(
+                        title=title,
+                        body=body,
+                    ),
+                    data={str(k): str(v) for k, v in (data or {}).items()},
+                    token=token,
+                    android=messaging.AndroidConfig(
+                        priority='high',
+                        notification=messaging.AndroidNotification(
+                            sound='default',
+                            channel_id='blog',
+                        ),
+                    ),
                 )
                 
-                if response.status_code == 200:
-                    result = response.json()
-                    sent_count += len(batch)
-                    logger.info(f"Push notifications sent: {len(batch)} messages")
+                response = messaging.send(message)
+                logger.info(f"FCM message sent: {response}")
+                sent_count += 1
+                
+            except Exception as send_error:
+                error_str = str(send_error)
+                if "not a valid FCM registration token" in error_str or "Requested entity was not found" in error_str:
+                    # Token is invalid, try Expo Push API as fallback
+                    logger.info(f"FCM token invalid, trying Expo Push API for: {token[:30]}...")
+                    try:
+                        async with httpx.AsyncClient() as http_client:
+                            response = await http_client.post(
+                                "https://exp.host/--/api/v2/push/send",
+                                json=[{
+                                    "to": token,
+                                    "sound": "default",
+                                    "title": title,
+                                    "body": body,
+                                    "data": data or {},
+                                    "channelId": "blog",
+                                    "priority": "high",
+                                }],
+                                headers={
+                                    "Accept": "application/json",
+                                    "Content-Type": "application/json",
+                                },
+                                timeout=30.0
+                            )
+                            if response.status_code == 200:
+                                result = response.json()
+                                logger.info(f"Expo Push API response: {result}")
+                                if result.get("data") and result["data"][0].get("status") == "ok":
+                                    sent_count += 1
+                    except Exception as expo_error:
+                        logger.error(f"Expo Push API error: {expo_error}")
                 else:
-                    logger.error(f"Push API error: {response.status_code} - {response.text}")
+                    logger.error(f"FCM send error for {token[:30]}...: {send_error}")
+        
+        logger.info(f"Total notifications sent: {sent_count}")
+        return sent_count
+        
+    except Exception as e:
+        logger.error(f"Error sending push notifications: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return 0
         
         return sent_count
     
