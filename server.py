@@ -461,6 +461,58 @@ def parse_shopify_node(node: dict) -> dict:
         "synced_at": datetime.utcnow()
     }
 
+def _extract_next_page_info(link_header: str) -> Optional[str]:
+    """Extract the page_info belonging specifically to the rel="next" entry.
+
+    Shopify's Link header can contain BOTH rel="previous" AND rel="next" on
+    any page after the first, comma-separated in one string, e.g.:
+      <...page_info=AAA...>; rel="previous", <...page_info=BBB...>; rel="next"
+    A regex applied to the whole header (`page_info=(...).*rel="next"`) is
+    greedy and matches the FIRST page_info in the string (the previous one),
+    not the one actually tied to rel="next" - which silently paginates
+    backwards and loops forever. Splitting on "," and only inspecting the
+    segment that contains rel="next" avoids that.
+    """
+    if not link_header:
+        return None
+    for segment in link_header.split(","):
+        if 'rel="next"' not in segment:
+            continue
+        match = re.search(r'page_info=([^>&]+)', segment)
+        if match:
+            return match.group(1)
+    return None
+
+
+async def _fetch_all_collection_product_ids(http_client: httpx.AsyncClient, collection_id, headers: dict) -> list:
+    """Fetch every product id in a collection, following Shopify's Link-header
+    pagination. The old inline version only ever made one request per
+    collection (?limit=250) and silently dropped anything past the first
+    250 products - this fixes that."""
+    product_ids = []
+    page_info = None
+    while True:
+        products_url = f"https://{SHOPIFY_STORE}/admin/api/2024-01/collections/{collection_id}/products.json?limit=250"
+        if page_info:
+            products_url += f"&page_info={page_info}"
+
+        products_response = await http_client.get(products_url, headers=headers, timeout=60.0)
+        if products_response.status_code != 200:
+            break
+
+        products_data = products_response.json()
+        for product in products_data.get("products", []):
+            product_ids.append(str(product.get("id")))
+
+        next_page_info = _extract_next_page_info(products_response.headers.get("Link", ""))
+        if not next_page_info or next_page_info == page_info:
+            break
+        page_info = next_page_info
+        await asyncio.sleep(0.15)
+
+    return product_ids
+
+
 async def fetch_shopify_collections() -> list:
     """Fetch all collections from Shopify Admin API with their products"""
     collections = []
@@ -496,39 +548,24 @@ async def fetch_shopify_collections() -> list:
             for collection in data.get("custom_collections", []):
                 collection_id = collection.get("id")
                 collection_title = collection.get("title", "")
-                
-                # Get products in this collection
-                products_url = f"https://{SHOPIFY_STORE}/admin/api/2024-01/collections/{collection_id}/products.json?limit=250"
-                products_response = await http_client.get(products_url, headers=headers, timeout=60.0)
-                
-                product_ids = []
-                if products_response.status_code == 200:
-                    products_data = products_response.json()
-                    for product in products_data.get("products", []):
-                        product_ids.append(str(product.get("id")))
-                
+
+                product_ids = await _fetch_all_collection_product_ids(http_client, collection_id, headers)
+
                 collections.append({
                     "title": collection_title,
                     "handle": collection.get("handle", ""),
                     "product_ids": product_ids
                 })
-                
+
                 logger.info(f"Collection '{collection_title}' has {len(product_ids)} products")
                 await asyncio.sleep(0.1)  # Rate limiting
-            
+
             # Check for pagination via Link header
-            link_header = response.headers.get("Link", "")
-            if 'rel="next"' not in link_header:
+            next_page_info = _extract_next_page_info(response.headers.get("Link", ""))
+            if not next_page_info or next_page_info == page_info:
                 break
-            
-            # Extract page_info from Link header
-            import re
-            match = re.search(r'page_info=([^>&]+).*rel="next"', link_header)
-            if match:
-                page_info = match.group(1)
-            else:
-                break
-            
+            page_info = next_page_info
+
             await asyncio.sleep(0.2)
         
         # Also get smart collections
@@ -540,23 +577,15 @@ async def fetch_shopify_collections() -> list:
             for collection in data.get("smart_collections", []):
                 collection_id = collection.get("id")
                 collection_title = collection.get("title", "")
-                
-                # Get products in this collection
-                products_url = f"https://{SHOPIFY_STORE}/admin/api/2024-01/collections/{collection_id}/products.json?limit=250"
-                products_response = await http_client.get(products_url, headers=headers, timeout=60.0)
-                
-                product_ids = []
-                if products_response.status_code == 200:
-                    products_data = products_response.json()
-                    for product in products_data.get("products", []):
-                        product_ids.append(str(product.get("id")))
-                
+
+                product_ids = await _fetch_all_collection_product_ids(http_client, collection_id, headers)
+
                 collections.append({
                     "title": collection_title,
                     "handle": collection.get("handle", ""),
                     "product_ids": product_ids
                 })
-                
+
                 logger.info(f"Smart Collection '{collection_title}' has {len(product_ids)} products")
                 await asyncio.sleep(0.1)
     
@@ -711,6 +740,7 @@ async def get_collections():
 async def get_products(
     search: Optional[str] = None,
     product_type: Optional[str] = None,
+    collection: Optional[str] = None,
     limit: int = 1000,
     skip: int = 0
 ):
@@ -721,17 +751,22 @@ async def get_products(
     try:
         # Check if we have products in DB
         product_count = await db.shopify_products.count_documents({})
-        
+
         if product_count == 0:
             # Fallback to Shopify API if no local products
             return await get_products_from_shopify(search, limit)
-        
+
         # Build query
         query = {}
-        
+
         if product_type:
             query["product_type"] = product_type
-        
+
+        if collection:
+            # `collections` is a list field per product; querying it with a
+            # scalar matches documents where the array contains that value.
+            query["collections"] = collection
+
         if search:
             # Normalize search terms and handle "Premium" variations
             # Convert "6930 Premium" to search for both "6930Premium" and "6930PR"
