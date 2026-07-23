@@ -17,6 +17,8 @@ import unicodedata
 import asyncio
 import hashlib
 import hmac
+import secrets
+import bcrypt
 
 ROOT_DIR = Path(__file__).parent
 # Load .env but don't override existing environment variables (important for Render deployment)
@@ -221,12 +223,14 @@ class UserResponse(BaseModel):
 
 # Password hashing helper
 def hash_password(password: str) -> str:
-    """Hash password using SHA256"""
-    return hashlib.sha256(password.encode()).hexdigest()
+    """Hash password using bcrypt"""
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
 def verify_password(password: str, hashed: str) -> bool:
-    """Verify password against hash"""
-    return hash_password(password) == hashed
+    """Verify password against bcrypt hash"""
+    if not hashed:
+        return False
+    return bcrypt.checkpw(password.encode(), hashed.encode())
 
 def generate_token() -> str:
     """Generate a simple auth token"""
@@ -1407,139 +1411,25 @@ async def create_shopify_checkout(request: CheckoutRequest):
 
 @api_router.post("/auth/register")
 async def register_user(user_data: UserRegister):
-    """Register a new user - Creates customer in Shopify"""
-    
-    # Step 1: Create customer in Shopify
-    mutation = """
-    mutation customerCreate($input: CustomerCreateInput!) {
-        customerCreate(input: $input) {
-            customer {
-                id
-                email
-                firstName
-                lastName
-                phone
-            }
-            customerUserErrors {
-                code
-                field
-                message
-            }
-        }
-    }
-    """
-    
-    # Split name into first and last name
-    name_parts = user_data.name.strip().split(' ', 1)
-    first_name = name_parts[0]
-    last_name = name_parts[1] if len(name_parts) > 1 else ""
-    
-    variables = {
-        "input": {
-            "email": user_data.email.lower(),
-            "password": user_data.password,
-            "firstName": first_name,
-            "lastName": last_name,
-            "phone": user_data.phone if user_data.phone else None,
-            "acceptsMarketing": True
-        }
-    }
-    
-    headers = {
-        "Content-Type": "application/json",
-        "X-Shopify-Storefront-Access-Token": SHOPIFY_STOREFRONT_TOKEN
-    }
-    
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            f"https://{SHOPIFY_STORE}/api/{SHOPIFY_API_VERSION}/graphql.json",
-            json={"query": mutation, "variables": variables},
-            headers=headers
-        )
-        
-        data = response.json()
-        logger.info(f"Shopify customerCreate response: {data}")
-        
-        result = data.get("data", {}).get("customerCreate", {})
-        errors = result.get("customerUserErrors", [])
-        
-        if errors:
-            error_msg = errors[0].get("message", "Eroare la înregistrare")
-            error_code = errors[0].get("code", "")
-            error_field = errors[0].get("field", [""])[0] if errors[0].get("field") else ""
-            
-            logger.info(f"Registration error - code: {error_code}, field: {error_field}, msg: {error_msg}")
-            
-            if error_code == "TAKEN":
-                if error_field == "phone" or "phone" in error_msg.lower():
-                    raise HTTPException(status_code=400, detail="Numărul de telefon este deja înregistrat pe alt cont")
-                elif error_field == "email" or "email" in error_msg.lower():
-                    # Check if user exists in local DB but was deleted from Shopify
-                    existing_user = await db.users.find_one({"email": user_data.email.lower()})
-                    if existing_user:
-                        # Delete from local DB to allow re-registration
-                        await db.users.delete_one({"email": user_data.email.lower()})
-                        logger.info(f"Deleted orphaned local user: {user_data.email}")
-                    raise HTTPException(status_code=400, detail="Adresa de email este deja înregistrată în Shopify")
-                else:
-                    raise HTTPException(status_code=400, detail="Email-ul sau telefonul este deja înregistrat")
-            if error_code == "TOO_SHORT":
-                raise HTTPException(status_code=400, detail="Parola trebuie să aibă minim 5 caractere")
-            if error_code == "INVALID":
-                if "phone" in error_field.lower() or "phone" in error_msg.lower():
-                    raise HTTPException(status_code=400, detail="Numărul de telefon este invalid. Folosiți formatul +40XXXXXXXXX")
-                elif "email" in error_field.lower() or "email" in error_msg.lower():
-                    raise HTTPException(status_code=400, detail="Adresa de email este invalidă")
-            raise HTTPException(status_code=400, detail=error_msg)
-        
-        customer = result.get("customer")
-        if not customer:
-            raise HTTPException(status_code=400, detail="Eroare la crearea contului")
-    
-    # Step 2: Login to get access token
-    login_mutation = """
-    mutation customerAccessTokenCreate($input: CustomerAccessTokenCreateInput!) {
-        customerAccessTokenCreate(input: $input) {
-            customerAccessToken {
-                accessToken
-                expiresAt
-            }
-            customerUserErrors {
-                code
-                message
-            }
-        }
-    }
-    """
-    
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            f"https://{SHOPIFY_STORE}/api/{SHOPIFY_API_VERSION}/graphql.json",
-            json={
-                "query": login_mutation, 
-                "variables": {
-                    "input": {
-                        "email": user_data.email.lower(),
-                        "password": user_data.password
-                    }
-                }
-            },
-            headers=headers
-        )
-        
-        login_data = response.json()
-        token_result = login_data.get("data", {}).get("customerAccessTokenCreate", {})
-        shopify_token = token_result.get("customerAccessToken", {}).get("accessToken")
-    
-    # Step 3: Create local user record linked to Shopify
+    """Register a new user - fully local account, independent of Shopify"""
+
+    email = user_data.email.lower().strip()
+
+    if len(user_data.password) < 6:
+        raise HTTPException(status_code=400, detail="Parola trebuie să aibă minim 6 caractere")
+
+    existing_user = await db.users.find_one({"email": email})
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Adresa de email este deja înregistrată")
+
     user_id = str(uuid.uuid4())
     local_token = generate_token()
-    shopify_customer_id = customer.get("id", "").replace("gid://shopify/Customer/", "")
-    
+    created_at = datetime.utcnow()
+
     user = {
         "id": user_id,
-        "email": user_data.email.lower(),
-        "password_hash": "",
+        "email": email,
+        "password_hash": hash_password(user_data.password),
         "name": user_data.name,
         "phone": user_data.phone,
         "address": None,
@@ -1552,74 +1442,228 @@ async def register_user(user_data: UserRegister):
         "reg_com": None,
         "company_address": None,
         "token": local_token,
-        "is_shopify_customer": True,
-        "shopify_customer_id": shopify_customer_id,
-        "shopify_access_token": shopify_token,
-        "created_at": datetime.utcnow()
+        "is_shopify_customer": False,
+        "created_at": created_at
     }
-    
-    await db.users.insert_one(user)
-    
+
+    try:
+        await db.users.insert_one(user)
+    except Exception as e:
+        # Guards against a race with the unique index on email (two concurrent
+        # registrations for the same address slipping past the find_one check above)
+        if "duplicate key" in str(e).lower():
+            raise HTTPException(status_code=400, detail="Adresa de email este deja înregistrată")
+        raise
+
     return {
         "token": local_token,
         "user": {
             "id": user_id,
-            "email": user_data.email.lower(),
+            "email": email,
             "name": user_data.name,
             "phone": user_data.phone,
             "is_company": False,
-            "is_shopify_customer": True,
-            "created_at": user["created_at"]
+            "is_shopify_customer": False,
+            "created_at": created_at
         }
     }
 
 class ForgotPasswordRequest(BaseModel):
     email: str
 
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str
+
+
+def _public_base_url() -> str:
+    return os.environ.get('RENDER_EXTERNAL_URL', 'http://localhost:8002').rstrip('/')
+
+
+async def send_password_reset_email(recipient_email: str, recipient_name: str, reset_url: str) -> bool:
+    """Send a password reset email via Brevo (same provider/style as
+    send_blog_notification_email further down this file)."""
+    try:
+        if not BREVO_API_KEY:
+            logger.warning("BREVO_API_KEY not set - skipping password reset email")
+            return False
+
+        import sib_api_v3_sdk
+
+        configuration = sib_api_v3_sdk.Configuration()
+        configuration.api_key['api-key'] = BREVO_API_KEY
+        api_instance = sib_api_v3_sdk.TransactionalEmailsApi(sib_api_v3_sdk.ApiClient(configuration))
+
+        html_content = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif; background-color: #f5f5f5; padding: 20px;">
+            <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 10px; overflow: hidden;">
+                <div style="background-color: #367c2b; padding: 20px; text-align: center;">
+                    <h1 style="color: #ffffff; margin: 0;">🚜 AGB Agroparts</h1>
+                </div>
+                <div style="padding: 30px;">
+                    <h2 style="color: #333;">Resetare parolă</h2>
+                    <p style="color: #666; line-height: 1.6;">Am primit o cerere de resetare a parolei pentru contul tău. Link-ul de mai jos este valabil 1 oră.</p>
+                    <div style="text-align: center; margin-top: 30px;">
+                        <a href="{reset_url}" style="background-color: #367c2b; color: #ffffff; padding: 15px 30px; text-decoration: none; border-radius: 5px; font-weight: bold;">
+                            Resetează parola
+                        </a>
+                    </div>
+                    <p style="color: #999; font-size: 13px; margin-top: 30px;">Dacă nu ai cerut tu resetarea, poți ignora acest email.</p>
+                </div>
+                <div style="background-color: #f0f0f0; padding: 15px; text-align: center; font-size: 12px; color: #999;">
+                    <p>AGB Agroparts Solution S.R.L.</p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+
+        send_smtp_email = sib_api_v3_sdk.SendSmtpEmail(
+            to=[{"email": recipient_email, "name": recipient_name or recipient_email}],
+            sender={"email": "noreply@agb-agroparts.ro", "name": "AGB Agroparts"},
+            subject="🔑 Resetare parolă - AGB Agroparts",
+            html_content=html_content
+        )
+
+        api_instance.send_transac_email(send_smtp_email)
+        logger.info(f"Password reset email sent to {recipient_email}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Error sending password reset email to {recipient_email}: {e}")
+        return False
+
+
 @api_router.post("/auth/forgot-password")
 async def forgot_password(request: ForgotPasswordRequest):
-    """Send password reset email via Shopify"""
-    
-    mutation = """
-    mutation customerRecover($email: String!) {
-        customerRecover(email: $email) {
-            customerUserErrors {
-                code
-                field
-                message
-            }
-        }
-    }
-    """
-    
-    headers = {
-        "Content-Type": "application/json",
-        "X-Shopify-Storefront-Access-Token": SHOPIFY_STOREFRONT_TOKEN
-    }
-    
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            f"https://{SHOPIFY_STORE}/api/{SHOPIFY_API_VERSION}/graphql.json",
-            json={"query": mutation, "variables": {"email": request.email.lower()}},
-            headers=headers
-        )
-        
-        data = response.json()
-        logger.info(f"Shopify password recovery response: {data}")
-        
-        errors = data.get("data", {}).get("customerRecover", {}).get("customerUserErrors", [])
-        
-        if errors:
-            error_msg = errors[0].get("message", "Eroare la trimiterea emailului")
-            raise HTTPException(status_code=400, detail=error_msg)
-        
-        return {"message": "Email de resetare trimis cu succes"}
+    """Send a local password reset email. Always returns a generic success
+    message regardless of whether the address is registered, to avoid
+    leaking which emails have accounts."""
+    email = request.email.lower().strip()
+    user = await db.users.find_one({"email": email})
 
-@api_router.post("/auth/login")
-async def login_user(credentials: UserLogin):
-    """Login a user - Uses Shopify authentication"""
-    
-    # Authenticate with Shopify
+    if user:
+        reset_token = secrets.token_urlsafe(32)
+        await db.users.update_one(
+            {"email": email},
+            {"$set": {
+                "reset_token": reset_token,
+                "reset_token_expires": datetime.utcnow() + timedelta(hours=1),
+            }}
+        )
+        reset_url = f"{_public_base_url()}/api/reset-password?token={reset_token}"
+        await send_password_reset_email(email, user.get("name", ""), reset_url)
+
+    return {"message": "Dacă adresa există în sistem, ai primit un email cu instrucțiuni de resetare"}
+
+
+@api_router.post("/auth/reset-password")
+async def reset_password(request: ResetPasswordRequest):
+    """Consume a reset token minted by /auth/forgot-password and set a new password."""
+    if len(request.new_password) < 6:
+        raise HTTPException(status_code=400, detail="Parola trebuie să aibă minim 6 caractere")
+
+    user = await db.users.find_one({"reset_token": request.token})
+    if not user:
+        raise HTTPException(status_code=400, detail="Link de resetare invalid")
+
+    expires = user.get("reset_token_expires")
+    if not expires or expires < datetime.utcnow():
+        raise HTTPException(status_code=400, detail="Link de resetare expirat. Cere unul nou.")
+
+    await db.users.update_one(
+        {"id": user["id"]},
+        {
+            "$set": {"password_hash": hash_password(request.new_password), "token": generate_token()},
+            "$unset": {"reset_token": "", "reset_token_expires": ""},
+        }
+    )
+
+    return {"message": "Parola a fost schimbată cu succes"}
+
+
+@api_router.get("/reset-password", response_class=HTMLResponse)
+async def reset_password_page(token: str = ""):
+    """Minimal, self-contained password reset form. No separate web frontend
+    exists yet for the future storefront, so this is served directly by the
+    API — same idiom as /privacy-policy below."""
+    html_content = f"""
+    <!DOCTYPE html>
+    <html lang="ro">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Resetare parolă - AGB Agroparts</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; max-width: 420px; margin: 60px auto; padding: 20px; }}
+            h1 {{ color: #367c2b; font-size: 22px; }}
+            label {{ display: block; margin-top: 16px; color: #333; font-size: 14px; }}
+            input {{ width: 100%; padding: 10px; margin-top: 6px; border: 1px solid #ccc; border-radius: 6px; box-sizing: border-box; }}
+            button {{ margin-top: 24px; width: 100%; background-color: #367c2b; color: #fff; border: none; padding: 12px; border-radius: 6px; font-size: 15px; cursor: pointer; }}
+            #message {{ margin-top: 16px; font-size: 14px; }}
+            .error {{ color: #b00020; }}
+            .success {{ color: #367c2b; }}
+        </style>
+    </head>
+    <body>
+        <h1>🚜 Resetare parolă</h1>
+        <form id="reset-form">
+            <label for="password">Parolă nouă</label>
+            <input type="password" id="password" minlength="6" required>
+            <label for="confirm">Confirmă parola</label>
+            <input type="password" id="confirm" minlength="6" required>
+            <button type="submit">Schimbă parola</button>
+        </form>
+        <div id="message"></div>
+        <script>
+            const token = {token!r};
+            const form = document.getElementById('reset-form');
+            const messageEl = document.getElementById('message');
+            form.addEventListener('submit', async (e) => {{
+                e.preventDefault();
+                const password = document.getElementById('password').value;
+                const confirm = document.getElementById('confirm').value;
+                messageEl.className = '';
+                if (password !== confirm) {{
+                    messageEl.textContent = 'Parolele nu coincid.';
+                    messageEl.className = 'error';
+                    return;
+                }}
+                try {{
+                    const resp = await fetch('/api/auth/reset-password', {{
+                        method: 'POST',
+                        headers: {{ 'Content-Type': 'application/json' }},
+                        body: JSON.stringify({{ token: token, new_password: password }})
+                    }});
+                    const data = await resp.json();
+                    if (resp.ok) {{
+                        messageEl.textContent = data.message;
+                        messageEl.className = 'success';
+                        form.style.display = 'none';
+                    }} else {{
+                        messageEl.textContent = data.detail || 'A apărut o eroare.';
+                        messageEl.className = 'error';
+                    }}
+                }} catch (err) {{
+                    messageEl.textContent = 'A apărut o eroare de rețea.';
+                    messageEl.className = 'error';
+                }}
+            }});
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
+
+async def _legacy_shopify_login_and_migrate(email: str, password: str, existing_user: Optional[dict]) -> dict:
+    """Fallback path for accounts created before local auth existed (or any
+    email not yet in our `users` collection): verify the password against
+    Shopify exactly as the app always has, and on success silently persist a
+    local bcrypt hash of the password just submitted. From then on this
+    account authenticates locally via `_authenticate_user` and no longer
+    needs Shopify to log in.
+    """
     mutation = """
     mutation customerAccessTokenCreate($input: CustomerAccessTokenCreateInput!) {
         customerAccessTokenCreate(input: $input) {
@@ -1635,41 +1679,34 @@ async def login_user(credentials: UserLogin):
         }
     }
     """
-    
-    variables = {
-        "input": {
-            "email": credentials.email,
-            "password": credentials.password
-        }
-    }
-    
+
     headers = {
         "Content-Type": "application/json",
         "X-Shopify-Storefront-Access-Token": SHOPIFY_STOREFRONT_TOKEN
     }
-    
+
     async with httpx.AsyncClient() as client:
         response = await client.post(
             f"https://{SHOPIFY_STORE}/api/{SHOPIFY_API_VERSION}/graphql.json",
-            json={"query": mutation, "variables": variables},
+            json={"query": mutation, "variables": {"input": {"email": email, "password": password}}},
             headers=headers
         )
-        
+
         data = response.json()
         logger.info(f"Shopify customer login response: {data}")
-        
+
         result = data.get("data", {}).get("customerAccessTokenCreate", {})
         errors = result.get("customerUserErrors", [])
-        
+
         if errors:
             raise HTTPException(status_code=401, detail="Email sau parolă incorectă")
-        
+
         customer_token = result.get("customerAccessToken", {})
         if not customer_token or not customer_token.get("accessToken"):
             raise HTTPException(status_code=401, detail="Email sau parolă incorectă")
-        
+
         shopify_access_token = customer_token.get("accessToken")
-    
+
     # Get customer details from Shopify
     customer_query = """
     query getCustomer($customerAccessToken: String!) {
@@ -1705,34 +1742,32 @@ async def login_user(credentials: UserLogin):
         }
     }
     """
-    
+
     async with httpx.AsyncClient() as client:
         response = await client.post(
             f"https://{SHOPIFY_STORE}/api/{SHOPIFY_API_VERSION}/graphql.json",
             json={
-                "query": customer_query, 
+                "query": customer_query,
                 "variables": {"customerAccessToken": shopify_access_token}
             },
             headers=headers
         )
-        
+
         customer_data = response.json()
         customer = customer_data.get("data", {}).get("customer")
-        
+
         if not customer:
             raise HTTPException(status_code=401, detail="Nu s-au putut obține datele contului")
-    
+
     # Create or update local user linked to Shopify
     local_token = generate_token()
     shopify_customer_id = customer.get("id", "").replace("gid://shopify/Customer/", "")
-    
-    existing_user = await db.users.find_one({"email": credentials.email.lower()})
-    
+
     default_address = customer.get("defaultAddress") or {}
-    
+
     user_update_data = {
-        "email": credentials.email.lower(),
-        "name": f"{customer.get('firstName', '')} {customer.get('lastName', '')}".strip() or credentials.email.split('@')[0],
+        "email": email,
+        "name": f"{customer.get('firstName', '')} {customer.get('lastName', '')}".strip() or email.split('@')[0],
         "phone": customer.get("phone") or "",
         "address": default_address.get("address1") or "",
         "city": default_address.get("city") or "",
@@ -1741,28 +1776,29 @@ async def login_user(credentials: UserLogin):
         "is_company": bool(default_address.get("company")),
         "company_name": default_address.get("company") or None,
         "token": local_token,
+        # Silent migration: from this point on, this account has a local
+        # password and no longer needs the Shopify fallback above.
+        "password_hash": hash_password(password),
         "is_shopify_customer": True,
         "shopify_customer_id": shopify_customer_id,
         "shopify_access_token": shopify_access_token,
         "updated_at": datetime.utcnow()
     }
-    
+
     if existing_user:
         # Preserve locally-saved data that Shopify doesn't have
-        # Only update fields from Shopify if they have values, otherwise keep existing
         preserved_fields = ['cui', 'reg_com', 'company_address', 'is_company', 'company_name']
         for field in preserved_fields:
             if not user_update_data.get(field) and existing_user.get(field):
                 user_update_data[field] = existing_user[field]
-        
-        # Also preserve phone, address, city, county, postal_code if Shopify doesn't have them
+
         local_fields = ['phone', 'address', 'city', 'county', 'postal_code']
         for field in local_fields:
             if not user_update_data.get(field) and existing_user.get(field):
                 user_update_data[field] = existing_user[field]
-        
+
         await db.users.update_one(
-            {"email": credentials.email.lower()},
+            {"email": email},
             {"$set": user_update_data}
         )
         user_id = existing_user["id"]
@@ -1770,12 +1806,11 @@ async def login_user(credentials: UserLogin):
     else:
         user_id = str(uuid.uuid4())
         user_update_data["id"] = user_id
-        user_update_data["password_hash"] = ""
         user_update_data["created_at"] = datetime.utcnow()
         created_at = user_update_data["created_at"]
         await db.users.insert_one(user_update_data)
-    
-    # Extract Shopify orders
+
+    # Extract Shopify orders (only available on this legacy/Shopify-verified path)
     shopify_orders = []
     orders_edges = customer.get("orders", {}).get("edges", [])
     for edge in orders_edges:
@@ -1787,12 +1822,12 @@ async def login_user(credentials: UserLogin):
             "date": order.get("processedAt"),
             "status": order.get("fulfillmentStatus") or "UNFULFILLED"
         })
-    
+
     return {
         "token": local_token,
         "user": {
             "id": user_id,
-            "email": credentials.email.lower(),
+            "email": email,
             "name": user_update_data["name"],
             "phone": user_update_data["phone"],
             "address": user_update_data["address"],
@@ -1809,6 +1844,54 @@ async def login_user(credentials: UserLogin):
         },
         "shopify_orders": shopify_orders
     }
+
+
+async def _authenticate_user(email: str, password: str) -> dict:
+    """Authenticate a customer for login. Checks the local password hash
+    first; only falls back to Shopify (and silently migrates) for accounts
+    that don't have one yet. See `_legacy_shopify_login_and_migrate`.
+    """
+    email = email.lower().strip()
+    existing_user = await db.users.find_one({"email": email})
+
+    if existing_user and existing_user.get("password_hash"):
+        if not verify_password(password, existing_user["password_hash"]):
+            raise HTTPException(status_code=401, detail="Email sau parolă incorectă")
+
+        local_token = generate_token()
+        await db.users.update_one({"email": email}, {"$set": {"token": local_token}})
+
+        return {
+            "token": local_token,
+            "user": {
+                "id": existing_user["id"],
+                "email": email,
+                "name": existing_user.get("name"),
+                "phone": existing_user.get("phone"),
+                "address": existing_user.get("address"),
+                "city": existing_user.get("city"),
+                "county": existing_user.get("county"),
+                "postal_code": existing_user.get("postal_code"),
+                "is_company": existing_user.get("is_company", False),
+                "company_name": existing_user.get("company_name"),
+                "cui": existing_user.get("cui"),
+                "reg_com": existing_user.get("reg_com"),
+                "company_address": existing_user.get("company_address"),
+                "is_shopify_customer": existing_user.get("is_shopify_customer", False),
+                "created_at": existing_user["created_at"],
+            },
+            # Full order history stays available via GET /auth/orders (local)
+            # and GET /auth/shopify-orders (Shopify-linked accounts only).
+            "shopify_orders": [],
+        }
+
+    return await _legacy_shopify_login_and_migrate(email, password, existing_user)
+
+
+@api_router.post("/auth/login")
+async def login_user(credentials: UserLogin):
+    """Login a user - local password first, Shopify fallback for legacy accounts"""
+    return await _authenticate_user(credentials.email, credentials.password)
 
 @api_router.get("/auth/me")
 async def get_current_user(request: Request):
@@ -1845,184 +1928,9 @@ async def get_current_user(request: Request):
 
 @api_router.post("/auth/shopify-login")
 async def shopify_customer_login(credentials: ShopifyCustomerLogin):
-    """Login with existing Shopify customer account"""
-    # Step 1: Get customer access token from Shopify
-    mutation = """
-    mutation customerAccessTokenCreate($input: CustomerAccessTokenCreateInput!) {
-        customerAccessTokenCreate(input: $input) {
-            customerAccessToken {
-                accessToken
-                expiresAt
-            }
-            customerUserErrors {
-                code
-                field
-                message
-            }
-        }
-    }
-    """
-    
-    variables = {
-        "input": {
-            "email": credentials.email,
-            "password": credentials.password
-        }
-    }
-    
-    headers = {
-        "Content-Type": "application/json",
-        "X-Shopify-Storefront-Access-Token": SHOPIFY_STOREFRONT_TOKEN
-    }
-    
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            f"https://{SHOPIFY_STORE}/api/{SHOPIFY_API_VERSION}/graphql.json",
-            json={"query": mutation, "variables": variables},
-            headers=headers
-        )
-        
-        data = response.json()
-        logger.info(f"Shopify customer login response: {data}")
-        
-        result = data.get("data", {}).get("customerAccessTokenCreate", {})
-        errors = result.get("customerUserErrors", [])
-        
-        if errors:
-            error_msg = errors[0].get("message", "Autentificare eșuată")
-            raise HTTPException(status_code=401, detail=error_msg)
-        
-        customer_token = result.get("customerAccessToken", {})
-        if not customer_token or not customer_token.get("accessToken"):
-            raise HTTPException(status_code=401, detail="Email sau parolă incorectă")
-        
-        shopify_access_token = customer_token.get("accessToken")
-        
-    # Step 2: Get customer details from Shopify
-    customer_query = """
-    query getCustomer($customerAccessToken: String!) {
-        customer(customerAccessToken: $customerAccessToken) {
-            id
-            email
-            firstName
-            lastName
-            phone
-            defaultAddress {
-                address1
-                address2
-                city
-                province
-                zip
-                country
-                company
-            }
-            orders(first: 10) {
-                edges {
-                    node {
-                        id
-                        orderNumber
-                        totalPrice {
-                            amount
-                            currencyCode
-                        }
-                        processedAt
-                        fulfillmentStatus
-                    }
-                }
-            }
-        }
-    }
-    """
-    
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            f"https://{SHOPIFY_STORE}/api/{SHOPIFY_API_VERSION}/graphql.json",
-            json={
-                "query": customer_query, 
-                "variables": {"customerAccessToken": shopify_access_token}
-            },
-            headers=headers
-        )
-        
-        customer_data = response.json()
-        logger.info(f"Shopify customer data: {customer_data}")
-        
-        customer = customer_data.get("data", {}).get("customer")
-        
-        if not customer:
-            raise HTTPException(status_code=401, detail="Nu s-au putut obține datele clientului")
-    
-    # Step 3: Create or update local user linked to Shopify
-    local_token = generate_token()
-    shopify_customer_id = customer.get("id", "").replace("gid://shopify/Customer/", "")
-    
-    existing_user = await db.users.find_one({"email": credentials.email.lower()})
-    
-    default_address = customer.get("defaultAddress") or {}
-    
-    user_data = {
-        "email": credentials.email.lower(),
-        "name": f"{customer.get('firstName', '')} {customer.get('lastName', '')}".strip() or credentials.email.split('@')[0],
-        "phone": customer.get("phone") or "",
-        "address": default_address.get("address1") or "",
-        "city": default_address.get("city") or "",
-        "county": default_address.get("province") or "",
-        "postal_code": default_address.get("zip") or "",
-        "is_company": bool(default_address.get("company")),
-        "company_name": default_address.get("company") or None,
-        "token": local_token,
-        "is_shopify_customer": True,
-        "shopify_customer_id": shopify_customer_id,
-        "shopify_access_token": shopify_access_token,
-        "updated_at": datetime.utcnow()
-    }
-    
-    if existing_user:
-        # Update existing user
-        await db.users.update_one(
-            {"email": credentials.email.lower()},
-            {"$set": user_data}
-        )
-        user_id = existing_user["id"]
-    else:
-        # Create new user linked to Shopify
-        user_id = str(uuid.uuid4())
-        user_data["id"] = user_id
-        user_data["password_hash"] = ""  # No local password
-        user_data["created_at"] = datetime.utcnow()
-        await db.users.insert_one(user_data)
-    
-    # Extract Shopify orders
-    shopify_orders = []
-    orders_edges = customer.get("orders", {}).get("edges", [])
-    for edge in orders_edges:
-        order = edge.get("node", {})
-        shopify_orders.append({
-            "order_number": order.get("orderNumber"),
-            "total": float(order.get("totalPrice", {}).get("amount", 0)),
-            "currency": order.get("totalPrice", {}).get("currencyCode", "RON"),
-            "date": order.get("processedAt"),
-            "status": order.get("fulfillmentStatus") or "UNFULFILLED"
-        })
-    
-    return {
-        "token": local_token,
-        "user": {
-            "id": user_id,
-            "email": credentials.email.lower(),
-            "name": user_data["name"],
-            "phone": user_data["phone"],
-            "address": user_data["address"],
-            "city": user_data["city"],
-            "county": user_data["county"],
-            "postal_code": user_data["postal_code"],
-            "is_company": user_data["is_company"],
-            "company_name": user_data["company_name"],
-            "is_shopify_customer": True,
-            "created_at": existing_user["created_at"] if existing_user else user_data["created_at"]
-        },
-        "shopify_orders": shopify_orders
-    }
+    """Kept for backward compatibility with older app builds that call this
+    route specifically; behaves identically to /auth/login now."""
+    return await _authenticate_user(credentials.email, credentials.password)
 
 @api_router.put("/auth/me")
 async def update_current_user(request: Request, update_data: UserUpdate):
@@ -3423,7 +3331,12 @@ async def auto_sync_loop():
 async def startup_event():
     """Start background tasks on app startup"""
     global auto_sync_task
-    
+
+    try:
+        await db.users.create_index("email", unique=True)
+    except Exception:
+        logger.exception("Failed to create unique index on users.email")
+
     auto_sync_task = asyncio.create_task(auto_sync_loop())
     logger.info(f"Auto-sync enabled: every {AUTO_SYNC_INTERVAL_MINUTES} minutes")
     
