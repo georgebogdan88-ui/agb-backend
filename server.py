@@ -632,8 +632,10 @@ async def sync_all_products():
     sync_status["error"] = None
     
     try:
-        # Clear existing products
-        await db.shopify_products.delete_many({})
+        # Clear existing Shopify-synced products, but keep manually-created
+        # products (source="manual") - those aren't part of the Shopify catalog
+        # and would be permanently lost if wiped here.
+        await db.shopify_products.delete_many({"source": {"$ne": "manual"}})
         
         after = None
         total_products = 0
@@ -1970,7 +1972,8 @@ async def get_current_user(request: Request):
         "reg_com": user.get("reg_com"),
         "company_address": user.get("company_address"),
         "created_at": user["created_at"],
-        "is_shopify_customer": user.get("is_shopify_customer", False)
+        "is_shopify_customer": user.get("is_shopify_customer", False),
+        "role": user.get("role", "customer")
     }
 
 # ==================== SHOPIFY CUSTOMER AUTH ====================
@@ -2221,6 +2224,149 @@ async def get_user_shopify_orders(request: Request):
             "items_count": order.get("items_count", 0),
             "payment_method": order.get("payment_method", "N/A")
         } for order in mobile_orders]
+
+# ==================== ADMIN ENDPOINTS ====================
+
+class ProductCreate(BaseModel):
+    title: str
+    description: str = ""
+    price: float
+    currency: str = "RON"
+    image_url: Optional[str] = None
+    images: List[str] = []
+    tags: List[str] = []
+    product_type: Optional[str] = None
+    vendor: Optional[str] = None
+    stock: int = 0
+    stock_status: Optional[str] = None
+    sku: Optional[str] = None
+    compatible_models: List[str] = []
+
+class ProductUpdate(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    price: Optional[float] = None
+    currency: Optional[str] = None
+    image_url: Optional[str] = None
+    images: Optional[List[str]] = None
+    tags: Optional[List[str]] = None
+    product_type: Optional[str] = None
+    vendor: Optional[str] = None
+    stock: Optional[int] = None
+    stock_status: Optional[str] = None
+    sku: Optional[str] = None
+    compatible_models: Optional[List[str]] = None
+
+def slugify(text: str) -> str:
+    slug = normalize_text(text)
+    slug = re.sub(r'[^a-z0-9]+', '-', slug).strip('-')
+    return slug or str(uuid.uuid4())[:8]
+
+async def _require_admin(request: Request) -> dict:
+    """Resolve the bearer token to a user and confirm they have the admin
+    role. There's no self-serve way to become admin - the role is only ever
+    set directly in the database for the store owner's own account."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Token lipsă sau invalid")
+
+    token = auth_header.replace("Bearer ", "")
+    user = await db.users.find_one({"token": token})
+
+    if not user:
+        raise HTTPException(status_code=401, detail="Token invalid sau expirat")
+
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Acces interzis")
+
+    return user
+
+@api_router.get("/admin/products")
+async def admin_list_products(request: Request, limit: int = 200, skip: int = 0):
+    """List manually-created products (Shopify-synced products are managed
+    in Shopify Admin, not here)."""
+    await _require_admin(request)
+    cursor = db.shopify_products.find({"source": "manual"}).sort("created_at", -1).skip(skip).limit(limit)
+    products = await cursor.to_list(limit)
+    return [Product(**p) for p in products]
+
+@api_router.post("/admin/products")
+async def admin_create_product(request: Request, product_data: ProductCreate):
+    await _require_admin(request)
+
+    product_id = f"local-{uuid.uuid4()}"
+    now = datetime.utcnow()
+    product = {
+        "id": product_id,
+        "title": product_data.title,
+        "handle": slugify(product_data.title),
+        "description": product_data.description,
+        "description_normalized": normalize_text(product_data.description),
+        "title_normalized": normalize_text(product_data.title),
+        "price": product_data.price,
+        "currency": product_data.currency,
+        "image_url": product_data.image_url,
+        "images": product_data.images,
+        "tags": product_data.tags,
+        "product_type": product_data.product_type,
+        "vendor": product_data.vendor,
+        "stock": product_data.stock,
+        "stock_status": product_data.stock_status,
+        "sku": product_data.sku,
+        "compatible_models": product_data.compatible_models,
+        "source": "manual",
+        "created_at": now,
+    }
+    await db.shopify_products.insert_one(product)
+    return Product(**product)
+
+@api_router.put("/admin/products/{product_id}")
+async def admin_update_product(product_id: str, request: Request, product_data: ProductUpdate):
+    await _require_admin(request)
+
+    existing = await db.shopify_products.find_one({"id": product_id})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Produs inexistent")
+    if existing.get("source") != "manual":
+        raise HTTPException(status_code=403, detail="Acest produs este sincronizat din Shopify și nu poate fi editat aici")
+
+    update_dict = {k: v for k, v in product_data.dict().items() if v is not None}
+    if "title" in update_dict:
+        update_dict["title_normalized"] = normalize_text(update_dict["title"])
+        update_dict["handle"] = slugify(update_dict["title"])
+    if "description" in update_dict:
+        update_dict["description_normalized"] = normalize_text(update_dict["description"])
+
+    if update_dict:
+        await db.shopify_products.update_one({"id": product_id}, {"$set": update_dict})
+
+    updated = await db.shopify_products.find_one({"id": product_id})
+    return Product(**updated)
+
+@api_router.delete("/admin/products/{product_id}")
+async def admin_delete_product(product_id: str, request: Request):
+    await _require_admin(request)
+
+    existing = await db.shopify_products.find_one({"id": product_id})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Produs inexistent")
+    if existing.get("source") != "manual":
+        raise HTTPException(status_code=403, detail="Acest produs este sincronizat din Shopify și nu poate fi șters aici")
+
+    await db.shopify_products.delete_one({"id": product_id})
+    return {"message": "Produs șters"}
+
+@api_router.get("/admin/orders")
+async def admin_list_orders(request: Request, limit: int = 100, skip: int = 0):
+    """List orders placed through the webshop's own checkout (db.orders).
+    Does not include Shopify/mobile-app orders (db.mobile_orders) - those are
+    thin references without full line-item/customer detail."""
+    await _require_admin(request)
+    cursor = db.orders.find({}).sort("created_at", -1).skip(skip).limit(limit)
+    orders = await cursor.to_list(limit)
+    for order in orders:
+        order.pop("_id", None)
+    return orders
 
 # ==================== EQUIPMENT/UTILAJE ENDPOINTS ====================
 
