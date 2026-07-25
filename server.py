@@ -290,6 +290,7 @@ def extract_compatible_models(description: str) -> List[str]:
         r'\b(SE\s*\d{4})\b',               # e.g., "SE6400"
         r'\b(\d{4}[RMESTXDNJHL]?)\b',      # e.g., "6630", "6630R", "6920S", "6920"
         r'\b(\d{3,4}[A-Z]{0,2})\b',        # e.g., "6920", "6920S", "5045D"
+        r'\b(\d{4}[A-Z]{1,3}\d{2,4})\b',   # engine codes, e.g. "6068HL470", "4045HL474"
     ]
     
     for pattern in patterns:
@@ -736,11 +737,19 @@ async def get_collections():
     result = await db.shopify_products.aggregate(pipeline).to_list(100)
     return [{"name": r["_id"], "product_count": r["count"]} for r in result]
 
+SORT_FIELDS = {
+    "price_asc": ("price", 1),
+    "price_desc": ("price", -1),
+    "title_asc": ("title_normalized", 1),
+}
+
+
 @api_router.get("/products", response_model=List[Product])
 async def get_products(
     search: Optional[str] = None,
     product_type: Optional[str] = None,
     collection: Optional[str] = None,
+    sort: Optional[str] = None,
     limit: int = 1000,
     skip: int = 0
 ):
@@ -840,11 +849,16 @@ async def get_products(
                     query["$and"] = regex_conditions
         
         # Execute query
-        cursor = db.shopify_products.find(query).skip(skip).limit(limit)
+        cursor = db.shopify_products.find(query)
+        if sort and sort in SORT_FIELDS:
+            field, direction = SORT_FIELDS[sort]
+            cursor = cursor.sort(field, direction)
+        cursor = cursor.skip(skip).limit(limit)
         products = await cursor.to_list(limit)
-        
-        # Sort by relevance if searching
-        if search:
+
+        # Sort by relevance if searching and no explicit sort was requested -
+        # an explicit sort (price/title) takes priority over relevance.
+        if search and not sort:
             search_normalized = normalize_text(search)
             products.sort(
                 key=lambda p: (
@@ -853,7 +867,7 @@ async def get_products(
                     -1 if p.get("stock", 0) > 0 else 0
                 )
             )
-        
+
         return [Product(**p) for p in products]
         
     except Exception as e:
