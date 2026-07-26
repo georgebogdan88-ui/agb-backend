@@ -2282,11 +2282,21 @@ async def _require_admin(request: Request) -> dict:
     return user
 
 @api_router.get("/admin/products")
-async def admin_list_products(request: Request, limit: int = 200, skip: int = 0):
-    """List manually-created products (Shopify-synced products are managed
-    in Shopify Admin, not here)."""
+async def admin_list_products(request: Request, search: Optional[str] = None, limit: int = 50, skip: int = 0):
+    """List/search the full product catalog (originally Shopify-imported
+    products and manually-created ones alike - both are now owned by this
+    database, see sync_all_products())."""
     await _require_admin(request)
-    cursor = db.shopify_products.find({"source": "manual"}).sort("created_at", -1).skip(skip).limit(limit)
+
+    query = {}
+    if search:
+        term = normalize_text(search)
+        query["$or"] = [
+            {"title_normalized": {"$regex": term, "$options": "i"}},
+            {"sku": {"$regex": term, "$options": "i"}},
+        ]
+
+    cursor = db.shopify_products.find(query).sort("title_normalized", 1).skip(skip).limit(limit)
     products = await cursor.to_list(limit)
     return [Product(**p) for p in products]
 
@@ -2327,8 +2337,6 @@ async def admin_update_product(product_id: str, request: Request, product_data: 
     existing = await db.shopify_products.find_one({"id": product_id})
     if not existing:
         raise HTTPException(status_code=404, detail="Produs inexistent")
-    if existing.get("source") != "manual":
-        raise HTTPException(status_code=403, detail="Acest produs este sincronizat din Shopify și nu poate fi editat aici")
 
     update_dict = {k: v for k, v in product_data.dict().items() if v is not None}
     if "title" in update_dict:
@@ -2336,6 +2344,10 @@ async def admin_update_product(product_id: str, request: Request, product_data: 
         update_dict["handle"] = slugify(update_dict["title"])
     if "description" in update_dict:
         update_dict["description_normalized"] = normalize_text(update_dict["description"])
+    # Once locally edited, this product is locally-owned from now on - if a
+    # full resync ever runs again, it won't get silently reverted back to
+    # its old Shopify-imported values.
+    update_dict["source"] = "manual"
 
     if update_dict:
         await db.shopify_products.update_one({"id": product_id}, {"$set": update_dict})
@@ -2350,8 +2362,6 @@ async def admin_delete_product(product_id: str, request: Request):
     existing = await db.shopify_products.find_one({"id": product_id})
     if not existing:
         raise HTTPException(status_code=404, detail="Produs inexistent")
-    if existing.get("source") != "manual":
-        raise HTTPException(status_code=403, detail="Acest produs este sincronizat din Shopify și nu poate fi șters aici")
 
     await db.shopify_products.delete_one({"id": product_id})
     return {"message": "Produs șters"}
@@ -2945,7 +2955,7 @@ async def get_webhook_status():
     count = await db.shopify_products.count_documents({})
     return {
         "webhook_secret_configured": bool(SHOPIFY_WEBHOOK_SECRET),
-        "auto_sync_enabled": True,
+        "auto_sync_enabled": False,
         "auto_sync_interval_minutes": AUTO_SYNC_INTERVAL_MINUTES,
         "webhook_url": "/api/webhooks/shopify",
         "supported_topics": [
@@ -3532,9 +3542,13 @@ async def startup_event():
     except Exception:
         logger.exception("Failed to create unique index on users.email")
 
-    auto_sync_task = asyncio.create_task(auto_sync_loop())
-    logger.info(f"Auto-sync enabled: every {AUTO_SYNC_INTERVAL_MINUTES} minutes")
-    
+    # Auto-sync from Shopify is permanently disabled as of 2026-07-26: the
+    # webshop/admin panel is now the source of truth for the product catalog
+    # (independence from Shopify is the whole point of this project). A full
+    # catalog resync can still be triggered manually via POST /sync/start if
+    # ever needed, but nothing runs it on a recurring schedule anymore.
+    logger.info("Auto-sync from Shopify is disabled - product catalog is now locally owned")
+
     logger.info("=== WEBHOOK SETUP ===")
     logger.info("Add webhooks in Shopify Admin -> Settings -> Notifications -> Webhooks")
     logger.info(f"  URL: https://YOUR_DOMAIN/api/webhooks/shopify")
