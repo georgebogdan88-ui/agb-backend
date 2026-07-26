@@ -45,6 +45,10 @@ SHOPIFY_ADMIN_TOKEN = os.environ.get('SHOPIFY_ADMIN_TOKEN', '')  # Will be set a
 # Brevo Email Configuration
 BREVO_API_KEY = os.environ.get('BREVO_API_KEY', '')
 
+# CRM Integration Configuration (fire-and-forget order sync to agb-crm)
+CRM_API_URL = os.environ.get('CRM_API_URL', '')
+CRM_INTEGRATION_KEY = os.environ.get('CRM_INTEGRATION_KEY', '')
+
 # Auto-sync configuration
 AUTO_SYNC_INTERVAL_MINUTES = int(os.environ.get('AUTO_SYNC_INTERVAL_MINUTES', '5'))  # Default 5 minutes
 
@@ -141,6 +145,9 @@ class Order(BaseModel):
     status: str = "pending"
     payment_method: str = "ramburs"
     created_at: datetime = Field(default_factory=datetime.utcnow)
+    crm_synced: bool = False
+    crm_sync_error: Optional[str] = None
+    crm_sync_attempts: int = 0
 
 class OrderCreate(BaseModel):
     session_id: str
@@ -1303,12 +1310,90 @@ async def clear_cart(session_id: str):
 
 # ==================== ORDER ENDPOINTS ====================
 
+async def sync_order_to_crm(order: Order):
+    """Fire-and-forget: push a newly created webshop order into agb-crm.
+
+    Must never raise - any failure (missing config, timeout, connection
+    error, 4xx/5xx) is logged and swallowed so it can't affect the order
+    that was already saved/returned to the client.
+    """
+    if not CRM_API_URL or not CRM_INTEGRATION_KEY:
+        logger.error("CRM sync skipped for order %s: CRM_API_URL/CRM_INTEGRATION_KEY not configured", order.id)
+        return
+
+    payload = {
+        "source": "webshop",
+        "source_order_id": order.id,
+        "payment_method": order.payment_method,
+        "note": order.customer.notes,
+        "customer": {
+            "nume": order.customer.name,
+            "email": order.customer.email,
+            "telefon": order.customer.phone,
+            "adresa_strada": order.customer.address,
+            "adresa_oras": order.customer.city,
+            "adresa_judet": order.customer.county,
+            "adresa_cod_postal": order.customer.postal_code,
+        },
+        "items": [
+            {
+                "denumire": item.get("product_name"),
+                "cod_prod": item.get("product_id"),
+                "cantitate": item.get("quantity"),
+                "pret_unitar_cu_tva": item.get("price"),
+            }
+            for item in order.items
+        ],
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as http_client:
+            response = await http_client.post(
+                f"{CRM_API_URL}/integrations/orders",
+                json=payload,
+                headers={"X-Integration-Key": CRM_INTEGRATION_KEY},
+            )
+            if response.status_code >= 400:
+                error_message = f"HTTP {response.status_code} - {response.text}"
+                logger.error(
+                    "CRM sync failed for order %s: %s",
+                    order.id, error_message,
+                )
+                await db.orders.update_one(
+                    {"id": order.id},
+                    {
+                        "$set": {"crm_synced": False, "crm_sync_error": error_message},
+                        "$inc": {"crm_sync_attempts": 1},
+                    },
+                )
+                new_attempts = order.crm_sync_attempts + 1
+                if new_attempts >= 10:
+                    logger.error(f"CRM SYNC FAILED PERMANENTLY for order {order.id} after 10 attempts - needs manual sync")
+            else:
+                await db.orders.update_one(
+                    {"id": order.id},
+                    {"$set": {"crm_synced": True, "crm_sync_error": None}},
+                )
+    except Exception as e:
+        logger.error("CRM sync failed for order %s: %s", order.id, e)
+        await db.orders.update_one(
+            {"id": order.id},
+            {
+                "$set": {"crm_synced": False, "crm_sync_error": str(e)},
+                "$inc": {"crm_sync_attempts": 1},
+            },
+        )
+        new_attempts = order.crm_sync_attempts + 1
+        if new_attempts >= 10:
+            logger.error(f"CRM SYNC FAILED PERMANENTLY for order {order.id} after 10 attempts - needs manual sync")
+
 @api_router.post("/orders", response_model=Order)
-async def create_order(order_data: OrderCreate):
+async def create_order(order_data: OrderCreate, background_tasks: BackgroundTasks):
     """Create a new order"""
     order = Order(**order_data.dict())
     await db.orders.insert_one(order.dict())
     await db.cart.delete_many({"session_id": order_data.session_id})
+    background_tasks.add_task(sync_order_to_crm, order)
     return order
 
 @api_router.get("/orders/{session_id}", response_model=List[Order])
@@ -2967,31 +3052,46 @@ async def admin_get_client_detail(client_id: str, request: Request):
 
 # ==================== EQUIPMENT/UTILAJE ENDPOINTS ====================
 
-async def parse_equipment_from_shopify_notes(notes: str) -> list:
-    """Parse equipment from Shopify customer notes format"""
+def _equipment_match_key(model: str, chassis_serial: str) -> tuple:
+    return (model.strip().lower(), (chassis_serial or "").strip().lower())
+
+async def parse_equipment_from_shopify_notes(notes: str, existing_equipment: list = None) -> list:
+    """Parse equipment from Shopify customer notes format.
+
+    Re-parses on every read (so admin edits made directly in Shopify notes
+    show up), but reuses the id/created_at of any existing local entry that
+    matches by (model, chassis_serial) instead of always minting a fresh
+    uuid4 - otherwise ids churn on every GET and break links/routes that
+    reference a specific equipment id (e.g. the edit page).
+    """
     equipment_list = []
-    
+
     if not notes or "UTILAJELE CLIENTULUI:" not in notes:
         return equipment_list
-    
+
+    existing_by_key = {}
+    for eq in existing_equipment or []:
+        key = _equipment_match_key(eq.get("model", ""), eq.get("chassis_serial", ""))
+        existing_by_key[key] = eq
+
     try:
         # Split by equipment entries (numbered lines like "1. 6820")
         lines = notes.split('\n')
         current_equipment = None
-        
+
         for line in lines:
             line = line.strip()
-            
+
             # Check for new equipment entry (starts with number followed by .)
             if line and line[0].isdigit() and '. ' in line:
                 # Save previous equipment if exists
                 if current_equipment:
                     equipment_list.append(current_equipment)
-                
+
                 # Extract model name
                 parts = line.split('. ', 1)
                 model = parts[1] if len(parts) > 1 else line
-                
+
                 current_equipment = {
                     "id": str(uuid.uuid4()),
                     "model": model,
@@ -3026,7 +3126,16 @@ async def parse_equipment_from_shopify_notes(notes: str) -> list:
         # Don't forget the last equipment
         if current_equipment:
             equipment_list.append(current_equipment)
-        
+
+        # Reuse ids/created_at from matching existing entries so links to a
+        # specific equipment id keep working across repeated GETs.
+        for eq in equipment_list:
+            key = _equipment_match_key(eq.get("model", ""), eq.get("chassis_serial", ""))
+            match = existing_by_key.get(key)
+            if match:
+                eq["id"] = match.get("id", eq["id"])
+                eq["created_at"] = match.get("created_at", eq["created_at"])
+
         return equipment_list
     except Exception as e:
         logger.error(f"Error parsing equipment from Shopify notes: {e}")
@@ -3220,7 +3329,7 @@ async def get_user_equipment(request: Request):
         logger.info(f"Shopify notes for {user.get('email')}: {shopify_notes[:200] if shopify_notes else 'empty'}...")
         
         if shopify_notes and "UTILAJELE CLIENTULUI:" in shopify_notes:
-            shopify_equipment = await parse_equipment_from_shopify_notes(shopify_notes)
+            shopify_equipment = await parse_equipment_from_shopify_notes(shopify_notes, local_equipment)
             logger.info(f"Parsed {len(shopify_equipment)} equipment from Shopify notes")
             
             if shopify_equipment:
@@ -4119,10 +4228,37 @@ async def auto_sync_loop():
             logger.error(f"Auto-sync error: {e}")
             await asyncio.sleep(300)
 
+# ==================== CRM RECONCILIATION BACKGROUND TASK ====================
+
+crm_reconciliation_task = None
+
+async def crm_reconciliation_loop():
+    """Background task that retries CRM sync for orders that previously failed"""
+    while True:
+        try:
+            await asyncio.sleep(600)  # 10 minutes
+
+            pending_orders = await db.orders.find({
+                "crm_synced": {"$ne": True},
+                "crm_sync_attempts": {"$lt": 10},
+            }).to_list(1000)
+
+            for doc in pending_orders:
+                doc.pop("_id", None)
+                order = Order(**doc)
+                logger.info(f"CRM reconciliation: retry order {order.id}, attempt {order.crm_sync_attempts + 1}")
+                await sync_order_to_crm(order)
+        except asyncio.CancelledError:
+            logger.info("CRM reconciliation task cancelled")
+            break
+        except Exception as e:
+            logger.error(f"CRM reconciliation error: {e}")
+            await asyncio.sleep(300)
+
 @app.on_event("startup")
 async def startup_event():
     """Start background tasks on app startup"""
-    global auto_sync_task
+    global auto_sync_task, crm_reconciliation_task
 
     try:
         await db.users.create_index("email", unique=True)
@@ -4135,6 +4271,8 @@ async def startup_event():
     # catalog resync can still be triggered manually via POST /sync/start if
     # ever needed, but nothing runs it on a recurring schedule anymore.
     logger.info("Auto-sync from Shopify is disabled - product catalog is now locally owned")
+
+    crm_reconciliation_task = asyncio.create_task(crm_reconciliation_loop())
 
     logger.info("=== WEBHOOK SETUP ===")
     logger.info("Add webhooks in Shopify Admin -> Settings -> Notifications -> Webhooks")
