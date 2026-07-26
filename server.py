@@ -2450,6 +2450,123 @@ async def admin_upload_image(request: Request, file: UploadFile = File(...)):
 
     return {"url": result["secure_url"]}
 
+# ==================== IMAGE MIGRATION (Shopify CDN -> Cloudinary) ====================
+# One-off bulk migration so product images no longer depend on Shopify's CDN
+# staying up (the whole point of leaving Shopify). Resumable: progress is
+# tracked per source URL in db.image_migrations, so a re-run skips anything
+# already done and only retries what's pending/failed.
+
+image_migration_status = {
+    "is_running": False,
+    "total": 0,
+    "done": 0,
+    "failed": 0,
+    "last_run": None,
+    "error": None,
+}
+
+async def _migrate_single_image(url: str, semaphore: asyncio.Semaphore):
+    async with semaphore:
+        existing = await db.image_migrations.find_one({"_id": url})
+        if existing and existing.get("status") == "done":
+            image_migration_status["done"] += 1
+            return
+
+        try:
+            # Cloudinary fetches directly from the given URL server-side -
+            # no need to download it ourselves first.
+            result = await asyncio.to_thread(
+                cloudinary.uploader.upload, url, folder="agb-agroparts/products-import"
+            )
+            await db.image_migrations.update_one(
+                {"_id": url},
+                {"$set": {
+                    "cloudinary_url": result["secure_url"],
+                    "status": "done",
+                    "error": None,
+                    "migrated_at": datetime.utcnow(),
+                }},
+                upsert=True,
+            )
+            image_migration_status["done"] += 1
+        except Exception as e:
+            await db.image_migrations.update_one(
+                {"_id": url},
+                {"$set": {"status": "failed", "error": str(e), "migrated_at": datetime.utcnow()}},
+                upsert=True,
+            )
+            image_migration_status["failed"] += 1
+
+async def _run_image_migration(limit: Optional[int] = None):
+    global image_migration_status
+    if image_migration_status["is_running"]:
+        return
+    image_migration_status.update({"is_running": True, "error": None, "done": 0, "failed": 0})
+
+    try:
+        cursor = db.shopify_products.find({}, {"image_url": 1, "images": 1})
+        urls = set()
+        async for doc in cursor:
+            for u in (doc.get("images") or []):
+                if u and "cdn.shopify.com" in u:
+                    urls.add(u)
+            image_url = doc.get("image_url")
+            if image_url and "cdn.shopify.com" in image_url:
+                urls.add(image_url)
+
+        urls = list(urls)
+        if limit:
+            urls = urls[:limit]
+        image_migration_status["total"] = len(urls)
+
+        semaphore = asyncio.Semaphore(10)
+        await asyncio.gather(*(_migrate_single_image(u, semaphore) for u in urls))
+
+        # Rewrite product image fields using whatever's mapped so far -
+        # partial progress (e.g. a limited test run) still updates the
+        # matching products instead of waiting for 100% completion.
+        mapping = {}
+        async for m in db.image_migrations.find({"status": "done", "_id": {"$in": urls}}):
+            mapping[m["_id"]] = m["cloudinary_url"]
+
+        cursor = db.shopify_products.find(
+            {"$or": [{"image_url": {"$in": urls}}, {"images": {"$in": urls}}]},
+            {"id": 1, "image_url": 1, "images": 1},
+        )
+        async for doc in cursor:
+            update = {}
+            old_image_url = doc.get("image_url")
+            if old_image_url in mapping:
+                update["image_url"] = mapping[old_image_url]
+            old_images = doc.get("images") or []
+            new_images = [mapping.get(u, u) for u in old_images]
+            if new_images != old_images:
+                update["images"] = new_images
+            if update:
+                await db.shopify_products.update_one({"id": doc["id"]}, {"$set": update})
+
+        image_migration_status["last_run"] = datetime.utcnow().isoformat()
+    except Exception as e:
+        image_migration_status["error"] = str(e)
+        logger.error(f"Image migration error: {e}")
+    finally:
+        image_migration_status["is_running"] = False
+
+@api_router.post("/admin/migrate-images")
+async def admin_migrate_images(request: Request, background_tasks: BackgroundTasks, limit: Optional[int] = None):
+    """Kick off the Shopify-CDN -> Cloudinary image migration in the
+    background. Pass `limit` to test on a handful of images first."""
+    await _require_admin(request)
+    if image_migration_status["is_running"]:
+        raise HTTPException(status_code=409, detail="Migrarea rulează deja")
+    background_tasks.add_task(_run_image_migration, limit)
+    return {"message": "Migrare pornită"}
+
+@api_router.get("/admin/migrate-images/status")
+async def admin_migrate_images_status(request: Request):
+    await _require_admin(request)
+    return image_migration_status
+
 @api_router.get("/admin/orders")
 async def admin_list_orders(request: Request, limit: int = 100, skip: int = 0):
     """List orders placed through the webshop's own checkout (db.orders).
