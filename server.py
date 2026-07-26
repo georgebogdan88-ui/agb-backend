@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Query, BackgroundTasks, Request
+from fastapi import FastAPI, APIRouter, HTTPException, Query, BackgroundTasks, Request, UploadFile, File
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
@@ -19,6 +19,8 @@ import hashlib
 import hmac
 import secrets
 import bcrypt
+import cloudinary
+import cloudinary.uploader
 
 ROOT_DIR = Path(__file__).parent
 # Load .env but don't override existing environment variables (important for Render deployment)
@@ -45,6 +47,14 @@ BREVO_API_KEY = os.environ.get('BREVO_API_KEY', '')
 
 # Auto-sync configuration
 AUTO_SYNC_INTERVAL_MINUTES = int(os.environ.get('AUTO_SYNC_INTERVAL_MINUTES', '5'))  # Default 5 minutes
+
+# Cloudinary configuration (admin product image uploads)
+cloudinary.config(
+    cloud_name=os.environ.get('CLOUDINARY_CLOUD_NAME', ''),
+    api_key=os.environ.get('CLOUDINARY_API_KEY', ''),
+    api_secret=os.environ.get('CLOUDINARY_API_SECRET', ''),
+    secure=True,
+)
 
 # Create the main app without a prefix
 app = FastAPI()
@@ -2365,6 +2375,28 @@ async def admin_delete_product(product_id: str, request: Request):
 
     await db.shopify_products.delete_one({"id": product_id})
     return {"message": "Produs șters"}
+
+@api_router.post("/admin/upload-image")
+async def admin_upload_image(request: Request, file: UploadFile = File(...)):
+    """Upload a product image (e.g. exported from Canva) to Cloudinary and
+    return its public URL, for pasting into the image fields above."""
+    await _require_admin(request)
+
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Fișierul trebuie să fie o imagine")
+
+    contents = await file.read()
+    try:
+        result = cloudinary.uploader.upload(
+            contents,
+            folder="agb-agroparts/products",
+            resource_type="image",
+        )
+    except Exception as e:
+        logger.error(f"Cloudinary upload error: {e}")
+        raise HTTPException(status_code=502, detail="Încărcarea imaginii a eșuat")
+
+    return {"url": result["secure_url"]}
 
 @api_router.get("/admin/orders")
 async def admin_list_orders(request: Request, limit: int = 100, skip: int = 0):

@@ -13,3 +13,4 @@ email-validator==2.3.0
 python-multipart==0.0.22
 sib-api-v3-sdk==7.6.0
 firebase_admin==7.3.0
+cloudinary==1.44.1
