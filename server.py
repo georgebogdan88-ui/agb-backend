@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Query, BackgroundTasks, Request, UploadFile, File
+from fastapi import FastAPI, APIRouter, HTTPException, Query, BackgroundTasks, Request, UploadFile, File, Body
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
@@ -2578,6 +2578,392 @@ async def admin_list_orders(request: Request, limit: int = 100, skip: int = 0):
     for order in orders:
         order.pop("_id", None)
     return orders
+
+# ==================== CLIENTS (Shopify customer import) ====================
+# One-time bulk import of every existing Shopify customer + their full order
+# history into our own db.clients / db.shopify_order_history collections, so
+# the webshop admin panel can show a "Clienti" section without depending on
+# Shopify staying online. This is NOT a continuous sync - Shopify remains the
+# system of record for customers until it's deactivated, at which point a
+# SECOND run (passing `since` = the `cutoff_recorded` value returned by this
+# run's status once it's done) picks up only what changed since then.
+# Idempotent by design: re-running upserts by shopify_customer_id / Shopify
+# order id, it never duplicates - safe to run repeatedly.
+
+SHOPIFY_ADMIN_API_VERSION = "2024-01"
+
+clients_import_status = {
+    "is_running": False,
+    "since_used": None,
+    "limit_used": None,
+    "total_customers": 0,
+    "done_customers": 0,
+    "orders_imported": 0,
+    "failed_customers": 0,
+    "cutoff_recorded": None,
+    "last_run": None,
+    "error": None,
+}
+
+
+def _parse_shopify_datetime(value: Optional[str]) -> Optional[datetime]:
+    """Shopify returns ISO8601 with a fixed offset (e.g. -04:00), which
+    datetime.fromisoformat handles natively - no extra dependency needed."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        logger.warning(f"Could not parse Shopify datetime: {value}")
+        return None
+
+
+async def _fetch_shopify_customer_orders(http_client: httpx.AsyncClient, headers: dict, customer_id: str) -> list:
+    """Fetch a single customer's FULL order history (status=any, so it
+    includes open/closed/cancelled orders alike), following Shopify's
+    Link-header pagination - same pattern as _fetch_all_collection_product_ids
+    above."""
+    orders = []
+    page_info = None
+    while True:
+        url = (
+            f"https://{SHOPIFY_STORE}/admin/api/{SHOPIFY_ADMIN_API_VERSION}/customers/"
+            f"{customer_id}/orders.json?status=any&limit=250"
+        )
+        if page_info:
+            url += f"&page_info={page_info}"
+
+        response = await http_client.get(url, headers=headers, timeout=60.0)
+        if response.status_code != 200:
+            logger.error(f"Error fetching orders for Shopify customer {customer_id}: {response.text}")
+            break
+
+        data = response.json()
+        orders.extend(data.get("orders", []))
+
+        next_page_info = _extract_next_page_info(response.headers.get("Link", ""))
+        if not next_page_info or next_page_info == page_info:
+            break
+        page_info = next_page_info
+        await asyncio.sleep(0.15)
+
+    return orders
+
+
+async def _run_clients_import(since: Optional[str], limit: Optional[int]):
+    """Background job: page through Shopify's customers.json (optionally
+    filtered to only customers updated at/after `since`), and for each one
+    upsert its profile plus its complete order history. `limit` caps the
+    total number of customers processed, for a quick sanity-check run."""
+    global clients_import_status
+    if clients_import_status["is_running"]:
+        return
+
+    run_started_at = datetime.utcnow()
+    clients_import_status.update({
+        "is_running": True,
+        "since_used": since,
+        "limit_used": limit,
+        "total_customers": 0,
+        "done_customers": 0,
+        "orders_imported": 0,
+        "failed_customers": 0,
+        "cutoff_recorded": None,
+        "error": None,
+    })
+
+    run_status = "completed"
+    run_error = None
+
+    try:
+        admin_token = os.environ.get('SHOPIFY_ADMIN_TOKEN', '') or SHOPIFY_ADMIN_TOKEN
+        if not admin_token:
+            raise RuntimeError("SHOPIFY_ADMIN_TOKEN not configured")
+
+        headers = {
+            "X-Shopify-Access-Token": admin_token,
+            "Content-Type": "application/json",
+        }
+
+        async with httpx.AsyncClient() as http_client:
+            customers = []
+            page_info = None
+            while True:
+                url = f"https://{SHOPIFY_STORE}/admin/api/{SHOPIFY_ADMIN_API_VERSION}/customers.json?limit=250"
+                if since:
+                    url += f"&updated_at_min={since}"
+                if page_info:
+                    url += f"&page_info={page_info}"
+
+                response = await http_client.get(url, headers=headers, timeout=60.0)
+                if response.status_code != 200:
+                    raise RuntimeError(f"Shopify customers.json error {response.status_code}: {response.text}")
+
+                data = response.json()
+                customers.extend(data.get("customers", []))
+
+                if limit and len(customers) >= limit:
+                    customers = customers[:limit]
+                    break
+
+                next_page_info = _extract_next_page_info(response.headers.get("Link", ""))
+                if not next_page_info or next_page_info == page_info:
+                    break
+                page_info = next_page_info
+                await asyncio.sleep(0.15)
+
+            clients_import_status["total_customers"] = len(customers)
+
+            for customer in customers:
+                try:
+                    shopify_customer_id = str(customer.get("id"))
+                    default_address = customer.get("default_address") or {}
+                    name = " ".join(
+                        part for part in [customer.get("first_name"), customer.get("last_name")] if part
+                    ).strip()
+                    email = customer.get("email") or ""
+
+                    client_doc = {
+                        "id": shopify_customer_id,
+                        "shopify_customer_id": shopify_customer_id,
+                        "name": name,
+                        "name_normalized": normalize_text(name),
+                        "email": email,
+                        "email_normalized": email.strip().lower(),
+                        "phone": customer.get("phone") or default_address.get("phone") or "",
+                        "address": {
+                            "address": default_address.get("address1", "") or "",
+                            "address2": default_address.get("address2", "") or "",
+                            "city": default_address.get("city", "") or "",
+                            "county": default_address.get("province", "") or "",
+                            "postal_code": default_address.get("zip", "") or "",
+                            "country": default_address.get("country", "") or "",
+                        },
+                        "orders_count": customer.get("orders_count", 0) or 0,
+                        "total_spent": float(customer.get("total_spent") or 0),
+                        "created_at": _parse_shopify_datetime(customer.get("created_at")),
+                        "shopify_updated_at": _parse_shopify_datetime(customer.get("updated_at")),
+                        "source": "shopify",
+                        "last_synced_at": datetime.utcnow(),
+                    }
+
+                    await db.clients.update_one(
+                        {"id": shopify_customer_id},
+                        {
+                            "$set": client_doc,
+                            "$setOnInsert": {"imported_at": datetime.utcnow()},
+                        },
+                        upsert=True,
+                    )
+
+                    orders = await _fetch_shopify_customer_orders(http_client, headers, shopify_customer_id)
+                    for order in orders:
+                        order_id = str(order.get("id"))
+                        line_items = [
+                            {
+                                "title": item.get("title"),
+                                "quantity": item.get("quantity"),
+                                "price": float(item.get("price") or 0),
+                            }
+                            for item in order.get("line_items", [])
+                        ]
+                        order_doc = {
+                            "id": order_id,
+                            "client_id": shopify_customer_id,
+                            "order_number": order.get("order_number"),
+                            "name": order.get("name"),
+                            "created_at": _parse_shopify_datetime(order.get("created_at")),
+                            "total_price": float(order.get("total_price") or 0),
+                            "currency": order.get("currency", "RON"),
+                            "financial_status": order.get("financial_status"),
+                            "fulfillment_status": order.get("fulfillment_status"),
+                            "line_items": line_items,
+                        }
+                        await db.shopify_order_history.update_one(
+                            {"id": order_id},
+                            {
+                                "$set": order_doc,
+                                "$setOnInsert": {"imported_at": datetime.utcnow()},
+                            },
+                            upsert=True,
+                        )
+                    clients_import_status["orders_imported"] += len(orders)
+
+                except Exception as e:
+                    logger.error(f"Clients import: failed on customer {customer.get('id')}: {e}")
+                    clients_import_status["failed_customers"] += 1
+
+                clients_import_status["done_customers"] += 1
+                await asyncio.sleep(0.1)
+
+    except Exception as e:
+        run_status = "failed"
+        run_error = str(e)
+        clients_import_status["error"] = run_error
+        logger.error(f"Clients import failed: {e}")
+
+    finally:
+        finished_at = datetime.utcnow()
+        clients_import_status["is_running"] = False
+        clients_import_status["last_run"] = finished_at.isoformat()
+        # Safe cutoff for the NEXT incremental run: the moment THIS run
+        # started, not when it finished - any customer change that happens
+        # concurrently with this run is guaranteed to be updated_at >= this
+        # value, so it'll be picked up next time even if this run raced it
+        # (idempotent upserts mean re-processing it again is harmless).
+        clients_import_status["cutoff_recorded"] = run_started_at.isoformat()
+
+        await db.clients_import_runs.insert_one({
+            "id": str(uuid.uuid4()),
+            "started_at": run_started_at,
+            "finished_at": finished_at,
+            "since_used": since,
+            "cutoff_recorded": run_started_at,
+            "limit_used": limit,
+            "total_customers": clients_import_status["total_customers"],
+            "done_customers": clients_import_status["done_customers"],
+            "orders_imported": clients_import_status["orders_imported"],
+            "failed_customers": clients_import_status["failed_customers"],
+            "status": run_status,
+            "error": run_error,
+        })
+
+
+@api_router.post("/admin/clients/import-shopify")
+async def admin_import_clients_shopify(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    since: Optional[str] = Body(default=None, embed=True),
+    limit: Optional[int] = None,
+):
+    """Kick off the one-time Shopify customer + order-history import in the
+    background. Pass `since` (ISO datetime, e.g. "2026-07-26T00:00:00+00:00")
+    in the JSON body to only (re)import customers updated at/after that point
+    - use this for the second run once Shopify is deactivated, passing the
+    `cutoff_recorded` value from this run's final status. Pass `limit`
+    (query param) to cap it to a handful of customers for a quick
+    sanity-check run first."""
+    await _require_admin(request)
+    if clients_import_status["is_running"]:
+        raise HTTPException(status_code=409, detail="Importul rulează deja")
+    background_tasks.add_task(_run_clients_import, since, limit)
+    return {"message": "Import pornit", "since": since, "limit": limit}
+
+
+@api_router.get("/admin/clients/import-shopify/status")
+async def admin_import_clients_shopify_status(request: Request):
+    """Poll this while the import runs. If this process hasn't run an import
+    since it last started (e.g. right after a restart, which can easily
+    happen between the first run and the second run weeks/months later),
+    fall back to the last persisted run in db.clients_import_runs so the
+    cutoff/history isn't lost."""
+    await _require_admin(request)
+    if not clients_import_status["is_running"] and clients_import_status["last_run"] is None:
+        last = await db.clients_import_runs.find_one({}, sort=[("finished_at", -1)])
+        if last:
+            last.pop("_id", None)
+            return last
+    return clients_import_status
+
+
+@api_router.get("/admin/clients")
+async def admin_list_clients(request: Request, search: Optional[str] = None, limit: int = 50, skip: int = 0):
+    """Paginated list of imported Shopify clients, for the admin 'Clienti' list view."""
+    await _require_admin(request)
+
+    query = {}
+    if search:
+        term = normalize_text(search)
+        query["$or"] = [
+            {"name_normalized": {"$regex": term, "$options": "i"}},
+            {"email_normalized": {"$regex": term, "$options": "i"}},
+        ]
+
+    total = await db.clients.count_documents(query)
+    cursor = db.clients.find(query).sort("name_normalized", 1).skip(skip).limit(limit)
+    clients = await cursor.to_list(limit)
+    for c in clients:
+        c.pop("_id", None)
+    return {"total": total, "clients": clients}
+
+
+@api_router.get("/admin/clients/{client_id}")
+async def admin_get_client_detail(client_id: str, request: Request):
+    """Full client detail: profile + the COMPLETE order history ('totalitatea
+    comenzilor'), merging (a) the imported historical Shopify orders and (b)
+    any native webshop orders (db.orders) matched by customer email
+    (case-insensitive - native orders have no client_id link), each entry
+    tagged with its `source` ("shopify"/"native"), sorted newest-first."""
+    await _require_admin(request)
+
+    client = await db.clients.find_one({"id": client_id})
+    if not client:
+        raise HTTPException(status_code=404, detail="Client inexistent")
+    client.pop("_id", None)
+
+    merged_orders = []
+
+    shopify_orders = await db.shopify_order_history.find({"client_id": client_id}).to_list(1000)
+    for o in shopify_orders:
+        merged_orders.append({
+            "source": "shopify",
+            "order_id": o.get("id"),
+            "order_number": o.get("name") or o.get("order_number"),
+            "date": o.get("created_at"),
+            "total": o.get("total_price"),
+            "currency": o.get("currency", "RON"),
+            "financial_status": o.get("financial_status"),
+            "fulfillment_status": o.get("fulfillment_status"),
+            "payment_method": None,
+            "line_items": o.get("line_items", []),
+        })
+
+    email = client.get("email_normalized") or (client.get("email") or "").strip().lower()
+    native_orders = []
+    if email:
+        native_orders = await db.orders.find(
+            {"customer.email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}}
+        ).to_list(1000)
+
+    for o in native_orders:
+        line_items = [
+            {
+                "title": item.get("product_name"),
+                "quantity": item.get("quantity"),
+                "price": item.get("price"),
+            }
+            for item in o.get("items", [])
+        ]
+        merged_orders.append({
+            "source": "native",
+            "order_id": o.get("id"),
+            "order_number": None,
+            "date": o.get("created_at"),
+            "total": o.get("total"),
+            "currency": "RON",
+            "financial_status": o.get("status"),
+            "fulfillment_status": None,
+            "payment_method": o.get("payment_method"),
+            "line_items": line_items,
+        })
+
+    def _sort_key(entry):
+        value = entry.get("date")
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, str):
+            return _parse_shopify_datetime(value) or datetime.min
+        return datetime.min
+
+    merged_orders.sort(key=_sort_key, reverse=True)
+
+    return {
+        "client": client,
+        "orders": merged_orders,
+        "orders_count_total": len(merged_orders),
+        "shopify_orders_count": len(shopify_orders),
+        "native_orders_count": len(native_orders),
+    }
 
 # ==================== EQUIPMENT/UTILAJE ENDPOINTS ====================
 
