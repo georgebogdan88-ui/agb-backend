@@ -97,6 +97,7 @@ class Product(BaseModel):
     stock_status: Optional[str] = None
     sku: Optional[str] = None
     compatible_models: List[str] = []
+    collections: List[str] = []
 
 class CartItem(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -975,6 +976,14 @@ async def get_product_types():
                 "Filtre"
             ]
         }
+
+@api_router.get("/products/vendors")
+async def get_product_vendors():
+    """Get distinct vendor/brand names from the database, for the admin
+    product form's Marcă field."""
+    vendors = await db.shopify_products.distinct("vendor")
+    vendors = sorted(v for v in vendors if v)
+    return {"vendors": vendors}
 
 @api_router.get("/products/{product_id}/complementary")
 async def get_complementary_products(product_id: str):
@@ -2251,6 +2260,7 @@ class ProductCreate(BaseModel):
     stock_status: Optional[str] = None
     sku: Optional[str] = None
     compatible_models: List[str] = []
+    category: Optional[str] = None  # e.g. "motor", "transmisie" - combined with product_type to derive `collections`
 
 class ProductUpdate(BaseModel):
     title: Optional[str] = None
@@ -2266,11 +2276,43 @@ class ProductUpdate(BaseModel):
     stock_status: Optional[str] = None
     sku: Optional[str] = None
     compatible_models: Optional[List[str]] = None
+    category: Optional[str] = None
 
 def slugify(text: str) -> str:
     slug = normalize_text(text)
     slug = re.sub(r'[^a-z0-9]+', '-', slug).strip('-')
     return slug or str(uuid.uuid4())[:8]
+
+NEW_COLLECTION = "PIESE NOI"
+DEZMEMBRARE_COLLECTION = "PIESE DIN DEZMEMBRARE"
+NEW_CATEGORY_PREFIX = "Piese noi "
+DEZMEMBRARE_CATEGORY_PREFIX = "Piese din dezmembrare "
+
+def build_collections(product_type: Optional[str], category: Optional[str], existing: List[str]) -> List[str]:
+    """Derives the `collections` array (used for storefront category
+    browsing) from the admin's Tip ("Nou"/"Dezmembrari") + Categorie
+    ("motor", "transmisie"...) picks, matching the naming convention the
+    Shopify sync already uses ("PIESE NOI" + "Piese noi motor"). Anything
+    else already on the product (e.g. "HOME", "Recommended products
+    (Seguno)") is preserved as-is rather than wiped."""
+    preserved = [
+        c for c in existing
+        if c not in (NEW_COLLECTION, DEZMEMBRARE_COLLECTION)
+        and not c.startswith(NEW_CATEGORY_PREFIX)
+        and not c.startswith(DEZMEMBRARE_CATEGORY_PREFIX)
+    ]
+
+    derived = []
+    if product_type == "Nou":
+        derived.append(NEW_COLLECTION)
+        if category:
+            derived.append(f"{NEW_CATEGORY_PREFIX}{category}")
+    elif product_type == "Dezmembrari":
+        derived.append(DEZMEMBRARE_COLLECTION)
+        if category:
+            derived.append(f"{DEZMEMBRARE_CATEGORY_PREFIX}{category}")
+
+    return preserved + derived
 
 async def _require_admin(request: Request) -> dict:
     """Resolve the bearer token to a user and confirm they have the admin
@@ -2316,6 +2358,7 @@ async def admin_create_product(request: Request, product_data: ProductCreate):
 
     product_id = f"local-{uuid.uuid4()}"
     now = datetime.utcnow()
+    collections = build_collections(product_data.product_type, product_data.category, [])
     product = {
         "id": product_id,
         "title": product_data.title,
@@ -2334,6 +2377,8 @@ async def admin_create_product(request: Request, product_data: ProductCreate):
         "stock_status": product_data.stock_status,
         "sku": product_data.sku,
         "compatible_models": product_data.compatible_models,
+        "collections": collections,
+        "collections_normalized": [normalize_text(c) for c in collections],
         "source": "manual",
         "created_at": now,
     }
@@ -2349,11 +2394,18 @@ async def admin_update_product(product_id: str, request: Request, product_data: 
         raise HTTPException(status_code=404, detail="Produs inexistent")
 
     update_dict = {k: v for k, v in product_data.dict().items() if v is not None}
+    category = update_dict.pop("category", None)
     if "title" in update_dict:
         update_dict["title_normalized"] = normalize_text(update_dict["title"])
         update_dict["handle"] = slugify(update_dict["title"])
     if "description" in update_dict:
         update_dict["description_normalized"] = normalize_text(update_dict["description"])
+    # ProductForm always resubmits the full Tip+Categorie selection together,
+    # so it's safe to always rebuild `collections` here rather than trying
+    # to detect whether either one actually changed.
+    final_type = update_dict.get("product_type", existing.get("product_type"))
+    update_dict["collections"] = build_collections(final_type, category, existing.get("collections", []))
+    update_dict["collections_normalized"] = [normalize_text(c) for c in update_dict["collections"]]
     # Once locally edited, this product is locally-owned from now on - if a
     # full resync ever runs again, it won't get silently reverted back to
     # its old Shopify-imported values.
