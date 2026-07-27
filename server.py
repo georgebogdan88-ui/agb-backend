@@ -8,7 +8,7 @@ import os
 import logging
 from pathlib import Path
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Optional, Literal
 import uuid
 from datetime import datetime, timedelta
 import httpx
@@ -102,6 +102,8 @@ class Product(BaseModel):
     sku: Optional[str] = None
     compatible_models: List[str] = []
     collections: List[str] = []
+    complementary_product_ids: List[str] = []
+    is_featured: bool = False
 
 class CartItem(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -223,6 +225,12 @@ class EquipmentUpdate(BaseModel):
     front_axle_model: Optional[str] = None
     features: Optional[List[str]] = None
 
+class CustomerInterestCreate(BaseModel):
+    """Add-interest request body for POST /auth/interests (favorite /
+    price alert / stock alert toggle on a product page)."""
+    product_id: str
+    type: Literal["favorite", "price_alert", "stock_alert"]
+
 class UserResponse(BaseModel):
     id: str
     email: str
@@ -253,6 +261,58 @@ def verify_password(password: str, hashed: str) -> bool:
 def generate_token() -> str:
     """Generate a simple auth token"""
     return str(uuid.uuid4()) + "-" + str(uuid.uuid4())
+
+# Hard cap on concurrent logged-in devices per account. Each `db.users`
+# document stores its active session tokens in a `tokens` array (max length
+# MAX_DEVICE_TOKENS); a 4th simultaneous login is rejected rather than
+# evicting the oldest session (see _issue_session_token).
+MAX_DEVICE_TOKENS = 3
+DEVICE_LIMIT_MESSAGE = (
+    "Ai atins limita de 3 dispozitive conectate simultan. "
+    "Deconectează-te de pe un alt dispozitiv pentru a continua."
+)
+
+
+async def _issue_session_token(email: str) -> str:
+    """Mint and persist a new session token for the given user, enforcing
+    MAX_DEVICE_TOKENS concurrent devices per account. Only call this after
+    credentials have already been verified for `email`.
+
+    Atomic by construction: the filter's `tokens.{MAX-1}` existence check and
+    the `$push` happen in a single update_one, so two simultaneous logins for
+    the same account can't both slip past the cap (no separate read-then-write
+    race window).
+
+    Raises HTTP 403 if the account already has MAX_DEVICE_TOKENS active
+    sessions.
+    """
+    new_token = generate_token()
+    result = await db.users.update_one(
+        {"email": email, f"tokens.{MAX_DEVICE_TOKENS - 1}": {"$exists": False}},
+        {"$push": {"tokens": new_token}},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=403, detail=DEVICE_LIMIT_MESSAGE)
+    return new_token
+
+
+async def _find_user_by_token(token: str, allow_shopify_access_token: bool = False) -> Optional[dict]:
+    """Resolve a bearer token to a user doc.
+
+    Checks the `tokens` array (current, multi-device scheme) first, then
+    falls back to a legacy singular `token` field for any account the
+    one-time startup migration hasn't converted yet (belt-and-braces safety
+    net - in steady state every account should already have `tokens`).
+
+    When `allow_shopify_access_token` is set, also matches on the user's
+    stored Shopify customer access token, matching the handful of endpoints
+    (equipment CRUD) that have always accepted either credential type as a
+    bearer token.
+    """
+    or_clauses = [{"tokens": token}, {"token": token}]
+    if allow_shopify_access_token:
+        or_clauses.append({"shopify_access_token": token})
+    return await db.users.find_one({"$or": or_clauses})
 
 # ==================== SEARCH HELPERS ====================
 
@@ -650,25 +710,53 @@ async def sync_all_products():
     sync_status["error"] = None
     
     try:
+        # Preserve admin-curated complementary-product links and "Produse
+        # recomandate" picks across the delete+reinsert below -
+        # parse_shopify_node() never produces either field (Shopify's bulk
+        # product query doesn't return them), so without this the periodic
+        # auto-sync would silently wipe every link set via the admin UI or
+        # scripts/backfill_complementary_products.py, and silently un-feature
+        # every product an admin curated, within one sync cycle. (No need to
+        # preserve an explicit `is_featured: False` - that's already the
+        # default for anything freshly parsed.)
+        preserved_complementary = {
+            p["id"]: p["complementary_product_ids"]
+            for p in await db.shopify_products.find(
+                {"source": {"$ne": "manual"}, "complementary_product_ids": {"$exists": True, "$ne": []}},
+                {"id": 1, "complementary_product_ids": 1}
+            ).to_list(None)
+        }
+        preserved_featured = {
+            p["id"]
+            for p in await db.shopify_products.find(
+                {"source": {"$ne": "manual"}, "is_featured": True},
+                {"id": 1}
+            ).to_list(None)
+        }
+
         # Clear existing Shopify-synced products, but keep manually-created
         # products (source="manual") - those aren't part of the Shopify catalog
         # and would be permanently lost if wiped here.
         await db.shopify_products.delete_many({"source": {"$ne": "manual"}})
-        
+
         after = None
         total_products = 0
         batch = []
-        
+
         while True:
             logger.info(f"Fetching products... (total so far: {total_products})")
-            
+
             data = await fetch_shopify_products_page(after)
             edges = data.get("data", {}).get("products", {}).get("edges", [])
             page_info = data.get("data", {}).get("products", {}).get("pageInfo", {})
-            
+
             for edge in edges:
                 node = edge["node"]
                 product = parse_shopify_node(node)
+                if product["id"] in preserved_complementary:
+                    product["complementary_product_ids"] = preserved_complementary[product["id"]]
+                if product["id"] in preserved_featured:
+                    product["is_featured"] = True
                 batch.append(product)
                 total_products += 1
             
@@ -931,28 +1019,47 @@ async def get_products_from_shopify(search: Optional[str], limit: int) -> List[P
 
 @api_router.get("/products/featured", response_model=List[Product])
 async def get_featured_products(limit: int = 10):
-    """Get featured products - prioritize in-stock items"""
+    """Get featured products for the homepage "Produse recomandate" section.
+
+    Admin-curated picks (`is_featured: True`, set via the admin UI) always
+    take priority and are listed first. If there are fewer curated picks
+    than `limit` (including none at all, e.g. before an admin has curated
+    anything), the remainder is backfilled using the old automatic logic
+    (in-stock items first, then out-of-stock), excluding anything already
+    included as a curated pick so nothing is duplicated. Curated picks are
+    never bumped by the automatic fallback."""
     try:
         product_count = await db.shopify_products.count_documents({})
-        
+
         if product_count > 0:
-            # Get from local DB
-            products = await db.shopify_products.find(
-                {"stock": {"$gt": 0}}
-            ).limit(limit).to_list(limit)
-            
-            if len(products) < limit:
-                # Add out-of-stock if needed
+            curated = await db.shopify_products.find(
+                {"is_featured": True}
+            ).sort("title_normalized", 1).limit(limit).to_list(limit)
+
+            products = list(curated)
+            remaining = limit - len(products)
+
+            if remaining > 0:
+                curated_ids = [p["id"] for p in curated]
+
                 more = await db.shopify_products.find(
-                    {"stock": 0}
-                ).limit(limit - len(products)).to_list(limit - len(products))
+                    {"stock": {"$gt": 0}, "id": {"$nin": curated_ids}}
+                ).limit(remaining).to_list(remaining)
                 products.extend(more)
-            
+                remaining -= len(more)
+
+                if remaining > 0:
+                    excluded_ids = curated_ids + [p["id"] for p in more]
+                    more_out_of_stock = await db.shopify_products.find(
+                        {"stock": 0, "id": {"$nin": excluded_ids}}
+                    ).limit(remaining).to_list(remaining)
+                    products.extend(more_out_of_stock)
+
             return [Product(**p) for p in products]
         else:
             # Fallback to Shopify
             return await get_products_from_shopify(None, limit)
-            
+
     except Exception as e:
         logger.error(f"Error fetching featured products: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -994,7 +1101,42 @@ async def get_product_vendors():
 
 @api_router.get("/products/{product_id}/complementary")
 async def get_complementary_products(product_id: str):
-    """Get complementary and related products from Shopify metafields"""
+    """Get complementary and related products.
+
+    Prefers the native, admin-managed `complementary_product_ids` field on
+    the product's own db.shopify_products doc (set via the admin UI, or by
+    the one-off scripts/backfill_complementary_products.py backfill) - this
+    lets George manually curate the "Posibil să ai nevoie și de" section
+    instead of relying solely on Shopify's metafield. Falls back to the
+    original live Shopify metafield query (unchanged) for any product that
+    hasn't been given native links yet. `related` products stay
+    Shopify-metafield-only in both cases - that field is out of scope here,
+    so a native-resolved response always returns an empty `related` list.
+    """
+    local_product = await db.shopify_products.find_one({"id": product_id})
+    complementary_ids = (local_product or {}).get("complementary_product_ids") or []
+
+    if complementary_ids:
+        complementary = []
+        for ref_id in complementary_ids:
+            ref_product = await db.shopify_products.find_one({"id": ref_id})
+            if not ref_product:
+                continue
+            complementary.append({
+                "id": ref_product.get("id"),
+                "variant_id": None,
+                "title": ref_product.get("title", ""),
+                "handle": ref_product.get("handle", ""),
+                "description": ref_product.get("description", ""),
+                "price": ref_product.get("price", 0.0),
+                "currency": ref_product.get("currency", "RON"),
+                "image_url": ref_product.get("image_url"),
+                "stock": ref_product.get("stock", 0),
+                "sku": ref_product.get("sku"),
+                "recommended_quantity": 1,
+            })
+        return {"complementary": complementary, "related": []}
+
     try:
         # Fetch product with metafields from Shopify
         graphql_query = """
@@ -1596,7 +1738,7 @@ async def register_user(user_data: UserRegister):
         "cui": None,
         "reg_com": None,
         "company_address": None,
-        "token": local_token,
+        "tokens": [local_token],
         "is_shopify_customer": False,
         "created_at": created_at
     }
@@ -1707,7 +1849,8 @@ async def forgot_password(request: ForgotPasswordRequest):
                 "reset_token_expires": datetime.utcnow() + timedelta(hours=1),
             }}
         )
-        reset_url = f"{_public_base_url()}/api/reset-password?token={reset_token}"
+        webshop_public_url = os.environ.get('WEBSHOP_PUBLIC_URL', 'http://localhost:3000').rstrip('/')
+        reset_url = f"{webshop_public_url}/cont/reseteaza-parola?token={reset_token}"
         await send_password_reset_email(email, user.get("name", ""), reset_url)
 
     return {"message": "Dacă adresa există în sistem, ai primit un email cu instrucțiuni de resetare"}
@@ -1727,11 +1870,15 @@ async def reset_password(request: ResetPasswordRequest):
     if not expires or expires < datetime.utcnow():
         raise HTTPException(status_code=400, detail="Link de resetare expirat. Cere unul nou.")
 
+    # A password reset invalidates every existing session for this account
+    # (all devices get logged out and must sign in again with the new
+    # password) - this endpoint never hands the caller a fresh session token
+    # to keep using, so there's no "device" to preserve here anyway.
     await db.users.update_one(
         {"id": user["id"]},
         {
-            "$set": {"password_hash": hash_password(request.new_password), "token": generate_token()},
-            "$unset": {"reset_token": "", "reset_token_expires": ""},
+            "$set": {"password_hash": hash_password(request.new_password), "tokens": []},
+            "$unset": {"reset_token": "", "reset_token_expires": "", "token": ""},
         }
     )
 
@@ -1915,7 +2062,6 @@ async def _legacy_shopify_login_and_migrate(email: str, password: str, existing_
             raise HTTPException(status_code=401, detail="Nu s-au putut obține datele contului")
 
     # Create or update local user linked to Shopify
-    local_token = generate_token()
     shopify_customer_id = customer.get("id", "").replace("gid://shopify/Customer/", "")
 
     default_address = customer.get("defaultAddress") or {}
@@ -1930,7 +2076,6 @@ async def _legacy_shopify_login_and_migrate(email: str, password: str, existing_
         "postal_code": default_address.get("zip") or "",
         "is_company": bool(default_address.get("company")),
         "company_name": default_address.get("company") or None,
-        "token": local_token,
         # Silent migration: from this point on, this account has a local
         # password and no longer needs the Shopify fallback above.
         "password_hash": hash_password(password),
@@ -1958,11 +2103,17 @@ async def _legacy_shopify_login_and_migrate(email: str, password: str, existing_
         )
         user_id = existing_user["id"]
         created_at = existing_user["created_at"]
+        # Enforce the concurrent-device cap on this (potentially long-lived)
+        # account the same as any other login path.
+        local_token = await _issue_session_token(email)
     else:
         user_id = str(uuid.uuid4())
         user_update_data["id"] = user_id
         user_update_data["created_at"] = datetime.utcnow()
         created_at = user_update_data["created_at"]
+        # Brand new account - no existing sessions, so no cap check needed.
+        local_token = generate_token()
+        user_update_data["tokens"] = [local_token]
         await db.users.insert_one(user_update_data)
 
     # Extract Shopify orders (only available on this legacy/Shopify-verified path)
@@ -2013,8 +2164,7 @@ async def _authenticate_user(email: str, password: str) -> dict:
         if not verify_password(password, existing_user["password_hash"]):
             raise HTTPException(status_code=401, detail="Email sau parolă incorectă")
 
-        local_token = generate_token()
-        await db.users.update_one({"email": email}, {"$set": {"token": local_token}})
+        local_token = await _issue_session_token(email)
 
         return {
             "token": local_token,
@@ -2056,7 +2206,7 @@ async def get_current_user(request: Request):
         raise HTTPException(status_code=401, detail="Token lipsă sau invalid")
     
     token = auth_header.replace("Bearer ", "")
-    user = await db.users.find_one({"token": token})
+    user = await _find_user_by_token(token)
     
     if not user:
         raise HTTPException(status_code=401, detail="Token invalid sau expirat")
@@ -2096,7 +2246,7 @@ async def update_current_user(request: Request, update_data: UserUpdate):
         raise HTTPException(status_code=401, detail="Token lipsă sau invalid")
     
     token = auth_header.replace("Bearer ", "")
-    user = await db.users.find_one({"token": token})
+    user = await _find_user_by_token(token)
     
     if not user:
         raise HTTPException(status_code=401, detail="Token invalid sau expirat")
@@ -2135,14 +2285,22 @@ async def update_current_user(request: Request, update_data: UserUpdate):
 
 @api_router.post("/auth/logout")
 async def logout_user(request: Request):
-    """Logout user (invalidate token)"""
+    """Logout the current device only: free up this token's slot in the
+    `tokens` array so the user can log back in elsewhere without hitting the
+    device cap, without touching that user's other active sessions."""
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
         token = auth_header.replace("Bearer ", "")
-        # Generate new token to invalidate current one
+        await db.users.update_one(
+            {"tokens": token},
+            {"$pull": {"tokens": token}}
+        )
+        # Legacy safety net: also clear it if this account still had it
+        # stored as a single un-migrated `token` field (see
+        # _find_user_by_token / the startup migration).
         await db.users.update_one(
             {"token": token},
-            {"$set": {"token": generate_token()}}
+            {"$unset": {"token": ""}}
         )
     return {"message": "Deconectat cu succes"}
 
@@ -2154,7 +2312,7 @@ async def get_user_orders(request: Request):
         raise HTTPException(status_code=401, detail="Token lipsă sau invalid")
     
     token = auth_header.replace("Bearer ", "")
-    user = await db.users.find_one({"token": token})
+    user = await _find_user_by_token(token)
     
     if not user:
         raise HTTPException(status_code=401, detail="Token invalid sau expirat")
@@ -2171,7 +2329,7 @@ async def get_user_shopify_orders(request: Request):
         raise HTTPException(status_code=401, detail="Token lipsă sau invalid")
     
     token = auth_header.replace("Bearer ", "")
-    user = await db.users.find_one({"token": token})
+    user = await _find_user_by_token(token)
     
     if not user:
         raise HTTPException(status_code=401, detail="Token invalid sau expirat")
@@ -2346,6 +2504,8 @@ class ProductCreate(BaseModel):
     sku: Optional[str] = None
     compatible_models: List[str] = []
     category: Optional[str] = None  # e.g. "motor", "transmisie" - combined with product_type to derive `collections`
+    complementary_product_ids: List[str] = []
+    is_featured: bool = False
 
 class ProductUpdate(BaseModel):
     title: Optional[str] = None
@@ -2362,6 +2522,8 @@ class ProductUpdate(BaseModel):
     sku: Optional[str] = None
     compatible_models: Optional[List[str]] = None
     category: Optional[str] = None
+    complementary_product_ids: Optional[List[str]] = None
+    is_featured: Optional[bool] = None
 
 def slugify(text: str) -> str:
     slug = normalize_text(text)
@@ -2408,7 +2570,7 @@ async def _require_admin(request: Request) -> dict:
         raise HTTPException(status_code=401, detail="Token lipsă sau invalid")
 
     token = auth_header.replace("Bearer ", "")
-    user = await db.users.find_one({"token": token})
+    user = await _find_user_by_token(token)
 
     if not user:
         raise HTTPException(status_code=401, detail="Token invalid sau expirat")
@@ -2437,6 +2599,63 @@ async def admin_list_products(request: Request, search: Optional[str] = None, li
     products = await cursor.to_list(limit)
     return [Product(**p) for p in products]
 
+@api_router.get("/admin/customer-interests")
+async def admin_list_customer_interests(
+    request: Request,
+    type: Optional[str] = None,
+    limit: int = 50,
+    skip: int = 0,
+):
+    """Admin-only list of every customer's favorite / price-alert / stock-alert
+    selections (most recent first), enriched with the product and user info
+    needed for manual follow-up. Pure capture-and-display - no automated
+    notification is sent when a price changes or stock returns."""
+    await _require_admin(request)
+
+    query = {}
+    if type:
+        query["type"] = type
+
+    cursor = db.customer_interests.find(query).sort("created_at", -1).skip(skip).limit(limit)
+    interests = await cursor.to_list(limit)
+
+    # Batch-resolve products/users for this page in two queries total,
+    # rather than one query per row.
+    product_ids = list({i["product_id"] for i in interests})
+    user_ids = list({i["user_id"] for i in interests})
+
+    products_by_id = {}
+    if product_ids:
+        async for p in db.shopify_products.find({"id": {"$in": product_ids}}):
+            products_by_id[p["id"]] = p
+
+    users_by_id = {}
+    if user_ids:
+        async for u in db.users.find({"id": {"$in": user_ids}}):
+            users_by_id[u["id"]] = u
+
+    enriched = []
+    for i in interests:
+        product = products_by_id.get(i["product_id"])
+        user = users_by_id.get(i["user_id"])
+        enriched.append({
+            "id": i["id"],
+            "user_id": i["user_id"],
+            "product_id": i["product_id"],
+            "type": i["type"],
+            "created_at": i["created_at"],
+            "product_title": product.get("title") if product else None,
+            "product_price": product.get("price") if product else None,
+            "product_currency": product.get("currency") if product else None,
+            "product_image_url": product.get("image_url") if product else None,
+            "product_stock_status": product.get("stock_status") if product else None,
+            "user_name": user.get("name") if user else None,
+            "user_email": user.get("email") if user else None,
+            "user_phone": user.get("phone") if user else None,
+        })
+
+    return enriched
+
 @api_router.post("/admin/products")
 async def admin_create_product(request: Request, product_data: ProductCreate):
     await _require_admin(request)
@@ -2464,6 +2683,8 @@ async def admin_create_product(request: Request, product_data: ProductCreate):
         "compatible_models": product_data.compatible_models,
         "collections": collections,
         "collections_normalized": [normalize_text(c) for c in collections],
+        "complementary_product_ids": product_data.complementary_product_ids,
+        "is_featured": product_data.is_featured,
         "source": "manual",
         "created_at": now,
     }
@@ -3309,13 +3530,9 @@ async def get_user_equipment(request: Request):
         raise HTTPException(status_code=401, detail="Token lipsă sau invalid")
     
     token = auth_header.replace("Bearer ", "")
-    # Search by both token types (our token and Shopify access token)
-    user = await db.users.find_one({
-        "$or": [
-            {"token": token},
-            {"shopify_access_token": token}
-        ]
-    })
+    # Search by both credential types (our own multi-device tokens/legacy
+    # single token, and Shopify access token)
+    user = await _find_user_by_token(token, allow_shopify_access_token=True)
     
     if not user:
         raise HTTPException(status_code=401, detail="Token invalid sau expirat")
@@ -3370,13 +3587,9 @@ async def add_user_equipment(request: Request, equipment_data: EquipmentCreate):
         raise HTTPException(status_code=401, detail="Token lipsă sau invalid")
     
     token = auth_header.replace("Bearer ", "")
-    # Search by both token types (our token and Shopify access token)
-    user = await db.users.find_one({
-        "$or": [
-            {"token": token},
-            {"shopify_access_token": token}
-        ]
-    })
+    # Search by both credential types (our own multi-device tokens/legacy
+    # single token, and Shopify access token)
+    user = await _find_user_by_token(token, allow_shopify_access_token=True)
     
     if not user:
         raise HTTPException(status_code=401, detail="Token invalid sau expirat")
@@ -3419,13 +3632,9 @@ async def update_user_equipment(request: Request, equipment_id: str, equipment_d
         raise HTTPException(status_code=401, detail="Token lipsă sau invalid")
     
     token = auth_header.replace("Bearer ", "")
-    # Search by both token types (our token and Shopify access token)
-    user = await db.users.find_one({
-        "$or": [
-            {"token": token},
-            {"shopify_access_token": token}
-        ]
-    })
+    # Search by both credential types (our own multi-device tokens/legacy
+    # single token, and Shopify access token)
+    user = await _find_user_by_token(token, allow_shopify_access_token=True)
     
     if not user:
         raise HTTPException(status_code=401, detail="Token invalid sau expirat")
@@ -3475,13 +3684,9 @@ async def delete_user_equipment(request: Request, equipment_id: str):
         raise HTTPException(status_code=401, detail="Token lipsă sau invalid")
     
     token = auth_header.replace("Bearer ", "")
-    # Search by both token types (our token and Shopify access token)
-    user = await db.users.find_one({
-        "$or": [
-            {"token": token},
-            {"shopify_access_token": token}
-        ]
-    })
+    # Search by both credential types (our own multi-device tokens/legacy
+    # single token, and Shopify access token)
+    user = await _find_user_by_token(token, allow_shopify_access_token=True)
     
     if not user:
         raise HTTPException(status_code=401, detail="Token invalid sau expirat")
@@ -3503,6 +3708,97 @@ async def delete_user_equipment(request: Request, equipment_id: str):
     await sync_equipment_to_shopify_notes(user["email"], new_equipment_list)
     
     return {"message": "Utilaj șters cu succes", "remaining_count": len(new_equipment_list)}
+
+# ==================== CUSTOMER INTERESTS (Favorite / Price Alert / Stock Alert) ====================
+# Pure capture-and-display feature: a customer toggles interest in a product
+# from the product page (favorite/wishlist, price-drop alert, back-in-stock
+# alert) and admin staff see the resulting list in
+# GET /admin/customer-interests to follow up manually. There is deliberately
+# no automated notification-sending here (no email/push when a price
+# actually changes or stock returns) - that's out of scope for this feature.
+
+INTEREST_TYPES = ("favorite", "price_alert", "stock_alert")
+
+@api_router.get("/auth/interests")
+async def get_user_interest_state(request: Request, product_id: str):
+    """Return which of the three interest toggles the current user has set
+    for a single product, so the product page can render correct initial
+    toggle state on load without fetching the user's whole interest history."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Token lipsă sau invalid")
+
+    token = auth_header.replace("Bearer ", "")
+    # Search by both credential types (our own multi-device tokens/legacy
+    # single token, and Shopify access token) - same idiom as /auth/equipment.
+    user = await _find_user_by_token(token, allow_shopify_access_token=True)
+
+    if not user:
+        raise HTTPException(status_code=401, detail="Token invalid sau expirat")
+
+    existing = await db.customer_interests.find(
+        {"user_id": user["id"], "product_id": product_id}
+    ).to_list(len(INTEREST_TYPES))
+    existing_types = {i["type"] for i in existing}
+
+    return {t: (t in existing_types) for t in INTEREST_TYPES}
+
+@api_router.post("/auth/interests")
+async def add_user_interest(request: Request, interest_data: CustomerInterestCreate):
+    """Idempotently record that the current user is interested in a product
+    (favorite / price alert / stock alert). No-op (not an error) if that
+    exact user+product+type combo is already recorded."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Token lipsă sau invalid")
+
+    token = auth_header.replace("Bearer ", "")
+    user = await _find_user_by_token(token, allow_shopify_access_token=True)
+
+    if not user:
+        raise HTTPException(status_code=401, detail="Token invalid sau expirat")
+
+    existing = await db.customer_interests.find_one({
+        "user_id": user["id"],
+        "product_id": interest_data.product_id,
+        "type": interest_data.type,
+    })
+    if not existing:
+        await db.customer_interests.insert_one({
+            "id": str(uuid.uuid4()),
+            "user_id": user["id"],
+            "product_id": interest_data.product_id,
+            "type": interest_data.type,
+            "created_at": datetime.utcnow(),
+        })
+
+    return {"message": "ok"}
+
+@api_router.delete("/auth/interests")
+async def remove_user_interest(
+    request: Request,
+    product_id: str,
+    type: Literal["favorite", "price_alert", "stock_alert"],
+):
+    """Idempotently remove a previously recorded interest. No-op (not an
+    error) if that user+product+type combo doesn't exist."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Token lipsă sau invalid")
+
+    token = auth_header.replace("Bearer ", "")
+    user = await _find_user_by_token(token, allow_shopify_access_token=True)
+
+    if not user:
+        raise HTTPException(status_code=401, detail="Token invalid sau expirat")
+
+    await db.customer_interests.delete_one({
+        "user_id": user["id"],
+        "product_id": product_id,
+        "type": type,
+    })
+
+    return {"message": "ok"}
 
 # ==================== WEBHOOK ENDPOINTS ====================
 
@@ -4255,6 +4551,38 @@ async def crm_reconciliation_loop():
             logger.error(f"CRM reconciliation error: {e}")
             await asyncio.sleep(300)
 
+async def _migrate_legacy_single_token_users():
+    """One-time compatibility migration for the multi-device login cap
+    (max MAX_DEVICE_TOKENS concurrent sessions, see _issue_session_token):
+    fold each account's legacy single `token` field (from before this
+    feature existed, when every login overwrote one shared field) into the
+    new `tokens` array, so already-logged-in users - including the admin
+    account - keep working after this deploy instead of being silently
+    logged out by a schema mismatch.
+
+    Matches only docs that still have the old `token` field and haven't
+    been converted yet (`tokens` missing), so this is a cheap no-op on every
+    subsequent startup once a given database has been migrated once.
+    _find_user_by_token also has a legacy `token` fallback as a second
+    safety net in case any document is somehow missed here.
+    """
+    try:
+        result = await db.users.update_many(
+            {"token": {"$exists": True}, "tokens": {"$exists": False}},
+            [
+                {"$set": {"tokens": ["$token"]}},
+                {"$unset": "token"},
+            ],
+        )
+        if result.modified_count:
+            logger.info(
+                f"Migrated {result.modified_count} user(s) from legacy single "
+                f"`token` field to the new `tokens` array (multi-device login cap)"
+            )
+    except Exception:
+        logger.exception("Failed to migrate legacy user tokens to tokens[] array")
+
+
 @app.on_event("startup")
 async def startup_event():
     """Start background tasks on app startup"""
@@ -4264,6 +4592,20 @@ async def startup_event():
         await db.users.create_index("email", unique=True)
     except Exception:
         logger.exception("Failed to create unique index on users.email")
+
+    try:
+        # Belt-and-braces defense against duplicate interest rows on top of
+        # the check-then-insert idempotency in add_user_interest() (e.g. two
+        # concurrent taps of the same toggle) - see customer_interests.
+        await db.customer_interests.create_index(
+            [("user_id", 1), ("product_id", 1), ("type", 1)], unique=True
+        )
+    except Exception:
+        logger.exception("Failed to create unique index on customer_interests")
+
+    # Must run before the app starts accepting traffic under the new
+    # tokens[] auth scheme - see docstring.
+    await _migrate_legacy_single_token_users()
 
     # Auto-sync from Shopify is permanently disabled as of 2026-07-26: the
     # webshop/admin panel is now the source of truth for the product catalog
