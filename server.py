@@ -89,6 +89,7 @@ class Product(BaseModel):
     handle: str
     description: str
     description_normalized: Optional[str] = ""
+    technical_specs: Optional[str] = None
     title_normalized: Optional[str] = ""
     price: float
     currency: str = "RON"
@@ -104,6 +105,18 @@ class Product(BaseModel):
     collections: List[str] = []
     complementary_product_ids: List[str] = []
     is_featured: bool = False
+    # Utilaje de vânzare only (product_type == "Utilaje") - a used-equipment
+    # spec sheet, same shape as a marketplace listing (year/hours/power/
+    # transmission/tires/max speed). Left unset for spare-parts products.
+    equipment_year: Optional[int] = None
+    equipment_hours: Optional[int] = None
+    equipment_power_hp: Optional[int] = None
+    equipment_transmission: Optional[str] = None
+    equipment_front_tire: Optional[str] = None
+    equipment_front_tire_wear: Optional[str] = None
+    equipment_rear_tire: Optional[str] = None
+    equipment_rear_tire_wear: Optional[str] = None
+    equipment_max_speed: Optional[int] = None
 
 class CartItem(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -849,6 +862,114 @@ SORT_FIELDS = {
 }
 
 
+def build_products_query(
+    search: Optional[str],
+    product_type: Optional[str],
+    collection: Optional[str],
+) -> dict:
+    """Builds the MongoDB filter dict for the storefront catalog/search -
+    shared by GET /products (paginated results) and GET /products/count
+    (total match count for the "N produse găsite" indicator), so the two
+    always agree on what counts as a match."""
+    query = {}
+
+    if product_type:
+        query["product_type"] = product_type
+
+    if collection:
+        # `collections` is a list field per product; querying it with a
+        # scalar matches documents where the array contains that value.
+        query["collections"] = collection
+
+    if search:
+        # Normalize search terms and handle "Premium" variations
+        # Convert "6930 Premium" to search for both "6930Premium" and "6930PR"
+        premium_pattern = re.compile(r'(\d{4})\s*Premium', re.IGNORECASE)
+        premium_matches = premium_pattern.findall(search)
+
+        search_terms = [normalize_text(term) for term in search.split() if term.strip()]
+
+        # Remove "premium" from search terms if it was part of a model number
+        if premium_matches:
+            search_terms = [t for t in search_terms if t.lower() != 'premium']
+
+        if search_terms:
+            # Build regex patterns for each term
+            regex_conditions = []
+            for term in search_terms:
+                # Check if term looks like a model number (4 digits optionally followed by letters)
+                is_model_search = bool(re.match(r'^\d{4}[a-z]*$', term, re.IGNORECASE))
+
+                if is_model_search:
+                    # For model numbers, search more precisely
+                    # Match exact model or model followed by space/end (not followed by more letters)
+                    # This prevents "6210" from matching "6210R" but allows "6210" to match "6210 M" or "6210"
+                    model_regex = f"^{term}(?![A-Za-z])"  # Negative lookahead: not followed by letters
+
+                    # Also search for Premium variant if this model was part of "XXXX Premium" search
+                    model_conditions = [
+                        {"title_normalized": {"$regex": f"\\b{term}\\b", "$options": "i"}},
+                        {"description_normalized": {"$regex": f"\\b{term}\\b", "$options": "i"}},
+                        {"compatible_models": {"$regex": model_regex, "$options": "i"}},
+                    ]
+
+                    # If searching for a model that was part of "Premium" search, also look for Premium/PR variants
+                    if term in [m.lower() for m in premium_matches]:
+                        model_conditions.extend([
+                            {"compatible_models": {"$regex": f"^{term}Premium", "$options": "i"}},
+                            {"compatible_models": {"$regex": f"^{term}PR", "$options": "i"}},
+                        ])
+
+                    regex_conditions.append({"$or": model_conditions})
+                else:
+                    # For regular terms (non-model numbers)
+                    # Short terms (<=4 chars) should use word boundaries to avoid false matches
+                    # e.g., "usa" should not match inside other words like "caUzA"
+                    if len(term) <= 4:
+                        # Short terms - search with word boundary, prioritize title
+                        regex_conditions.append({
+                            "$or": [
+                                {"title_normalized": {"$regex": f"\\b{term}\\b", "$options": "i"}},
+                                {"description_normalized": {"$regex": f"\\b{term}\\b", "$options": "i"}},
+                                {"sku": {"$regex": f"\\b{term}\\b", "$options": "i"}},
+                                {"collections_normalized": {"$regex": f"\\b{term}\\b", "$options": "i"}}
+                            ]
+                        })
+                    else:
+                        # Longer terms - search normally (including collections)
+                        regex_conditions.append({
+                            "$or": [
+                                {"title_normalized": {"$regex": term, "$options": "i"}},
+                                {"description_normalized": {"$regex": term, "$options": "i"}},
+                                {"compatible_models": {"$regex": term, "$options": "i"}},
+                                {"sku": {"$regex": term, "$options": "i"}},
+                                {"collections_normalized": {"$regex": term, "$options": "i"}}
+                            ]
+                        })
+
+            if regex_conditions:
+                query["$and"] = regex_conditions
+
+    return query
+
+
+@api_router.get("/products/search-count")
+async def get_products_search_count(
+    search: Optional[str] = None,
+    product_type: Optional[str] = None,
+    collection: Optional[str] = None,
+):
+    """Total count of products matching the same filters as GET /products -
+    powers the "N produse găsite" indicator on the storefront catalog/search
+    page (which itself only loads a page at a time via infinite scroll, so
+    it has no way to know the true total on its own). Named distinctly from
+    the pre-existing unfiltered GET /products/count (used elsewhere for the
+    Shopify-sync total) rather than overloading it."""
+    query = build_products_query(search, product_type, collection)
+    total = await db.shopify_products.count_documents(query)
+    return {"total": total}
+
+
 @api_router.get("/products", response_model=List[Product])
 async def get_products(
     search: Optional[str] = None,
@@ -870,89 +991,8 @@ async def get_products(
             # Fallback to Shopify API if no local products
             return await get_products_from_shopify(search, limit)
 
-        # Build query
-        query = {}
+        query = build_products_query(search, product_type, collection)
 
-        if product_type:
-            query["product_type"] = product_type
-
-        if collection:
-            # `collections` is a list field per product; querying it with a
-            # scalar matches documents where the array contains that value.
-            query["collections"] = collection
-
-        if search:
-            # Normalize search terms and handle "Premium" variations
-            # Convert "6930 Premium" to search for both "6930Premium" and "6930PR"
-            search_normalized = search
-            
-            # Handle "Premium" -> also search for "PR" variant
-            premium_pattern = re.compile(r'(\d{4})\s*Premium', re.IGNORECASE)
-            premium_matches = premium_pattern.findall(search)
-            
-            search_terms = [normalize_text(term) for term in search.split() if term.strip()]
-            
-            # Remove "premium" from search terms if it was part of a model number
-            if premium_matches:
-                search_terms = [t for t in search_terms if t.lower() != 'premium']
-            
-            if search_terms:
-                # Build regex patterns for each term
-                regex_conditions = []
-                for term in search_terms:
-                    # Check if term looks like a model number (4 digits optionally followed by letters)
-                    is_model_search = bool(re.match(r'^\d{4}[a-z]*$', term, re.IGNORECASE))
-                    
-                    if is_model_search:
-                        # For model numbers, search more precisely
-                        # Match exact model or model followed by space/end (not followed by more letters)
-                        # This prevents "6210" from matching "6210R" but allows "6210" to match "6210 M" or "6210"
-                        model_regex = f"^{term}(?![A-Za-z])"  # Negative lookahead: not followed by letters
-                        
-                        # Also search for Premium variant if this model was part of "XXXX Premium" search
-                        model_conditions = [
-                            {"title_normalized": {"$regex": f"\\b{term}\\b", "$options": "i"}},
-                            {"description_normalized": {"$regex": f"\\b{term}\\b", "$options": "i"}},
-                            {"compatible_models": {"$regex": model_regex, "$options": "i"}},
-                        ]
-                        
-                        # If searching for a model that was part of "Premium" search, also look for Premium/PR variants
-                        if term in [m.lower() for m in premium_matches]:
-                            model_conditions.extend([
-                                {"compatible_models": {"$regex": f"^{term}Premium", "$options": "i"}},
-                                {"compatible_models": {"$regex": f"^{term}PR", "$options": "i"}},
-                            ])
-                        
-                        regex_conditions.append({"$or": model_conditions})
-                    else:
-                        # For regular terms (non-model numbers)
-                        # Short terms (<=4 chars) should use word boundaries to avoid false matches
-                        # e.g., "usa" should not match inside other words like "caUzA"
-                        if len(term) <= 4:
-                            # Short terms - search with word boundary, prioritize title
-                            regex_conditions.append({
-                                "$or": [
-                                    {"title_normalized": {"$regex": f"\\b{term}\\b", "$options": "i"}},
-                                    {"description_normalized": {"$regex": f"\\b{term}\\b", "$options": "i"}},
-                                    {"sku": {"$regex": f"\\b{term}\\b", "$options": "i"}},
-                                    {"collections_normalized": {"$regex": f"\\b{term}\\b", "$options": "i"}}
-                                ]
-                            })
-                        else:
-                            # Longer terms - search normally (including collections)
-                            regex_conditions.append({
-                                "$or": [
-                                    {"title_normalized": {"$regex": term, "$options": "i"}},
-                                    {"description_normalized": {"$regex": term, "$options": "i"}},
-                                    {"compatible_models": {"$regex": term, "$options": "i"}},
-                                    {"sku": {"$regex": term, "$options": "i"}},
-                                    {"collections_normalized": {"$regex": term, "$options": "i"}}
-                                ]
-                            })
-                
-                if regex_conditions:
-                    query["$and"] = regex_conditions
-        
         # Execute query
         cursor = db.shopify_products.find(query)
         if sort and sort in SORT_FIELDS:
@@ -2491,6 +2531,7 @@ async def get_user_shopify_orders(request: Request):
 class ProductCreate(BaseModel):
     title: str
     description: str = ""
+    technical_specs: Optional[str] = None
     price: float
     currency: str = "RON"
     image_url: Optional[str] = None
@@ -2505,10 +2546,20 @@ class ProductCreate(BaseModel):
     category: Optional[str] = None  # e.g. "motor", "transmisie" - combined with product_type to derive `collections`
     complementary_product_ids: List[str] = []
     is_featured: bool = False
+    equipment_year: Optional[int] = None
+    equipment_hours: Optional[int] = None
+    equipment_power_hp: Optional[int] = None
+    equipment_transmission: Optional[str] = None
+    equipment_front_tire: Optional[str] = None
+    equipment_front_tire_wear: Optional[str] = None
+    equipment_rear_tire: Optional[str] = None
+    equipment_rear_tire_wear: Optional[str] = None
+    equipment_max_speed: Optional[int] = None
 
 class ProductUpdate(BaseModel):
     title: Optional[str] = None
     description: Optional[str] = None
+    technical_specs: Optional[str] = None
     price: Optional[float] = None
     currency: Optional[str] = None
     image_url: Optional[str] = None
@@ -2523,6 +2574,26 @@ class ProductUpdate(BaseModel):
     category: Optional[str] = None
     complementary_product_ids: Optional[List[str]] = None
     is_featured: Optional[bool] = None
+    equipment_year: Optional[int] = None
+    equipment_hours: Optional[int] = None
+    equipment_power_hp: Optional[int] = None
+    equipment_transmission: Optional[str] = None
+    equipment_front_tire: Optional[str] = None
+    equipment_front_tire_wear: Optional[str] = None
+    equipment_rear_tire: Optional[str] = None
+    equipment_rear_tire_wear: Optional[str] = None
+    equipment_max_speed: Optional[int] = None
+
+class ProductBulkUpdate(BaseModel):
+    ids: List[str]
+    patch: ProductUpdate
+
+class ProductBulkSaveItem(BaseModel):
+    id: str
+    patch: ProductUpdate
+
+class ProductBulkSave(BaseModel):
+    updates: List[ProductBulkSaveItem]
 
 def slugify(text: str) -> str:
     slug = normalize_text(text)
@@ -2667,6 +2738,7 @@ async def admin_create_product(request: Request, product_data: ProductCreate):
         "title": product_data.title,
         "handle": slugify(product_data.title),
         "description": product_data.description,
+        "technical_specs": product_data.technical_specs,
         "description_normalized": normalize_text(product_data.description),
         "title_normalized": normalize_text(product_data.title),
         "price": product_data.price,
@@ -2684,19 +2756,29 @@ async def admin_create_product(request: Request, product_data: ProductCreate):
         "collections_normalized": [normalize_text(c) for c in collections],
         "complementary_product_ids": product_data.complementary_product_ids,
         "is_featured": product_data.is_featured,
+        "equipment_year": product_data.equipment_year,
+        "equipment_hours": product_data.equipment_hours,
+        "equipment_power_hp": product_data.equipment_power_hp,
+        "equipment_transmission": product_data.equipment_transmission,
+        "equipment_front_tire": product_data.equipment_front_tire,
+        "equipment_front_tire_wear": product_data.equipment_front_tire_wear,
+        "equipment_rear_tire": product_data.equipment_rear_tire,
+        "equipment_rear_tire_wear": product_data.equipment_rear_tire_wear,
+        "equipment_max_speed": product_data.equipment_max_speed,
         "source": "manual",
         "created_at": now,
     }
     await db.shopify_products.insert_one(product)
     return Product(**product)
 
-@api_router.put("/admin/products/{product_id}")
-async def admin_update_product(product_id: str, request: Request, product_data: ProductUpdate):
-    await _require_admin(request)
-
+async def _apply_product_update(product_id: str, product_data: ProductUpdate) -> Optional[dict]:
+    """Applies a partial ProductUpdate to a single product by id - shared by
+    the single-product and bulk update endpoints so the two code paths can't
+    silently diverge. Returns the updated document, or None if no product
+    with that id exists (caller decides how to report that)."""
     existing = await db.shopify_products.find_one({"id": product_id})
     if not existing:
-        raise HTTPException(status_code=404, detail="Produs inexistent")
+        return None
 
     update_dict = {k: v for k, v in product_data.dict().items() if v is not None}
     category = update_dict.pop("category", None)
@@ -2719,7 +2801,97 @@ async def admin_update_product(product_id: str, request: Request, product_data: 
     if update_dict:
         await db.shopify_products.update_one({"id": product_id}, {"$set": update_dict})
 
-    updated = await db.shopify_products.find_one({"id": product_id})
+    return await db.shopify_products.find_one({"id": product_id})
+
+# NOTE: this must stay registered *before* PUT /admin/products/{product_id}
+# below - otherwise Starlette's routing would match "bulk" against the
+# {product_id} path parameter first, since it's a plain string segment.
+@api_router.put("/admin/products/bulk")
+async def admin_bulk_update_products(request: Request, bulk_data: ProductBulkUpdate):
+    """Applies the same partial update to many products at once (e.g. the
+    admin product list's Shopify-style bulk-edit), instead of the frontend
+    issuing one PUT per product. Ids that don't match any product are
+    reported back in `not_found` rather than failing the whole request."""
+    await _require_admin(request)
+
+    if len(bulk_data.ids) > 500:
+        raise HTTPException(
+            status_code=400,
+            detail="Poți actualiza cel mult 500 de produse într-o singură cerere",
+        )
+
+    updated_count = 0
+    not_found: List[str] = []
+    for product_id in bulk_data.ids:
+        updated = await _apply_product_update(product_id, bulk_data.patch)
+        if updated is None:
+            not_found.append(product_id)
+        else:
+            updated_count += 1
+
+    return {"updated": updated_count, "not_found": not_found}
+
+# NOTE: same reasoning as /admin/products/bulk above - "bulk-save" and
+# "by-ids" must stay registered before PUT/DELETE /admin/products/{product_id}
+# below, otherwise Starlette would match them against the {product_id} path
+# parameter first.
+@api_router.put("/admin/products/bulk-save")
+async def admin_bulk_save_products(request: Request, bulk_data: ProductBulkSave):
+    """Shopify-style inline grid editor: each selected product carries its
+    own distinct patch (product A's price changes to X, product B's to Y,
+    etc), unlike /admin/products/bulk which applies one shared patch to many
+    ids. Reuses _apply_product_update per item so the update logic can't
+    diverge from the single-product/shared-bulk code paths. Ids that don't
+    match any product are reported back in `not_found` rather than failing
+    the whole request."""
+    await _require_admin(request)
+
+    if len(bulk_data.updates) > 500:
+        raise HTTPException(
+            status_code=400,
+            detail="Poți actualiza cel mult 500 de produse într-o singură cerere",
+        )
+
+    updated_count = 0
+    not_found: List[str] = []
+    for item in bulk_data.updates:
+        updated = await _apply_product_update(item.id, item.patch)
+        if updated is None:
+            not_found.append(item.id)
+        else:
+            updated_count += 1
+
+    return {"updated": updated_count, "not_found": not_found}
+
+@api_router.get("/admin/products/by-ids")
+async def admin_get_products_by_ids(request: Request, ids: str):
+    """Batch-fetches full Product objects for a comma-separated list of ids
+    in one request, so the admin grid-edit page can load details for a set
+    of selected products without issuing one GET per product. Order of the
+    returned list isn't guaranteed to match `ids` - the frontend re-associates
+    by id."""
+    await _require_admin(request)
+
+    id_list = [i for i in ids.split(",") if i]
+
+    if len(id_list) > 500:
+        raise HTTPException(
+            status_code=400,
+            detail="Poți solicita cel mult 500 de produse într-o singură cerere",
+        )
+
+    cursor = db.shopify_products.find({"id": {"$in": id_list}})
+    products = await cursor.to_list(500)
+    return [Product(**p) for p in products]
+
+@api_router.put("/admin/products/{product_id}")
+async def admin_update_product(product_id: str, request: Request, product_data: ProductUpdate):
+    await _require_admin(request)
+
+    updated = await _apply_product_update(product_id, product_data)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Produs inexistent")
+
     return Product(**updated)
 
 @api_router.delete("/admin/products/{product_id}")
