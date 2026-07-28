@@ -196,6 +196,7 @@ class UserUpdate(BaseModel):
 class Equipment(BaseModel):
     """Model for customer's equipment/tractors"""
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    brand: Optional[str] = None  # Marca
     model: str  # Ex: John Deere 6150R
     chassis_serial: Optional[str] = None  # Serie șasiu
     engine_serial: Optional[str] = None  # Serie motor
@@ -207,6 +208,7 @@ class Equipment(BaseModel):
 
 class EquipmentCreate(BaseModel):
     """Create equipment request"""
+    brand: Optional[str] = None
     model: str
     chassis_serial: Optional[str] = None
     engine_serial: Optional[str] = None
@@ -217,6 +219,7 @@ class EquipmentCreate(BaseModel):
 
 class EquipmentUpdate(BaseModel):
     """Update equipment request"""
+    brand: Optional[str] = None
     model: Optional[str] = None
     chassis_serial: Optional[str] = None
     engine_serial: Optional[str] = None
@@ -264,35 +267,29 @@ def generate_token() -> str:
 
 # Hard cap on concurrent logged-in devices per account. Each `db.users`
 # document stores its active session tokens in a `tokens` array (max length
-# MAX_DEVICE_TOKENS); a 4th simultaneous login is rejected rather than
-# evicting the oldest session (see _issue_session_token).
+# MAX_DEVICE_TOKENS); a 4th simultaneous login auto-evicts the oldest
+# session rather than being rejected (see _issue_session_token).
 MAX_DEVICE_TOKENS = 3
-DEVICE_LIMIT_MESSAGE = (
-    "Ai atins limita de 3 dispozitive conectate simultan. "
-    "Deconectează-te de pe un alt dispozitiv pentru a continua."
-)
 
 
 async def _issue_session_token(email: str) -> str:
-    """Mint and persist a new session token for the given user, enforcing
-    MAX_DEVICE_TOKENS concurrent devices per account. Only call this after
-    credentials have already been verified for `email`.
+    """Mint and persist a new session token for the given user. Enforces
+    MAX_DEVICE_TOKENS concurrent devices per account by evicting the oldest
+    session once the cap is reached, rather than rejecting the new login -
+    a 4th device logging in silently kicks out the least-recently-added
+    session (that device's next API call gets a normal 401, same as any
+    other invalid/expired token). Only call this after credentials have
+    already been verified for `email`.
 
-    Atomic by construction: the filter's `tokens.{MAX-1}` existence check and
-    the `$push` happen in a single update_one, so two simultaneous logins for
-    the same account can't both slip past the cap (no separate read-then-write
-    race window).
-
-    Raises HTTP 403 if the account already has MAX_DEVICE_TOKENS active
-    sessions.
+    Atomic by construction: `$push` with `$each`/`$slice` is a single
+    update_one, so concurrent logins for the same account can't race into
+    an over-sized array.
     """
     new_token = generate_token()
-    result = await db.users.update_one(
-        {"email": email, f"tokens.{MAX_DEVICE_TOKENS - 1}": {"$exists": False}},
-        {"$push": {"tokens": new_token}},
+    await db.users.update_one(
+        {"email": email},
+        {"$push": {"tokens": {"$each": [new_token], "$slice": -MAX_DEVICE_TOKENS}}},
     )
-    if result.matched_count == 0:
-        raise HTTPException(status_code=403, detail=DEVICE_LIMIT_MESSAGE)
     return new_token
 
 
@@ -2146,7 +2143,8 @@ async def _legacy_shopify_login_and_migrate(email: str, password: str, existing_
             "reg_com": user_update_data.get("reg_com"),
             "company_address": user_update_data.get("company_address"),
             "is_shopify_customer": True,
-            "created_at": created_at
+            "created_at": created_at,
+            "role": existing_user.get("role", "customer") if existing_user else "customer",
         },
         "shopify_orders": shopify_orders
     }
@@ -2184,6 +2182,7 @@ async def _authenticate_user(email: str, password: str) -> dict:
                 "company_address": existing_user.get("company_address"),
                 "is_shopify_customer": existing_user.get("is_shopify_customer", False),
                 "created_at": existing_user["created_at"],
+                "role": existing_user.get("role", "customer"),
             },
             # Full order history stays available via GET /auth/orders (local)
             # and GET /auth/shopify-orders (Shopify-linked accounts only).
@@ -3315,6 +3314,7 @@ async def parse_equipment_from_shopify_notes(notes: str, existing_equipment: lis
 
                 current_equipment = {
                     "id": str(uuid.uuid4()),
+                    "brand": "",
                     "model": model,
                     "chassis_serial": "",
                     "engine_serial": "",
@@ -3330,7 +3330,9 @@ async def parse_equipment_from_shopify_notes(notes: str, existing_equipment: lis
             elif current_equipment and '•' in line:
                 detail = line.replace('•', '').strip()
                 
-                if 'Serie șasiu:' in detail:
+                if 'Marca:' in detail:
+                    current_equipment["brand"] = detail.split('Marca:')[1].strip()
+                elif 'Serie șasiu:' in detail:
                     current_equipment["chassis_serial"] = detail.split('Serie șasiu:')[1].strip()
                 elif 'Serie motor:' in detail:
                     current_equipment["engine_serial"] = detail.split('Serie motor:')[1].strip()
@@ -3428,6 +3430,7 @@ async def sync_equipment_to_shopify_notes(user_email: str, equipment_list: list)
             for i, eq in enumerate(equipment_list, 1):
                 notes_lines.append(f"{i}. {eq.get('model', 'N/A')}")
                 # Always include all fields, even if empty (as template for admin to fill)
+                notes_lines.append(f"   • Marca: {eq.get('brand', '')}")
                 notes_lines.append(f"   • Serie șasiu: {eq.get('chassis_serial', '')}")
                 notes_lines.append(f"   • Serie motor: {eq.get('engine_serial', '')}")
                 notes_lines.append(f"   • Model motor: {eq.get('engine_type', '')}")
@@ -3566,6 +3569,7 @@ async def get_user_equipment(request: Request):
     for eq in local_equipment:
         cleaned_eq = {
             "id": eq.get("id", ""),
+            "brand": eq.get("brand") or "",
             "model": eq.get("model", ""),
             "chassis_serial": eq.get("chassis_serial") or "",
             "engine_serial": eq.get("engine_serial") or "",
@@ -3602,6 +3606,7 @@ async def add_user_equipment(request: Request, equipment_data: EquipmentCreate):
     # Create new equipment entry
     new_equipment = {
         "id": str(uuid.uuid4()),
+        "brand": equipment_data.brand,
         "model": equipment_data.model,
         "chassis_serial": equipment_data.chassis_serial,
         "engine_serial": equipment_data.engine_serial,
@@ -3645,6 +3650,8 @@ async def update_user_equipment(request: Request, equipment_id: str, equipment_d
     
     for eq in equipment_list:
         if eq.get("id") == equipment_id:
+            if equipment_data.brand is not None:
+                eq["brand"] = equipment_data.brand
             if equipment_data.model is not None:
                 eq["model"] = equipment_data.model
             if equipment_data.chassis_serial is not None:
@@ -3708,6 +3715,62 @@ async def delete_user_equipment(request: Request, equipment_id: str):
     await sync_equipment_to_shopify_notes(user["email"], new_equipment_list)
     
     return {"message": "Utilaj șters cu succes", "remaining_count": len(new_equipment_list)}
+
+# ==================== EQUIPMENT OPTIONS (admin-managed dropdown/checkbox lists) ====================
+# Powers the transmission-type / front-axle-model / features dropdown and
+# checkbox lists on the equipment form used by both web and mobile. Public
+# GET (no auth) - same tier as /products / /collections, this is
+# catalog-style reference data, not sensitive. Admin can add new option
+# values from the admin UI without a code change; there is deliberately no
+# edit/delete endpoint yet - not requested, can be added later if needed.
+
+EQUIPMENT_OPTION_CATEGORIES = ("transmission_type", "front_axle_model", "features")
+
+class EquipmentOptionCreate(BaseModel):
+    """Add-option request body for POST /admin/equipment-options."""
+    category: str
+    value: str
+
+@api_router.get("/equipment-options")
+async def get_equipment_options():
+    """Public: return all three equipment-option lists in one response, each
+    sorted by created_at ascending (insertion order)."""
+    result = {category: [] for category in EQUIPMENT_OPTION_CATEGORIES}
+    cursor = db.equipment_options.find({}).sort("created_at", 1)
+    async for opt in cursor:
+        category = opt.get("category")
+        if category in result:
+            result[category].append(opt.get("value"))
+    return result
+
+@api_router.post("/admin/equipment-options")
+async def admin_add_equipment_option(request: Request, option_data: EquipmentOptionCreate):
+    """Admin-only: add a new value to one of the three equipment-option
+    categories. Idempotent - a case-insensitive duplicate already present in
+    that category is a silent no-op rather than an error, same style as the
+    other "add" endpoints in this file (see customer-interests)."""
+    await _require_admin(request)
+
+    if option_data.category not in EQUIPMENT_OPTION_CATEGORIES:
+        raise HTTPException(status_code=400, detail="Categorie invalidă")
+
+    value = (option_data.value or "").strip()
+    if not value:
+        raise HTTPException(status_code=400, detail="Valoare invalidă")
+
+    existing = await db.equipment_options.find_one({
+        "category": option_data.category,
+        "value": {"$regex": f"^{re.escape(value)}$", "$options": "i"},
+    })
+    if not existing:
+        await db.equipment_options.insert_one({
+            "id": str(uuid.uuid4()),
+            "category": option_data.category,
+            "value": value,
+            "created_at": datetime.utcnow(),
+        })
+
+    return {"message": "ok", "category": option_data.category, "value": value}
 
 # ==================== CUSTOMER INTERESTS (Favorite / Price Alert / Stock Alert) ====================
 # Pure capture-and-display feature: a customer toggles interest in a product
@@ -3799,6 +3862,42 @@ async def remove_user_interest(
     })
 
     return {"message": "ok"}
+
+@api_router.get("/auth/favorites", response_model=List[Product])
+async def get_user_favorites(request: Request):
+    """Return the current user's own favorited products as full Product
+    objects (most recently favorited first), so the frontend can render
+    them with the same product-card/grid components used by GET /products."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Token lipsă sau invalid")
+
+    token = auth_header.replace("Bearer ", "")
+    user = await _find_user_by_token(token, allow_shopify_access_token=True)
+
+    if not user:
+        raise HTTPException(status_code=401, detail="Token invalid sau expirat")
+
+    cursor = db.customer_interests.find(
+        {"user_id": user["id"], "type": "favorite"}
+    ).sort("created_at", -1)
+    interests = await cursor.to_list(None)
+    product_ids = [i["product_id"] for i in interests]
+
+    products_by_id = {}
+    if product_ids:
+        async for p in db.shopify_products.find({"id": {"$in": product_ids}}):
+            products_by_id[p["id"]] = p
+
+    # Preserve favorited-order (most recent first) rather than $in's
+    # arbitrary order; silently skip products deleted since being favorited.
+    favorites = []
+    for pid in product_ids:
+        product = products_by_id.get(pid)
+        if product:
+            favorites.append(Product(**product))
+
+    return favorites
 
 # ==================== WEBHOOK ENDPOINTS ====================
 
