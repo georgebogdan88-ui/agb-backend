@@ -13,6 +13,7 @@ import uuid
 from datetime import datetime, timedelta
 import httpx
 import re
+import json
 import unicodedata
 import asyncio
 import hashlib
@@ -163,6 +164,14 @@ class Order(BaseModel):
     crm_synced: bool = False
     crm_sync_error: Optional[str] = None
     crm_sync_attempts: int = 0
+    # Set whenever an admin edits this order's items after it was already
+    # created (and, if crm_synced, already pushed to CRM) - tracks that the
+    # CRM copy needs its lines overwritten to match. Independent of
+    # crm_synced/crm_sync_* above, which are about the one-time initial
+    # create sync only.
+    crm_items_dirty: bool = False
+    crm_items_sync_error: Optional[str] = None
+    crm_items_sync_attempts: int = 0
 
 class OrderCreate(BaseModel):
     session_id: str
@@ -194,6 +203,11 @@ class UserUpdate(BaseModel):
     name: Optional[str] = None
     phone: Optional[str] = None
     address: Optional[str] = None
+    address_strada: Optional[str] = None
+    address_numar: Optional[str] = None
+    address_bloc: Optional[str] = None
+    address_scara: Optional[str] = None
+    address_ap: Optional[str] = None
     city: Optional[str] = None
     county: Optional[str] = None
     postal_code: Optional[str] = None
@@ -202,7 +216,16 @@ class UserUpdate(BaseModel):
     company_name: Optional[str] = None
     cui: Optional[str] = None
     reg_com: Optional[str] = None
+    administrator: Optional[str] = None
     company_address: Optional[str] = None
+    company_address_strada: Optional[str] = None
+    company_address_numar: Optional[str] = None
+    company_address_bloc: Optional[str] = None
+    company_address_scara: Optional[str] = None
+    company_address_ap: Optional[str] = None
+    company_address_oras: Optional[str] = None
+    company_address_judet: Optional[str] = None
+    company_address_cod_postal: Optional[str] = None
 
 # ==================== EQUIPMENT MODELS ====================
 
@@ -1489,6 +1512,20 @@ async def clear_cart(session_id: str):
 
 # ==================== ORDER ENDPOINTS ====================
 
+def _build_crm_order_items_payload(items: List[dict]) -> List[dict]:
+    """Shared by sync_order_to_crm (create) and sync_order_update_to_crm
+    (item edits) so the two can't map fields differently."""
+    return [
+        {
+            "denumire": item.get("product_name"),
+            "cod_prod": item.get("product_id"),
+            "cantitate": item.get("quantity"),
+            "pret_unitar_cu_tva": item.get("price"),
+        }
+        for item in items
+    ]
+
+
 async def sync_order_to_crm(order: Order):
     """Fire-and-forget: push a newly created webshop order into agb-crm.
 
@@ -1514,15 +1551,7 @@ async def sync_order_to_crm(order: Order):
             "adresa_judet": order.customer.county,
             "adresa_cod_postal": order.customer.postal_code,
         },
-        "items": [
-            {
-                "denumire": item.get("product_name"),
-                "cod_prod": item.get("product_id"),
-                "cantitate": item.get("quantity"),
-                "pret_unitar_cu_tva": item.get("price"),
-            }
-            for item in order.items
-        ],
+        "items": _build_crm_order_items_payload(order.items),
     }
 
     try:
@@ -1565,6 +1594,59 @@ async def sync_order_to_crm(order: Order):
         new_attempts = order.crm_sync_attempts + 1
         if new_attempts >= 10:
             logger.error(f"CRM SYNC FAILED PERMANENTLY for order {order.id} after 10 attempts - needs manual sync")
+
+
+async def sync_order_update_to_crm(order: Order):
+    """Fire-and-forget: push an admin's item edit (add/remove/adjust
+    products) on an already-CRM-synced order, overwriting its lines there.
+    Same never-raise contract as sync_order_to_crm.
+
+    Only called when the order's initial create-sync (crm_synced) already
+    succeeded - if it hasn't landed yet, the reconciliation loop's retry of
+    that pending create reads the order's current items fresh from the DB
+    each time, so it already picks up any edit made before the create even
+    lands. Nothing extra needed in that case."""
+    if not CRM_API_URL or not CRM_INTEGRATION_KEY:
+        logger.error("CRM items sync skipped for order %s: CRM_API_URL/CRM_INTEGRATION_KEY not configured", order.id)
+        return
+
+    payload = {
+        "source": "webshop",
+        "items": _build_crm_order_items_payload(order.items),
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as http_client:
+            response = await http_client.put(
+                f"{CRM_API_URL}/integrations/orders/{order.id}",
+                json=payload,
+                headers={"X-Integration-Key": CRM_INTEGRATION_KEY},
+            )
+            if response.status_code >= 400:
+                error_message = f"HTTP {response.status_code} - {response.text}"
+                logger.error("CRM items sync failed for order %s: %s", order.id, error_message)
+                await db.orders.update_one(
+                    {"id": order.id},
+                    {
+                        "$set": {"crm_items_dirty": True, "crm_items_sync_error": error_message},
+                        "$inc": {"crm_items_sync_attempts": 1},
+                    },
+                )
+            else:
+                await db.orders.update_one(
+                    {"id": order.id},
+                    {"$set": {"crm_items_dirty": False, "crm_items_sync_error": None}},
+                )
+    except Exception as e:
+        logger.error("CRM items sync failed for order %s: %s", order.id, e)
+        await db.orders.update_one(
+            {"id": order.id},
+            {
+                "$set": {"crm_items_dirty": True, "crm_items_sync_error": str(e)},
+                "$inc": {"crm_items_sync_attempts": 1},
+            },
+        )
+
 
 @api_router.post("/orders", response_model=Order)
 async def create_order(order_data: OrderCreate, background_tasks: BackgroundTasks):
@@ -1767,6 +1849,11 @@ async def register_user(user_data: UserRegister):
         "name": user_data.name,
         "phone": user_data.phone,
         "address": None,
+        "address_strada": None,
+        "address_numar": None,
+        "address_bloc": None,
+        "address_scara": None,
+        "address_ap": None,
         "city": None,
         "county": None,
         "postal_code": None,
@@ -1774,7 +1861,16 @@ async def register_user(user_data: UserRegister):
         "company_name": None,
         "cui": None,
         "reg_com": None,
+        "administrator": None,
         "company_address": None,
+        "company_address_strada": None,
+        "company_address_numar": None,
+        "company_address_bloc": None,
+        "company_address_scara": None,
+        "company_address_ap": None,
+        "company_address_oras": None,
+        "company_address_judet": None,
+        "company_address_cod_postal": None,
         "tokens": [local_token],
         "is_shopify_customer": False,
         "created_at": created_at
@@ -2166,27 +2262,53 @@ async def _legacy_shopify_login_and_migrate(email: str, password: str, existing_
             "status": order.get("fulfillmentStatus") or "UNFULFILLED"
         })
 
+    # Re-fetch rather than hand-assembling the response from user_update_data -
+    # that dict never carried the split address/company fields, and this way
+    # the response can't drift from _serialize_user's shape (see its docstring).
+    migrated_user = await db.users.find_one({"id": user_id})
     return {
         "token": local_token,
-        "user": {
-            "id": user_id,
-            "email": email,
-            "name": user_update_data["name"],
-            "phone": user_update_data["phone"],
-            "address": user_update_data["address"],
-            "city": user_update_data["city"],
-            "county": user_update_data["county"],
-            "postal_code": user_update_data["postal_code"],
-            "is_company": user_update_data.get("is_company", False),
-            "company_name": user_update_data.get("company_name"),
-            "cui": user_update_data.get("cui"),
-            "reg_com": user_update_data.get("reg_com"),
-            "company_address": user_update_data.get("company_address"),
-            "is_shopify_customer": True,
-            "created_at": created_at,
-            "role": existing_user.get("role", "customer") if existing_user else "customer",
-        },
+        "user": _serialize_user(migrated_user),
         "shopify_orders": shopify_orders
+    }
+
+
+def _serialize_user(user: dict) -> dict:
+    """Public-facing shape of a user doc - shared by /auth/me, /auth/login and
+    PUT /auth/me so the three response bodies can't silently drift apart
+    (a field present on one and missing on another has bitten us before -
+    see the earlier missing-`role` bug)."""
+    return {
+        "id": user["id"],
+        "email": user["email"],
+        "name": user.get("name"),
+        "phone": user.get("phone"),
+        "address": user.get("address"),
+        "address_strada": user.get("address_strada"),
+        "address_numar": user.get("address_numar"),
+        "address_bloc": user.get("address_bloc"),
+        "address_scara": user.get("address_scara"),
+        "address_ap": user.get("address_ap"),
+        "city": user.get("city"),
+        "county": user.get("county"),
+        "postal_code": user.get("postal_code"),
+        "is_company": user.get("is_company", False),
+        "company_name": user.get("company_name"),
+        "cui": user.get("cui"),
+        "reg_com": user.get("reg_com"),
+        "administrator": user.get("administrator"),
+        "company_address": user.get("company_address"),
+        "company_address_strada": user.get("company_address_strada"),
+        "company_address_numar": user.get("company_address_numar"),
+        "company_address_bloc": user.get("company_address_bloc"),
+        "company_address_scara": user.get("company_address_scara"),
+        "company_address_ap": user.get("company_address_ap"),
+        "company_address_oras": user.get("company_address_oras"),
+        "company_address_judet": user.get("company_address_judet"),
+        "company_address_cod_postal": user.get("company_address_cod_postal"),
+        "is_shopify_customer": user.get("is_shopify_customer", False),
+        "created_at": user["created_at"],
+        "role": user.get("role", "customer"),
     }
 
 
@@ -2206,24 +2328,7 @@ async def _authenticate_user(email: str, password: str) -> dict:
 
         return {
             "token": local_token,
-            "user": {
-                "id": existing_user["id"],
-                "email": email,
-                "name": existing_user.get("name"),
-                "phone": existing_user.get("phone"),
-                "address": existing_user.get("address"),
-                "city": existing_user.get("city"),
-                "county": existing_user.get("county"),
-                "postal_code": existing_user.get("postal_code"),
-                "is_company": existing_user.get("is_company", False),
-                "company_name": existing_user.get("company_name"),
-                "cui": existing_user.get("cui"),
-                "reg_com": existing_user.get("reg_com"),
-                "company_address": existing_user.get("company_address"),
-                "is_shopify_customer": existing_user.get("is_shopify_customer", False),
-                "created_at": existing_user["created_at"],
-                "role": existing_user.get("role", "customer"),
-            },
+            "user": _serialize_user(existing_user),
             # Full order history stays available via GET /auth/orders (local)
             # and GET /auth/shopify-orders (Shopify-linked accounts only).
             "shopify_orders": [],
@@ -2249,25 +2354,8 @@ async def get_current_user(request: Request):
     
     if not user:
         raise HTTPException(status_code=401, detail="Token invalid sau expirat")
-    
-    return {
-        "id": user["id"],
-        "email": user["email"],
-        "name": user["name"],
-        "phone": user["phone"],
-        "address": user.get("address"),
-        "city": user.get("city"),
-        "county": user.get("county"),
-        "postal_code": user.get("postal_code"),
-        "is_company": user.get("is_company", False),
-        "company_name": user.get("company_name"),
-        "cui": user.get("cui"),
-        "reg_com": user.get("reg_com"),
-        "company_address": user.get("company_address"),
-        "created_at": user["created_at"],
-        "is_shopify_customer": user.get("is_shopify_customer", False),
-        "role": user.get("role", "customer")
-    }
+
+    return _serialize_user(user)
 
 # ==================== SHOPIFY CUSTOMER AUTH ====================
 
@@ -2295,32 +2383,55 @@ async def update_current_user(request: Request, update_data: UserUpdate):
     for field, value in update_data.dict().items():
         if value is not None:
             update_dict[field] = value
-    
+
+    # address/company_address stay in sync as a derived combo whenever the
+    # split fields are sent - a handful of older call sites (checkout
+    # prefill, admin order display, the CRM order sync payload) still read
+    # the single combined field, so it can't just go stale the moment
+    # someone starts using the new split fields instead.
+    def _combine_address(strada: str, numar: str, bloc: str, scara: str, ap: str) -> str:
+        parts = [" ".join(filter(None, [strada, numar])).strip()]
+        if bloc:
+            parts.append(f"Bl. {bloc}")
+        if scara:
+            parts.append(f"Sc. {scara}")
+        if ap:
+            parts.append(f"Ap. {ap}")
+        return ", ".join(p for p in parts if p)
+
+    address_fields = ("address_strada", "address_numar", "address_bloc", "address_scara", "address_ap")
+    if any(k in update_dict for k in address_fields):
+        update_dict["address"] = _combine_address(
+            update_dict.get("address_strada", user.get("address_strada")) or "",
+            update_dict.get("address_numar", user.get("address_numar")) or "",
+            update_dict.get("address_bloc", user.get("address_bloc")) or "",
+            update_dict.get("address_scara", user.get("address_scara")) or "",
+            update_dict.get("address_ap", user.get("address_ap")) or "",
+        )
+    company_address_fields = (
+        "company_address_strada", "company_address_numar",
+        "company_address_bloc", "company_address_scara", "company_address_ap",
+    )
+    if any(k in update_dict for k in company_address_fields):
+        update_dict["company_address"] = _combine_address(
+            update_dict.get("company_address_strada", user.get("company_address_strada")) or "",
+            update_dict.get("company_address_numar", user.get("company_address_numar")) or "",
+            update_dict.get("company_address_bloc", user.get("company_address_bloc")) or "",
+            update_dict.get("company_address_scara", user.get("company_address_scara")) or "",
+            update_dict.get("company_address_ap", user.get("company_address_ap")) or "",
+        )
+
     if update_dict:
         await db.users.update_one(
             {"id": user["id"]},
             {"$set": update_dict}
         )
-    
+
     # Fetch updated user
     updated_user = await db.users.find_one({"id": user["id"]})
-    
-    return {
-        "id": updated_user["id"],
-        "email": updated_user["email"],
-        "name": updated_user["name"],
-        "phone": updated_user["phone"],
-        "address": updated_user.get("address"),
-        "city": updated_user.get("city"),
-        "county": updated_user.get("county"),
-        "postal_code": updated_user.get("postal_code"),
-        "is_company": updated_user.get("is_company", False),
-        "company_name": updated_user.get("company_name"),
-        "cui": updated_user.get("cui"),
-        "reg_com": updated_user.get("reg_com"),
-        "company_address": updated_user.get("company_address"),
-        "created_at": updated_user["created_at"]
-    }
+
+    return _serialize_user(updated_user)
+
 
 @api_router.post("/auth/logout")
 async def logout_user(request: Request):
@@ -2359,6 +2470,44 @@ async def get_user_orders(request: Request):
     # Get orders by user email
     orders = await db.orders.find({"customer.email": user["email"]}).sort("created_at", -1).to_list(100)
     return [Order(**order) for order in orders]
+
+@api_router.get("/auth/order-history")
+async def get_user_order_history(request: Request):
+    """Merged order history for the logged-in customer: native webshop
+    orders (already available via GET /auth/orders above) plus their
+    historical Shopify orders (matched by email, from the full-store import
+    - see _run_shopify_full_orders_import), so "Comenzile mele" isn't
+    missing everything ordered before the new checkout existed."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Token lipsă sau invalid")
+    token = auth_header.replace("Bearer ", "")
+    user = await _find_user_by_token(token, allow_shopify_access_token=True)
+    if not user:
+        raise HTTPException(status_code=401, detail="Token invalid sau expirat")
+
+    email = (user.get("email") or "").strip().lower()
+
+    native_orders = await db.orders.find({"customer.email": user["email"]}).to_list(200)
+    shopify_orders = []
+    clients_by_id = {}
+    if email:
+        # Match by customer_email directly (full-store import) OR via a
+        # resolved client_id (older customer-scoped import may only have
+        # client_id set, not customer_email, on some records - see
+        # _shopify_order_to_merged's docstring).
+        or_conditions = [{"customer_email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}}]
+        client = await db.clients.find_one({"email_normalized": email})
+        if client:
+            or_conditions.append({"client_id": client["id"]})
+            clients_by_id[client["id"]] = client
+        shopify_orders = await db.shopify_order_history.find({"$or": or_conditions}).to_list(200)
+
+    merged = [_native_order_to_merged(o) for o in native_orders] + [
+        _shopify_order_to_merged(o, clients_by_id) for o in shopify_orders
+    ]
+    merged.sort(key=_merged_order_sort_key, reverse=True)
+    return merged
 
 @api_router.get("/auth/shopify-orders")
 async def get_user_shopify_orders(request: Request):
@@ -2651,10 +2800,12 @@ async def _require_admin(request: Request) -> dict:
     return user
 
 @api_router.get("/admin/products")
-async def admin_list_products(request: Request, search: Optional[str] = None, limit: int = 50, skip: int = 0):
+async def admin_list_products(request: Request, search: Optional[str] = None, limit: int = 100, skip: int = 0):
     """List/search the full product catalog (originally Shopify-imported
     products and manually-created ones alike - both are now owned by this
-    database, see sync_all_products())."""
+    database, see sync_all_products()). Returns a total count alongside the
+    page of results so the admin list can render real page-number
+    pagination instead of silently truncating at one page."""
     await _require_admin(request)
 
     query = {}
@@ -2665,9 +2816,10 @@ async def admin_list_products(request: Request, search: Optional[str] = None, li
             {"sku": {"$regex": term, "$options": "i"}},
         ]
 
+    total = await db.shopify_products.count_documents(query)
     cursor = db.shopify_products.find(query).sort("title_normalized", 1).skip(skip).limit(limit)
     products = await cursor.to_list(limit)
-    return [Product(**p) for p in products]
+    return {"items": [Product(**p) for p in products], "total": total}
 
 @api_router.get("/admin/customer-interests")
 async def admin_list_customer_interests(
@@ -3056,6 +3208,131 @@ async def admin_list_orders(request: Request, limit: int = 100, skip: int = 0):
         order.pop("_id", None)
     return orders
 
+# NOTE: must stay registered *before* GET /admin/orders/{order_id} below -
+# same literal-path-before-wildcard ordering gotcha as /admin/products/bulk,
+# otherwise "history" would be swallowed as an order_id.
+@api_router.get("/admin/orders/history")
+async def admin_list_order_history(
+    request: Request,
+    search: Optional[str] = None,
+    source: Optional[str] = None,
+    limit: int = 100,
+    skip: int = 0,
+):
+    """Unified order history across both sources this store has ever had:
+    native webshop checkouts (db.orders) and the full historical Shopify
+    catalog (db.shopify_order_history - see the full-store import further
+    down), each entry tagged with `source`. In-process merge/sort rather
+    than a cross-collection DB-level paginated query - this store's total
+    order count is in the hundreds, not a scale where that matters."""
+    await _require_admin(request)
+
+    native_orders = await db.orders.find({}).to_list(5000)
+    shopify_orders = await db.shopify_order_history.find({}).to_list(5000)
+
+    client_ids = list({o["client_id"] for o in shopify_orders if o.get("client_id")})
+    clients_by_id = {}
+    if client_ids:
+        async for c in db.clients.find({"id": {"$in": client_ids}}):
+            clients_by_id[c["id"]] = c
+
+    merged = [_native_order_to_merged(o) for o in native_orders] + [
+        _shopify_order_to_merged(o, clients_by_id) for o in shopify_orders
+    ]
+
+    if source in ("native", "shopify"):
+        merged = [o for o in merged if o["source"] == source]
+
+    if search:
+        term = normalize_text(search)
+
+        def _matches(o: dict) -> bool:
+            haystack = normalize_text(
+                " ".join(filter(None, [
+                    o.get("customer_name"),
+                    o.get("customer_email"),
+                    str(o.get("order_number") or ""),
+                ]))
+            )
+            return term in haystack
+
+        merged = [o for o in merged if _matches(o)]
+
+    merged.sort(key=_merged_order_sort_key, reverse=True)
+
+    total = len(merged)
+    return {"items": merged[skip: skip + limit], "total": total}
+
+
+# NOTE: must stay registered *after* GET /admin/orders above - same
+# literal-path-before-wildcard ordering gotcha as /admin/products/bulk.
+@api_router.get("/admin/orders/{order_id}")
+async def admin_get_order(request: Request, order_id: str):
+    """Single order, for the admin order detail/edit page."""
+    await _require_admin(request)
+    order = await db.orders.find_one({"id": order_id})
+    if not order:
+        raise HTTPException(status_code=404, detail="Comanda nu a fost găsită")
+    order.pop("_id", None)
+    return order
+
+
+class OrderItemInput(BaseModel):
+    product_id: str
+    product_name: str
+    product_image: str
+    price: float
+    quantity: int
+
+
+class OrderItemsUpdate(BaseModel):
+    items: List[OrderItemInput]
+
+
+@api_router.put("/admin/orders/{order_id}/items")
+async def admin_update_order_items(
+    request: Request,
+    order_id: str,
+    payload: OrderItemsUpdate,
+    background_tasks: BackgroundTasks,
+):
+    """Add/remove/adjust the products on an order - e.g. staff noticing the
+    customer will also need an installation part they didn't order. Only
+    allowed while the order is still "pending" (not yet processed) - once
+    it's moved past that, editing locks, same spirit as Shopify's own order
+    editing restrictions."""
+    await _require_admin(request)
+
+    order_doc = await db.orders.find_one({"id": order_id})
+    if not order_doc:
+        raise HTTPException(status_code=404, detail="Comanda nu a fost găsită")
+    if order_doc.get("status") != "pending":
+        raise HTTPException(
+            status_code=409,
+            detail="Comanda nu mai poate fi editată (nu mai este în așteptare).",
+        )
+    if not payload.items:
+        raise HTTPException(status_code=400, detail="Comanda trebuie să aibă cel puțin un produs.")
+
+    items = [item.dict() for item in payload.items]
+    subtotal = sum(item["price"] * item["quantity"] for item in items)
+    total = subtotal + order_doc.get("shipping", 25.0)
+
+    update_dict: dict = {"items": items, "subtotal": subtotal, "total": total}
+    was_crm_synced = bool(order_doc.get("crm_synced"))
+    if was_crm_synced:
+        update_dict["crm_items_dirty"] = True
+        update_dict["crm_items_sync_error"] = None
+
+    await db.orders.update_one({"id": order_id}, {"$set": update_dict})
+    updated = await db.orders.find_one({"id": order_id})
+    updated.pop("_id", None)
+
+    if was_crm_synced:
+        background_tasks.add_task(sync_order_update_to_crm, Order(**updated))
+
+    return updated
+
 # ==================== CLIENTS (Shopify customer import) ====================
 # One-time bulk import of every existing Shopify customer + their full order
 # history into our own db.clients / db.shopify_order_history collections, so
@@ -3247,6 +3524,9 @@ async def _run_clients_import(since: Optional[str], limit: Optional[int]):
                         order_doc = {
                             "id": order_id,
                             "client_id": shopify_customer_id,
+                            "customer_name": name or None,
+                            "customer_email": email or None,
+                            "customer_phone": client_doc["phone"] or None,
                             "order_number": order.get("order_number"),
                             "name": order.get("name"),
                             "created_at": _parse_shopify_datetime(order.get("created_at")),
@@ -3343,6 +3623,177 @@ async def admin_import_clients_shopify_status(request: Request):
     return clients_import_status
 
 
+# ==================== SHOPIFY FULL ORDER HISTORY IMPORT ====================
+# Direct /orders.json import (every order in the store, status=any) - unlike
+# _run_clients_import above (which only reaches orders tied to a saved
+# Shopify customer, via customers/{id}/orders.json), this also captures
+# guest checkouts. Upserts into the SAME db.shopify_order_history collection
+# by Shopify order id, so it naturally merges with/enriches whatever the
+# customer-scoped import already put there - no duplicates, no separate
+# collection.
+#
+# Deliberately independent of agb-crm: CRM already has its own Shopify
+# orders webhook pipeline (routes_shopify.py there, a large chunk of these
+# orders already exist there) - this function must NEVER call CRM_API_URL
+# or anything under /integrations/*, on purpose, per explicit instruction.
+
+shopify_orders_import_status = {
+    "is_running": False,
+    "total_orders": 0,
+    "done_orders": 0,
+    "failed_orders": 0,
+    "last_run": None,
+    "error": None,
+}
+
+
+async def _run_shopify_full_orders_import():
+    global shopify_orders_import_status
+    if shopify_orders_import_status["is_running"]:
+        return
+
+    run_started_at = datetime.utcnow()
+    shopify_orders_import_status.update({
+        "is_running": True,
+        "total_orders": 0,
+        "done_orders": 0,
+        "failed_orders": 0,
+        "error": None,
+    })
+
+    run_status = "completed"
+    run_error = None
+
+    try:
+        admin_token = os.environ.get('SHOPIFY_ADMIN_TOKEN', '') or SHOPIFY_ADMIN_TOKEN
+        if not admin_token:
+            raise RuntimeError("SHOPIFY_ADMIN_TOKEN not configured")
+
+        headers = {
+            "X-Shopify-Access-Token": admin_token,
+            "Content-Type": "application/json",
+        }
+
+        async with httpx.AsyncClient() as http_client:
+            page_info = None
+            while True:
+                url = (
+                    f"https://{SHOPIFY_STORE}/admin/api/{SHOPIFY_ADMIN_API_VERSION}/orders.json"
+                    f"?status=any&limit=250"
+                )
+                if page_info:
+                    url += f"&page_info={page_info}"
+
+                response = await http_client.get(url, headers=headers, timeout=60.0)
+                if response.status_code != 200:
+                    raise RuntimeError(f"Shopify orders.json error {response.status_code}: {response.text}")
+
+                data = response.json()
+                orders = data.get("orders", [])
+                shopify_orders_import_status["total_orders"] += len(orders)
+
+                for order in orders:
+                    try:
+                        order_id = str(order.get("id"))
+                        customer = order.get("customer") or {}
+                        shopify_customer_id = str(customer.get("id")) if customer.get("id") else None
+                        customer_name = " ".join(
+                            part for part in [customer.get("first_name"), customer.get("last_name")] if part
+                        ).strip()
+                        shipping = order.get("shipping_address") or {}
+                        customer_email = (order.get("email") or order.get("contact_email") or "").strip()
+                        customer_phone = order.get("phone") or shipping.get("phone") or customer.get("phone") or ""
+
+                        line_items = [
+                            {
+                                "title": item.get("title"),
+                                "quantity": item.get("quantity"),
+                                "price": float(item.get("price") or 0),
+                            }
+                            for item in order.get("line_items", [])
+                        ]
+                        order_doc = {
+                            "id": order_id,
+                            "client_id": shopify_customer_id,
+                            "customer_name": customer_name or None,
+                            "customer_email": customer_email or None,
+                            "customer_phone": customer_phone or None,
+                            "order_number": order.get("order_number"),
+                            "name": order.get("name"),
+                            "created_at": _parse_shopify_datetime(order.get("created_at")),
+                            "total_price": float(order.get("total_price") or 0),
+                            "currency": order.get("currency", "RON"),
+                            "financial_status": order.get("financial_status"),
+                            "fulfillment_status": order.get("fulfillment_status"),
+                            "line_items": line_items,
+                        }
+                        await db.shopify_order_history.update_one(
+                            {"id": order_id},
+                            {
+                                "$set": order_doc,
+                                "$setOnInsert": {"imported_at": datetime.utcnow()},
+                            },
+                            upsert=True,
+                        )
+                        shopify_orders_import_status["done_orders"] += 1
+                    except Exception as e:
+                        logger.error(f"Shopify orders import: failed on order {order.get('id')}: {e}")
+                        shopify_orders_import_status["failed_orders"] += 1
+
+                next_page_info = _extract_next_page_info(response.headers.get("Link", ""))
+                if not next_page_info or next_page_info == page_info:
+                    break
+                page_info = next_page_info
+                await asyncio.sleep(0.15)
+
+    except Exception as e:
+        run_status = "failed"
+        run_error = str(e)
+        shopify_orders_import_status["error"] = run_error
+        logger.error(f"Shopify full orders import failed: {e}")
+
+    finally:
+        finished_at = datetime.utcnow()
+        shopify_orders_import_status["is_running"] = False
+        shopify_orders_import_status["last_run"] = finished_at.isoformat()
+
+        await db.shopify_orders_import_runs.insert_one({
+            "id": str(uuid.uuid4()),
+            "started_at": run_started_at,
+            "finished_at": finished_at,
+            "total_orders": shopify_orders_import_status["total_orders"],
+            "done_orders": shopify_orders_import_status["done_orders"],
+            "failed_orders": shopify_orders_import_status["failed_orders"],
+            "status": run_status,
+            "error": run_error,
+        })
+
+
+@api_router.post("/admin/shopify-orders-import/start")
+async def admin_import_shopify_orders(request: Request, background_tasks: BackgroundTasks):
+    """Kick off a full, direct import of every order in the Shopify store
+    (status=any - open/closed/cancelled alike), including guest checkouts
+    that _run_clients_import's customer-scoped approach can never reach.
+    Idempotent (upserts by Shopify order id) - safe to re-run any time to
+    pick up new orders."""
+    await _require_admin(request)
+    if shopify_orders_import_status["is_running"]:
+        raise HTTPException(status_code=409, detail="Importul rulează deja")
+    background_tasks.add_task(_run_shopify_full_orders_import)
+    return {"message": "Import pornit"}
+
+
+@api_router.get("/admin/shopify-orders-import/status")
+async def admin_import_shopify_orders_status(request: Request):
+    await _require_admin(request)
+    if not shopify_orders_import_status["is_running"] and shopify_orders_import_status["last_run"] is None:
+        last = await db.shopify_orders_import_runs.find_one({}, sort=[("finished_at", -1)])
+        if last:
+            last.pop("_id", None)
+            return last
+    return shopify_orders_import_status
+
+
 @api_router.get("/admin/clients")
 async def admin_list_clients(request: Request, search: Optional[str] = None, limit: int = 50, skip: int = 0):
     """Paginated list of imported Shopify clients, for the admin 'Clienti' list view."""
@@ -3364,6 +3815,69 @@ async def admin_list_clients(request: Request, search: Optional[str] = None, lim
     return {"total": total, "clients": clients}
 
 
+def _shopify_order_to_merged(o: dict, clients_by_id: Optional[dict] = None) -> dict:
+    """Normalizes a db.shopify_order_history doc into the shared merged-order
+    shape used by the admin client-detail view, the admin order-history list,
+    and the customer's own order history.
+
+    `customer_name`/`customer_email` are only populated directly on the
+    order doc by the newer full-store import - older customer-scoped-import
+    records may only carry `client_id`, so `clients_by_id` (a batch-fetched
+    {client_id: client_doc} map) is an optional fallback to resolve them."""
+    client = (clients_by_id or {}).get(o.get("client_id")) if o.get("client_id") else None
+    return {
+        "source": "shopify",
+        "order_id": o.get("id"),
+        "order_number": o.get("name") or o.get("order_number"),
+        "date": o.get("created_at"),
+        "customer_name": o.get("customer_name") or (client.get("name") if client else None),
+        "customer_email": o.get("customer_email") or (client.get("email") if client else None),
+        "total": o.get("total_price"),
+        "currency": o.get("currency", "RON"),
+        "financial_status": o.get("financial_status"),
+        "fulfillment_status": o.get("fulfillment_status"),
+        "payment_method": None,
+        "line_items": o.get("line_items", []),
+    }
+
+
+def _native_order_to_merged(o: dict) -> dict:
+    """Normalizes a db.orders doc (native webshop checkout) into the shared
+    merged-order shape - see _shopify_order_to_merged."""
+    customer = o.get("customer") or {}
+    line_items = [
+        {
+            "title": item.get("product_name"),
+            "quantity": item.get("quantity"),
+            "price": item.get("price"),
+        }
+        for item in o.get("items", [])
+    ]
+    return {
+        "source": "native",
+        "order_id": o.get("id"),
+        "order_number": None,
+        "date": o.get("created_at"),
+        "customer_name": customer.get("name"),
+        "customer_email": customer.get("email"),
+        "total": o.get("total"),
+        "currency": "RON",
+        "financial_status": o.get("status"),
+        "fulfillment_status": None,
+        "payment_method": o.get("payment_method"),
+        "line_items": line_items,
+    }
+
+
+def _merged_order_sort_key(entry: dict):
+    value = entry.get("date")
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        return _parse_shopify_datetime(value) or datetime.min
+    return datetime.min
+
+
 @api_router.get("/admin/clients/{client_id}")
 async def admin_get_client_detail(client_id: str, request: Request):
     """Full client detail: profile + the COMPLETE order history ('totalitatea
@@ -3381,19 +3895,7 @@ async def admin_get_client_detail(client_id: str, request: Request):
     merged_orders = []
 
     shopify_orders = await db.shopify_order_history.find({"client_id": client_id}).to_list(1000)
-    for o in shopify_orders:
-        merged_orders.append({
-            "source": "shopify",
-            "order_id": o.get("id"),
-            "order_number": o.get("name") or o.get("order_number"),
-            "date": o.get("created_at"),
-            "total": o.get("total_price"),
-            "currency": o.get("currency", "RON"),
-            "financial_status": o.get("financial_status"),
-            "fulfillment_status": o.get("fulfillment_status"),
-            "payment_method": None,
-            "line_items": o.get("line_items", []),
-        })
+    merged_orders.extend(_shopify_order_to_merged(o) for o in shopify_orders)
 
     email = client.get("email_normalized") or (client.get("email") or "").strip().lower()
     native_orders = []
@@ -3401,38 +3903,9 @@ async def admin_get_client_detail(client_id: str, request: Request):
         native_orders = await db.orders.find(
             {"customer.email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}}
         ).to_list(1000)
+    merged_orders.extend(_native_order_to_merged(o) for o in native_orders)
 
-    for o in native_orders:
-        line_items = [
-            {
-                "title": item.get("product_name"),
-                "quantity": item.get("quantity"),
-                "price": item.get("price"),
-            }
-            for item in o.get("items", [])
-        ]
-        merged_orders.append({
-            "source": "native",
-            "order_id": o.get("id"),
-            "order_number": None,
-            "date": o.get("created_at"),
-            "total": o.get("total"),
-            "currency": "RON",
-            "financial_status": o.get("status"),
-            "fulfillment_status": None,
-            "payment_method": o.get("payment_method"),
-            "line_items": line_items,
-        })
-
-    def _sort_key(entry):
-        value = entry.get("date")
-        if isinstance(value, datetime):
-            return value
-        if isinstance(value, str):
-            return _parse_shopify_datetime(value) or datetime.min
-        return datetime.min
-
-    merged_orders.sort(key=_sort_key, reverse=True)
+    merged_orders.sort(key=_merged_order_sort_key, reverse=True)
 
     return {
         "client": client,
@@ -4908,6 +5381,21 @@ async def crm_reconciliation_loop():
                     logger.error(f"CRM reconciliation: skipping interest {doc['id']}, user {doc['user_id']} no longer exists")
                     continue
                 await sync_interest_to_crm(doc["id"], doc["type"], user, product)
+
+            pending_item_syncs = await db.orders.find({
+                "crm_synced": True,
+                "crm_items_dirty": True,
+                "$or": [
+                    {"crm_items_sync_attempts": {"$exists": False}},
+                    {"crm_items_sync_attempts": {"$lt": 10}},
+                ],
+            }).to_list(1000)
+
+            for doc in pending_item_syncs:
+                doc.pop("_id", None)
+                order = Order(**doc)
+                logger.info(f"CRM reconciliation: retry item sync for order {order.id}, attempt {order.crm_items_sync_attempts + 1}")
+                await sync_order_update_to_crm(order)
         except asyncio.CancelledError:
             logger.info("CRM reconciliation task cancelled")
             break
