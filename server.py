@@ -3951,8 +3951,74 @@ async def admin_add_equipment_option(request: Request, option_data: EquipmentOpt
 # GET /admin/customer-interests to follow up manually. There is deliberately
 # no automated notification-sending here (no email/push when a price
 # actually changes or stock returns) - that's out of scope for this feature.
+# Each new interest is also fire-and-forget synced into agb-crm (see
+# sync_interest_to_crm below), so CRM staff see it alongside interests they
+# log manually there for out-of-stock requests - same retry/reconciliation
+# pattern as sync_order_to_crm.
 
 INTEREST_TYPES = ("favorite", "price_alert", "stock_alert")
+
+async def sync_interest_to_crm(interest_id: str, interest_type: str, user: dict, product: Optional[dict]) -> None:
+    """Fire-and-forget: push a newly recorded customer interest into agb-crm.
+
+    Must never raise - any failure (missing config, timeout, connection
+    error, 4xx/5xx) is logged and swallowed so it can't affect the interest
+    that was already saved/returned to the client. Mirrors sync_order_to_crm.
+    """
+    if not CRM_API_URL or not CRM_INTEGRATION_KEY:
+        logger.error("CRM sync skipped for interest %s: CRM_API_URL/CRM_INTEGRATION_KEY not configured", interest_id)
+        return
+
+    payload = {
+        "source": "webshop",
+        "source_interest_id": interest_id,
+        "type": interest_type,
+        "customer": {
+            "nume": user.get("name"),
+            "email": user.get("email"),
+            "telefon": user.get("phone"),
+        },
+        "product": {
+            "denumire": product.get("title") if product else None,
+            "cod_prod": product.get("sku") if product else None,
+            "pret": product.get("price") if product else None,
+            "moneda": product.get("currency") if product else None,
+            "imagine_url": product.get("image_url") if product else None,
+            "stoc_status": product.get("stock_status") if product else None,
+        },
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as http_client:
+            response = await http_client.post(
+                f"{CRM_API_URL}/integrations/interests",
+                json=payload,
+                headers={"X-Integration-Key": CRM_INTEGRATION_KEY},
+            )
+            if response.status_code >= 400:
+                error_message = f"HTTP {response.status_code} - {response.text}"
+                logger.error("CRM sync failed for interest %s: %s", interest_id, error_message)
+                await db.customer_interests.update_one(
+                    {"id": interest_id},
+                    {
+                        "$set": {"crm_synced": False, "crm_sync_error": error_message},
+                        "$inc": {"crm_sync_attempts": 1},
+                    },
+                )
+            else:
+                await db.customer_interests.update_one(
+                    {"id": interest_id},
+                    {"$set": {"crm_synced": True, "crm_sync_error": None}},
+                )
+    except Exception as e:
+        logger.error("CRM sync failed for interest %s: %s", interest_id, e)
+        await db.customer_interests.update_one(
+            {"id": interest_id},
+            {
+                "$set": {"crm_synced": False, "crm_sync_error": str(e)},
+                "$inc": {"crm_sync_attempts": 1},
+            },
+        )
 
 @api_router.get("/auth/interests")
 async def get_user_interest_state(request: Request, product_id: str):
@@ -3979,7 +4045,7 @@ async def get_user_interest_state(request: Request, product_id: str):
     return {t: (t in existing_types) for t in INTEREST_TYPES}
 
 @api_router.post("/auth/interests")
-async def add_user_interest(request: Request, interest_data: CustomerInterestCreate):
+async def add_user_interest(request: Request, interest_data: CustomerInterestCreate, background_tasks: BackgroundTasks):
     """Idempotently record that the current user is interested in a product
     (favorite / price alert / stock alert). No-op (not an error) if that
     exact user+product+type combo is already recorded."""
@@ -3999,13 +4065,19 @@ async def add_user_interest(request: Request, interest_data: CustomerInterestCre
         "type": interest_data.type,
     })
     if not existing:
+        interest_id = str(uuid.uuid4())
         await db.customer_interests.insert_one({
-            "id": str(uuid.uuid4()),
+            "id": interest_id,
             "user_id": user["id"],
             "product_id": interest_data.product_id,
             "type": interest_data.type,
             "created_at": datetime.utcnow(),
+            "crm_synced": False,
+            "crm_sync_error": None,
+            "crm_sync_attempts": 0,
         })
+        product = await db.shopify_products.find_one({"id": interest_data.product_id})
+        background_tasks.add_task(sync_interest_to_crm, interest_id, interest_data.type, user, product)
 
     return {"message": "ok"}
 
@@ -4800,7 +4872,10 @@ async def auto_sync_loop():
 crm_reconciliation_task = None
 
 async def crm_reconciliation_loop():
-    """Background task that retries CRM sync for orders that previously failed"""
+    """Background task that retries CRM sync for orders and customer
+    interests that previously failed (or predate crm_sync_attempts existing
+    on the document at all - $lt excludes missing fields, so the "OR missing"
+    branch is what catches those older records)."""
     while True:
         try:
             await asyncio.sleep(600)  # 10 minutes
@@ -4815,6 +4890,24 @@ async def crm_reconciliation_loop():
                 order = Order(**doc)
                 logger.info(f"CRM reconciliation: retry order {order.id}, attempt {order.crm_sync_attempts + 1}")
                 await sync_order_to_crm(order)
+
+            pending_interests = await db.customer_interests.find({
+                "crm_synced": {"$ne": True},
+                "$or": [
+                    {"crm_sync_attempts": {"$exists": False}},
+                    {"crm_sync_attempts": {"$lt": 10}},
+                ],
+            }).to_list(1000)
+
+            for doc in pending_interests:
+                attempts = doc.get("crm_sync_attempts", 0)
+                logger.info(f"CRM reconciliation: retry interest {doc['id']}, attempt {attempts + 1}")
+                user = await db.users.find_one({"id": doc["user_id"]})
+                product = await db.shopify_products.find_one({"id": doc["product_id"]})
+                if not user:
+                    logger.error(f"CRM reconciliation: skipping interest {doc['id']}, user {doc['user_id']} no longer exists")
+                    continue
+                await sync_interest_to_crm(doc["id"], doc["type"], user, product)
         except asyncio.CancelledError:
             logger.info("CRM reconciliation task cancelled")
             break
