@@ -28,8 +28,14 @@ ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env', override=False)
 
 # MongoDB connection
+# maxPoolSize explicit (was left at the driver default of 100) - this
+# process shares a ~500-connection Atlas M0 budget with agb-crm, and 100
+# idle-capable connections from a single-worker process is more than this
+# app's actual concurrency needs (each request holds a connection only
+# briefly, being I/O-bound async). 20 leaves headroom for agb-crm and for
+# any future horizontal scaling of this service.
 mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
+client = AsyncIOMotorClient(mongo_url, maxPoolSize=20)
 db = client[os.environ['DB_NAME']]
 
 # Shopify Configuration - loaded from environment
@@ -288,15 +294,21 @@ class UserResponse(BaseModel):
     created_at: datetime
 
 # Password hashing helper
-def hash_password(password: str) -> str:
-    """Hash password using bcrypt"""
-    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+async def hash_password(password: str) -> str:
+    """Hash password using bcrypt. Offloaded to a thread - bcrypt is
+    CPU-bound (~100-300ms) and this process runs a single Uvicorn worker,
+    so calling it synchronously would block the entire event loop (every
+    other concurrent request, not just this one) for that duration."""
+    return await asyncio.to_thread(
+        lambda: bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+    )
 
-def verify_password(password: str, hashed: str) -> bool:
-    """Verify password against bcrypt hash"""
+async def verify_password(password: str, hashed: str) -> bool:
+    """Verify password against bcrypt hash. Offloaded to a thread - see
+    hash_password() above for why."""
     if not hashed:
         return False
-    return bcrypt.checkpw(password.encode(), hashed.encode())
+    return await asyncio.to_thread(bcrypt.checkpw, password.encode(), hashed.encode())
 
 def generate_token() -> str:
     """Generate a simple auth token"""
@@ -1951,7 +1963,7 @@ async def register_user(user_data: UserRegister):
     user = {
         "id": user_id,
         "email": email,
-        "password_hash": hash_password(user_data.password),
+        "password_hash": await hash_password(user_data.password),
         "name": user_data.name,
         "phone": user_data.phone,
         "address": None,
@@ -2116,7 +2128,7 @@ async def reset_password(request: ResetPasswordRequest):
     await db.users.update_one(
         {"id": user["id"]},
         {
-            "$set": {"password_hash": hash_password(request.new_password), "tokens": []},
+            "$set": {"password_hash": await hash_password(request.new_password), "tokens": []},
             "$unset": {"reset_token": "", "reset_token_expires": "", "token": ""},
         }
     )
@@ -2317,7 +2329,7 @@ async def _legacy_shopify_login_and_migrate(email: str, password: str, existing_
         "company_name": default_address.get("company") or None,
         # Silent migration: from this point on, this account has a local
         # password and no longer needs the Shopify fallback above.
-        "password_hash": hash_password(password),
+        "password_hash": await hash_password(password),
         "is_shopify_customer": True,
         "shopify_customer_id": shopify_customer_id,
         "shopify_access_token": shopify_access_token,
@@ -2427,7 +2439,7 @@ async def _authenticate_user(email: str, password: str) -> dict:
     existing_user = await db.users.find_one({"email": email})
 
     if existing_user and existing_user.get("password_hash"):
-        if not verify_password(password, existing_user["password_hash"]):
+        if not await verify_password(password, existing_user["password_hash"]):
             raise HTTPException(status_code=401, detail="Email sau parolă incorectă")
 
         local_token = await _issue_session_token(email)
@@ -3177,7 +3189,13 @@ async def admin_upload_image(request: Request, file: UploadFile = File(...)):
 
     contents = await file.read()
     try:
-        result = cloudinary.uploader.upload(
+        # Offloaded to a thread, same reasoning as the bulk migration
+        # function below - cloudinary.uploader.upload() is a blocking
+        # network call, and this process runs a single Uvicorn worker, so
+        # calling it directly would stall every other concurrent request
+        # for the duration of the upload.
+        result = await asyncio.to_thread(
+            cloudinary.uploader.upload,
             contents,
             folder="agb-agroparts/products",
             resource_type="image",
@@ -5554,6 +5572,26 @@ async def startup_event():
         await db.users.create_index("email", unique=True)
     except Exception:
         logger.exception("Failed to create unique index on users.email")
+
+    # _find_user_by_token() runs on every authenticated request and matches
+    # on either field (see its docstring) - without these, that's a full
+    # collection scan on db.users every single time.
+    try:
+        await db.users.create_index("tokens")
+    except Exception:
+        logger.exception("Failed to create index on users.tokens")
+    try:
+        await db.users.create_index("token")
+    except Exception:
+        logger.exception("Failed to create index on users.token")
+
+    # Every cart read/write filters by session_id (get_cart, add_to_cart's
+    # existing-item lookup, create_order's cleanup) - without this, each one
+    # scans the whole (unboundedly-growing, never-expired) cart collection.
+    try:
+        await db.cart.create_index("session_id")
+    except Exception:
+        logger.exception("Failed to create index on cart.session_id")
 
     try:
         # Belt-and-braces defense against duplicate interest rows on top of
