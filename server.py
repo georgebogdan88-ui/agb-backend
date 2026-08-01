@@ -1525,6 +1525,18 @@ async def get_product(product_id: str):
 
 # ==================== CART ENDPOINTS ====================
 
+async def _get_authoritative_price(product_id: str) -> float:
+    """Never trust a price submitted by a client (webshop or mobile) - look
+    it up from the product catalog instead. Used at every point where a
+    cart/order is created or priced, so a client can't add an item at an
+    arbitrary price by editing the request. Raises 400 if the product_id
+    doesn't exist, so a fabricated product_id can't be used to inject a
+    fake line item either."""
+    product = await db.shopify_products.find_one({"id": product_id}, {"price": 1})
+    if not product or product.get("price") is None:
+        raise HTTPException(status_code=400, detail=f"Produs inexistent: {product_id}")
+    return product["price"]
+
 @api_router.get("/cart/{session_id}", response_model=List[CartItem])
 async def get_cart(session_id: str):
     """Get cart items for a session"""
@@ -1534,6 +1546,7 @@ async def get_cart(session_id: str):
 @api_router.post("/cart", response_model=CartItem)
 async def add_to_cart(item: CartItemCreate):
     """Add item to cart"""
+    item.price = await _get_authoritative_price(item.product_id)
     existing = await db.cart.find_one({
         "session_id": item.session_id,
         "product_id": item.product_id
@@ -1725,6 +1738,13 @@ async def sync_order_update_to_crm(order: Order):
 @api_router.post("/orders", response_model=Order)
 async def create_order(order_data: OrderCreate, background_tasks: BackgroundTasks):
     """Create a new order"""
+    if not order_data.items:
+        raise HTTPException(status_code=400, detail="Comanda trebuie să aibă cel puțin un produs.")
+    for item in order_data.items:
+        item["price"] = await _get_authoritative_price(item.get("product_id"))
+    order_data.subtotal = sum(item["price"] * item.get("quantity", 1) for item in order_data.items)
+    order_data.shipping = 25.0
+    order_data.total = order_data.subtotal + order_data.shipping
     order = Order(**order_data.dict())
     await db.orders.insert_one(order.dict())
     await db.cart.delete_many({"session_id": order_data.session_id})
@@ -5282,6 +5302,7 @@ async def create_shopify_order(order_data: ShopifyOrderCreate):
         # Build line items for the order
         line_items = []
         for item in order_data.items:
+            item.price = await _get_authoritative_price(item.product_id)
             line_item = {
                 "title": item.title,
                 "quantity": item.quantity,
@@ -5978,17 +5999,24 @@ async def create_shopify_order(request: CreateShopifyOrderRequest):
                     variant_id = product_doc.get("variant_id")
             
             if variant_id:
-                # Use variant_id if available
+                # Use variant_id if available - Shopify prices the line item
+                # from the variant itself, so item.price is never used here.
                 line_items.append({
                     "variant_id": int(variant_id.split("/")[-1]) if "/" in str(variant_id) else int(variant_id),
                     "quantity": item.quantity
                 })
             else:
-                # Fallback: create custom line item
+                # Fallback: create custom line item. product_doc was already
+                # looked up above (that's the only way to reach this branch)
+                # - price must come from it, never from the client, or a
+                # fabricated product_id could inject an arbitrarily-priced
+                # fake line item into a real Shopify order.
+                if not product_doc or product_doc.get("price") is None:
+                    raise HTTPException(status_code=400, detail=f"Produs inexistent: {item.product_id}")
                 line_items.append({
                     "title": item.title,
                     "quantity": item.quantity,
-                    "price": str(item.price),
+                    "price": str(product_doc["price"]),
                     "requires_shipping": True
                 })
         
