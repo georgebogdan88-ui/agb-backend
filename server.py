@@ -105,6 +105,7 @@ class Product(BaseModel):
     compatible_models: List[str] = []
     collections: List[str] = []
     complementary_product_ids: List[str] = []
+    equivalent_product_ids: List[str] = []
     is_featured: bool = False
     # Utilaje de vânzare only (product_type == "Utilaje") - a used-equipment
     # spec sheet, same shape as a marketplace listing (year/hours/power/
@@ -766,6 +767,37 @@ async def sync_all_products():
                 {"id": 1}
             ).to_list(None)
         }
+        # Same reasoning as preserved_complementary above, for the "Echivalente"
+        # (same part, different brand) links curated via the admin UI.
+        preserved_equivalent = {
+            p["id"]: p["equivalent_product_ids"]
+            for p in await db.shopify_products.find(
+                {"source": {"$ne": "manual"}, "equivalent_product_ids": {"$exists": True, "$ne": []}},
+                {"id": 1, "equivalent_product_ids": 1}
+            ).to_list(None)
+        }
+
+        # Preserve Cloudinary-hosted images across the delete+reinsert below.
+        # Product images were migrated off Shopify's CDN onto Cloudinary in a
+        # one-off bulk migration (see admin_migrate_images below), plus a
+        # subsequent recrop correction applied to ~15,298 images - but
+        # parse_shopify_node() always parses fresh, raw cdn.shopify.com URLs
+        # straight from Shopify. Without this, a full resync would silently
+        # overwrite every migrated/recropped Cloudinary URL with the original
+        # Shopify CDN URL, undoing both the migration and the recrop.
+        preserved_images = {
+            p["id"]: {"image_url": p.get("image_url"), "images": p.get("images") or []}
+            for p in await db.shopify_products.find(
+                {
+                    "source": {"$ne": "manual"},
+                    "$or": [
+                        {"image_url": {"$regex": "res.cloudinary.com"}},
+                        {"images": {"$regex": "res.cloudinary.com"}},
+                    ],
+                },
+                {"id": 1, "image_url": 1, "images": 1}
+            ).to_list(None)
+        }
 
         # Clear existing Shopify-synced products, but keep manually-created
         # products (source="manual") - those aren't part of the Shopify catalog
@@ -790,6 +822,11 @@ async def sync_all_products():
                     product["complementary_product_ids"] = preserved_complementary[product["id"]]
                 if product["id"] in preserved_featured:
                     product["is_featured"] = True
+                if product["id"] in preserved_equivalent:
+                    product["equivalent_product_ids"] = preserved_equivalent[product["id"]]
+                if product["id"] in preserved_images:
+                    product["image_url"] = preserved_images[product["id"]]["image_url"]
+                    product["images"] = preserved_images[product["id"]]["images"]
                 batch.append(product)
                 total_products += 1
             
@@ -1330,6 +1367,43 @@ async def get_complementary_products(product_id: str):
     except Exception as e:
         logger.error(f"Error fetching complementary products: {e}")
         return {"complementary": [], "related": []}
+
+@api_router.get("/products/{product_id}/equivalents")
+async def get_equivalent_products(product_id: str):
+    """Get "same part, different brand" equivalent products.
+
+    Mirrors get_complementary_products() above, but reads the native,
+    admin-managed `equivalent_product_ids` field instead of
+    `complementary_product_ids`, and has no Shopify-metafield fallback -
+    equivalence (same part number, different manufacturer/brand - e.g. John
+    Deere vs. Vapormatic vs. FP Diesel vs. Reliance vs. Mahle for the same
+    DZ110417 kit) is a purely admin-curated relationship with no Shopify
+    concept to fall back to. If `equivalent_product_ids` is empty, this
+    simply returns an empty list rather than querying Shopify.
+    """
+    local_product = await db.shopify_products.find_one({"id": product_id})
+    equivalent_ids = (local_product or {}).get("equivalent_product_ids") or []
+
+    equivalents = []
+    for ref_id in equivalent_ids:
+        ref_product = await db.shopify_products.find_one({"id": ref_id})
+        if not ref_product:
+            continue
+        equivalents.append({
+            "id": ref_product.get("id"),
+            "variant_id": None,
+            "title": ref_product.get("title", ""),
+            "handle": ref_product.get("handle", ""),
+            "description": ref_product.get("description", ""),
+            "price": ref_product.get("price", 0.0),
+            "currency": ref_product.get("currency", "RON"),
+            "image_url": ref_product.get("image_url"),
+            "stock": ref_product.get("stock", 0),
+            "sku": ref_product.get("sku"),
+            "vendor": ref_product.get("vendor"),
+            "recommended_quantity": 1,
+        })
+    return {"equivalents": equivalents}
 
 def parse_metafield_product(node: dict) -> dict:
     """Parse a product node from metafield references"""
@@ -2694,6 +2768,7 @@ class ProductCreate(BaseModel):
     compatible_models: List[str] = []
     category: Optional[str] = None  # e.g. "motor", "transmisie" - combined with product_type to derive `collections`
     complementary_product_ids: List[str] = []
+    equivalent_product_ids: List[str] = []
     is_featured: bool = False
     equipment_year: Optional[int] = None
     equipment_hours: Optional[int] = None
@@ -2722,6 +2797,7 @@ class ProductUpdate(BaseModel):
     compatible_models: Optional[List[str]] = None
     category: Optional[str] = None
     complementary_product_ids: Optional[List[str]] = None
+    equivalent_product_ids: Optional[List[str]] = None
     is_featured: Optional[bool] = None
     equipment_year: Optional[int] = None
     equipment_hours: Optional[int] = None
@@ -2907,6 +2983,7 @@ async def admin_create_product(request: Request, product_data: ProductCreate):
         "collections": collections,
         "collections_normalized": [normalize_text(c) for c in collections],
         "complementary_product_ids": product_data.complementary_product_ids,
+        "equivalent_product_ids": product_data.equivalent_product_ids,
         "is_featured": product_data.is_featured,
         "equipment_year": product_data.equipment_year,
         "equipment_hours": product_data.equipment_hours,
