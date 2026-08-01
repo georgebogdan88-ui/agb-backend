@@ -1731,6 +1731,18 @@ async def create_order(order_data: OrderCreate, background_tasks: BackgroundTask
     background_tasks.add_task(sync_order_to_crm, order)
     return order
 
+# NOTE: must stay registered *before* GET /orders/{session_id} below - same
+# literal-path-before-wildcard ordering gotcha as elsewhere in this file,
+# otherwise "mobile" would be swallowed as a session_id.
+@api_router.get("/orders/mobile")
+async def get_mobile_orders(request: Request, limit: int = 50):
+    """Get orders created from the mobile app"""
+    await _require_admin(request)
+    orders = await db.mobile_orders.find().sort("created_at", -1).limit(limit).to_list(limit)
+    for order in orders:
+        order["_id"] = str(order["_id"])
+    return orders
+
 @api_router.get("/orders/{session_id}", response_model=List[Order])
 async def get_orders(session_id: str):
     """Get orders for a session"""
@@ -6073,14 +6085,6 @@ async def create_shopify_order(request: CreateShopifyOrderRequest):
         logger.error(f"Error creating Shopify order: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@api_router.get("/orders/mobile")
-async def get_mobile_orders(limit: int = 50):
-    """Get orders created from the mobile app"""
-    orders = await db.mobile_orders.find().sort("created_at", -1).limit(limit).to_list(limit)
-    for order in orders:
-        order["_id"] = str(order["_id"])
-    return orders
-
 # Privacy Policy endpoint
 @api_router.get("/privacy-policy", response_class=HTMLResponse)
 async def privacy_policy():
@@ -6565,8 +6569,9 @@ async def blog_checker_task():
         await check_for_new_blog_posts()
 
 @api_router.post("/push/test")
-async def test_push_notification():
+async def test_push_notification(request: Request):
     """Test endpoint to send a push notification to all devices"""
+    await _require_admin(request)
     sent = await send_push_notification(
         title="🔔 Test Notificare",
         body="Aceasta este o notificare de test!",
@@ -6575,8 +6580,9 @@ async def test_push_notification():
     return {"success": True, "sent_to": sent}
 
 @api_router.get("/push/debug")
-async def debug_push_tokens():
+async def debug_push_tokens(request: Request):
     """Debug endpoint to see push tokens and test sending"""
+    await _require_admin(request)
     try:
         tokens = await db.push_tokens.find({}).to_list(100)
         token_info = []
@@ -6628,8 +6634,9 @@ async def trigger_blog_check():
     return {"success": True, "message": "Blog check triggered"}
 
 @api_router.get("/debug/shopify-token")
-async def debug_shopify_token():
+async def debug_shopify_token(request: Request):
     """Debug endpoint to check if Shopify Admin Token is set"""
+    await _require_admin(request)
     has_token = bool(SHOPIFY_ADMIN_TOKEN and len(SHOPIFY_ADMIN_TOKEN) > 10)
     return {
         "has_shopify_admin_token": has_token,
@@ -6638,8 +6645,9 @@ async def debug_shopify_token():
     }
 
 @api_router.get("/debug/customer-notes/{email}")
-async def debug_customer_notes(email: str):
+async def debug_customer_notes(email: str, request: Request):
     """Debug endpoint to fetch customer notes"""
+    await _require_admin(request)
     if not SHOPIFY_ADMIN_TOKEN:
         return {"error": "SHOPIFY_ADMIN_TOKEN not set", "notes": None}
     
