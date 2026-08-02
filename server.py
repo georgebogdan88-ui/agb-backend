@@ -961,6 +961,32 @@ SORT_FIELDS = {
 }
 
 
+def _term_to_spaced_regex(term: str) -> str:
+    """Turns a search term into a regex fragment that also matches the same
+    characters with an optional space inserted at each letter->digit
+    transition (e.g. "8r410" -> "8r\\s*410").
+
+    `compatible_models` stores John Deere's native R/RT/RX/M/T-series codes
+    with a space between the series letters and the model number (e.g.
+    "8R 410", "9RT 470", "6M 105", "6R 110" - confirmed against real data).
+    A customer typing "8r410" with no space would otherwise never match
+    "8R 410" contiguously, while typing "8r 410" happens to work today only
+    because it becomes two independent terms. This makes both spellings
+    behave the same, matching with zero or more spaces at that boundary.
+
+    Only the letter->digit transition gets the optional space. The reverse
+    (digit->letter, e.g. a hypothetical "410 R") does not occur in the real
+    data - suffixes like "R"/"RT" are always glued directly to the model
+    number (e.g. "8320R", "8310R") - so it is intentionally left alone.
+    """
+    parts = []
+    for i, ch in enumerate(term):
+        if i > 0 and term[i - 1].isalpha() and ch.isdigit():
+            parts.append(r"\s*")
+        parts.append(re.escape(ch))
+    return "".join(parts)
+
+
 def build_products_query(
     search: Optional[str],
     product_type: Optional[str],
@@ -991,6 +1017,45 @@ def build_products_query(
         # Remove "premium" from search terms if it was part of a model number
         if premium_matches:
             search_terms = [t for t in search_terms if t.lower() != 'premium']
+
+        # Re-merge a split series/model code (e.g. user typed "8r 410" as two
+        # words) back into one term ("8r410") before building regexes below.
+        #
+        # Without this, "8r" and "410" would become two independent \b..\b
+        # conditions ANDed together, each allowed to match a *different*
+        # element of the `compatible_models` array - e.g. a product listing
+        # both "8R 340" and "8RT 410" (but not "8R 410") would wrongly match,
+        # since "8R 340" satisfies the "8r" condition and "8RT 410"
+        # separately satisfies the "410" condition, even though neither
+        # element is actually "8R 410". That's a real false positive
+        # (verified against production data - see fix/search-model-spacing).
+        #
+        # Merging first makes "8r 410" go through the exact same single-term
+        # path as an already-glued "8r410" (see _term_to_spaced_regex below),
+        # which requires the letters and digits to be adjacent (with only an
+        # optional space between them), so both spellings return identical,
+        # correctly-adjacent results.
+        #
+        # Scope is deliberately narrow to avoid merging unrelated ordinary
+        # two-word searches: only triggers when a term made purely of
+        # digits+letters (e.g. "8r", "9rt", "6m" - a partial series code) is
+        # immediately followed by a purely-numeric term.
+        merged_terms = []
+        i = 0
+        while i < len(search_terms):
+            current = search_terms[i]
+            next_term = search_terms[i + 1] if i + 1 < len(search_terms) else None
+            if (
+                next_term
+                and re.match(r'^\d+[a-z]+$', current, re.IGNORECASE)
+                and re.match(r'^\d+$', next_term)
+            ):
+                merged_terms.append(current + next_term)
+                i += 2
+            else:
+                merged_terms.append(current)
+                i += 1
+        search_terms = merged_terms
 
         if search_terms:
             # Build regex patterns for each term
@@ -1062,11 +1127,19 @@ def build_products_query(
                     #     making the search return almost the entire catalog
                     #     for a 2-3 letter query. This restores the original,
                     #     safe both-ends-anchored behaviour for those terms.
+                    #
+                    # Additionally, terms that mix letters and digits (e.g.
+                    # "8r410", "9rt470") get an optional space inserted at
+                    # the letter->digit boundary via _term_to_spaced_regex,
+                    # so they match native-spaced codes like "8R 410" in
+                    # `compatible_models` just as well as the glued form -
+                    # see that helper's docstring for details.
                     has_digit = bool(re.search(r'\d', term))
+                    term_pattern = _term_to_spaced_regex(term) if has_digit else term
                     if has_digit or len(term) < 5:
-                        term_regex = f"\\b{term}\\b"
+                        term_regex = f"\\b{term_pattern}\\b"
                     else:
-                        term_regex = f"\\b{term}"
+                        term_regex = f"\\b{term_pattern}"
                     regex_conditions.append({
                         "$or": [
                             {"title_normalized": {"$regex": term_regex, "$options": "i"}},
