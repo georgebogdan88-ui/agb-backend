@@ -125,6 +125,14 @@ class Product(BaseModel):
     equipment_rear_tire: Optional[str] = None
     equipment_rear_tire_wear: Optional[str] = None
     equipment_max_speed: Optional[int] = None
+    # Internal-only flag for the gradual Cloudinary -> Cloudflare Images
+    # rollout (phase 2). Never set through this API - toggled directly in
+    # Mongo on a hand-picked sample of products. `exclude=True` so it's
+    # read from the raw Mongo doc (by `apply_cloudflare_rollout()`, before
+    # the doc is turned into a `Product`) but never leaks into the JSON
+    # response, same pattern as `title_en`/`description_en` on the
+    # feat/i18n-product-translations branch.
+    cloudflare_rollout: Optional[bool] = Field(default=None, exclude=True)
 
 class CartItem(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -1044,6 +1052,44 @@ def build_products_query(
     return query
 
 
+def apply_cloudflare_rollout(doc: dict) -> dict:
+    """Gradual, per-product rollout of Cloudflare Images (phase 2 of the
+    Cloudinary -> Cloudflare migration - see scripts/migrate_to_cloudflare_
+    images.py for phase 1, which only populated `cf_image_id`/`cf_image_url`
+    on each product doc without changing what's served).
+
+    Only swaps the primary `image_url` (and, if it was pointing at the same
+    URL, `images[0]`) for `cf_image_url` when a product doc has BOTH
+    `cloudflare_rollout: True` (set directly in Mongo, never via this API -
+    on a small hand-picked sample only) AND a populated `cf_image_url`
+    (i.e. the migration actually ran for that product). Any other product -
+    no flag, or flag set but migration incomplete for some reason - is
+    returned completely unchanged, still serving Cloudinary exactly as
+    before. The rest of `images[]` (secondary gallery photos) is left alone
+    either way - only the primary image is in scope for this phase.
+
+    Returns a shallow copy; never mutates `doc` in place. Meant to be
+    called on the raw Mongo dict before constructing a `Product` from it,
+    same pattern as `localize_product_doc()` on
+    feat/i18n-product-translations for the `?lang=` param."""
+    if not doc.get("cloudflare_rollout"):
+        return doc
+
+    cf_image_url = doc.get("cf_image_url")
+    if not cf_image_url:
+        return doc
+
+    doc = dict(doc)
+    old_image_url = doc.get("image_url")
+    doc["image_url"] = cf_image_url
+
+    images = doc.get("images")
+    if images and images[0] == old_image_url:
+        doc["images"] = [cf_image_url] + list(images[1:])
+
+    return doc
+
+
 @api_router.get("/products/search-count")
 async def get_products_search_count(
     search: Optional[str] = None,
@@ -1104,8 +1150,8 @@ async def get_products(
                 )
             )
 
-        return [Product(**p) for p in products]
-        
+        return [Product(**apply_cloudflare_rollout(p)) for p in products]
+
     except Exception as e:
         logger.error(f"Error fetching products: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1183,7 +1229,7 @@ async def get_featured_products(limit: int = 10):
                     ).limit(remaining).to_list(remaining)
                     products.extend(more_out_of_stock)
 
-            return [Product(**p) for p in products]
+            return [Product(**apply_cloudflare_rollout(p)) for p in products]
         else:
             # Fallback to Shopify
             return await get_products_from_shopify(None, limit)
@@ -1250,6 +1296,7 @@ async def get_complementary_products(product_id: str):
             ref_product = await db.shopify_products.find_one({"id": ref_id})
             if not ref_product:
                 continue
+            ref_product = apply_cloudflare_rollout(ref_product)
             complementary.append({
                 "id": ref_product.get("id"),
                 "variant_id": None,
@@ -1420,6 +1467,7 @@ async def get_equivalent_products(product_id: str):
         ref_product = await db.shopify_products.find_one({"id": ref_id})
         if not ref_product:
             continue
+        ref_product = apply_cloudflare_rollout(ref_product)
         equivalents.append({
             "id": ref_product.get("id"),
             "variant_id": None,
@@ -1483,10 +1531,10 @@ async def get_product(product_id: str):
     try:
         # First try local DB
         product = await db.shopify_products.find_one({"id": product_id})
-        
+
         if product:
-            return Product(**product)
-        
+            return Product(**apply_cloudflare_rollout(product))
+
         # Fallback to Shopify API
         graphql_query = """
         query getProduct($id: ID!) {
