@@ -1227,10 +1227,13 @@ async def get_products(
     First run /api/sync/start to sync all 15,000+ products from Shopify.
     """
     try:
-        # Check if we have products in DB
-        product_count = await db.shopify_products.count_documents({})
+        # Check if we have any products in DB. Only presence/absence matters
+        # here (bootstrap fallback before the first Shopify sync ever runs),
+        # so avoid an unfiltered count_documents({}) full-collection scan
+        # (15,000+ docs, on every request) and just look for one document.
+        has_products = await db.shopify_products.find_one({}, {"_id": 1}) is not None
 
-        if product_count == 0:
+        if not has_products:
             # Fallback to Shopify API if no local products
             return await get_products_from_shopify(search, limit)
 
@@ -1309,9 +1312,11 @@ async def get_featured_products(limit: int = 10):
     included as a curated pick so nothing is duplicated. Curated picks are
     never bumped by the automatic fallback."""
     try:
-        product_count = await db.shopify_products.count_documents({})
+        # Same rationale as get_products() above: only need to know whether
+        # the collection is empty (bootstrap fallback), not the exact total.
+        has_products = await db.shopify_products.find_one({}, {"_id": 1}) is not None
 
-        if product_count > 0:
+        if has_products:
             curated = await db.shopify_products.find(
                 {"is_featured": True}
             ).sort("title_normalized", 1).limit(limit).to_list(limit)
