@@ -33,9 +33,11 @@ load_dotenv(ROOT_DIR / '.env', override=False)
 # idle-capable connections from a single-worker process is more than this
 # app's actual concurrency needs (each request holds a connection only
 # briefly, being I/O-bound async). 20 leaves headroom for agb-crm and for
-# any future horizontal scaling of this service.
+# any future horizontal scaling of this service. Configurable via
+# MONGO_MAX_POOL_SIZE for staging load testing; defaults to 20 so
+# production is unaffected unless the env var is explicitly set there.
 mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url, maxPoolSize=20)
+client = AsyncIOMotorClient(mongo_url, maxPoolSize=int(os.environ.get("MONGO_MAX_POOL_SIZE", "20")))
 db = client[os.environ['DB_NAME']]
 
 # Shopify Configuration - loaded from environment
