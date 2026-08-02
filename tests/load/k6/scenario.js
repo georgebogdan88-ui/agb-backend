@@ -45,7 +45,10 @@ function extractFirstProductId(html) {
 }
 
 function extractImageUrl(html) {
-  const match = html.match(/https:\/\/res\.cloudinary\.com\/[^"'\s]+\.(?:png|jpg|jpeg|webp)/i);
+  // Generic (not Cloudinary-specific) - scripts/seed_staging_data.py uses
+  // Lorem Picsum placeholder images for staging, so production's
+  // Cloudinary and a freshly-seeded staging DB both match this.
+  const match = html.match(/https:\/\/[^\s"'<>]+\.(?:png|jpg|jpeg|webp)/i);
   return match ? match[0] : null;
 }
 

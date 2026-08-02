@@ -59,6 +59,11 @@ export const TEST_USER_COUNT = parseInt(__ENV.TEST_USER_COUNT || "1000", 10);
 // A handful of representative synthetic product IDs to search/browse/order
 // - populate via --env SEARCH_TERMS=... / PRODUCT_IDS=... or edit the
 // fallback list below once the synthetic catalog is seeded.
-export const SEARCH_TERMS = (__ENV.SEARCH_TERMS || "filtru,pompa,DZ100001,rulment,cuzineti").split(",");
+// Defaults match scripts/seed_staging_data.py's synthetic catalog exactly
+// (generic Romanian part-type words that appear in every generated title,
+// plus one specific SEED###### code guaranteed to exist once seeded) - so
+// an out-of-the-box run against a freshly-seeded staging DB gets real
+// search hits instead of empty results.
+export const SEARCH_TERMS = (__ENV.SEARCH_TERMS || "filtru,pompa,SEED100001,rulment,cuzineti").split(",");
 export const COLLECTIONS = (__ENV.COLLECTIONS || "Piese noi,Piese din dezmembrare").split(",");
 export const PRODUCT_IDS = (__ENV.PRODUCT_IDS || "").split(",").filter(Boolean);
