@@ -27,6 +27,24 @@ ROOT_DIR = Path(__file__).parent
 # Load .env but don't override existing environment variables (important for Render deployment)
 load_dotenv(ROOT_DIR / '.env', override=False)
 
+# Staging safety flag. Defaults to "production" (today's actual behavior,
+# unchanged) when unset - production's .env has no ENVIRONMENT var today,
+# so this is purely additive. A staging deployment must set
+# ENVIRONMENT=staging explicitly to get the protections below; there is no
+# way to get staging-safe behavior by accident, only by omission (i.e. the
+# safe direction to fail in is "acts like production", which is already
+# what happens today).
+#
+# This is deliberately NOT a substitute for using separate staging
+# infrastructure (separate DB, no real Shopify/Firebase/Brevo credentials
+# - see tests/load/k6/README.md and the staging plan) - it's a second,
+# independent layer: even if a staging deploy ends up with a real
+# credential in it by mistake, these specific high-consequence actions
+# (real Shopify orders, real push notifications, real customer emails)
+# still refuse to fire.
+ENVIRONMENT = os.environ.get('ENVIRONMENT', 'production').strip().lower()
+IS_STAGING = ENVIRONMENT == 'staging'
+
 # MongoDB connection
 # maxPoolSize explicit (was left at the driver default of 100) - this
 # process shares a ~500-connection Atlas M0 budget with agb-crm, and 100
@@ -5307,6 +5325,11 @@ class ShopifyOrderCreate(BaseModel):
 @api_router.post("/shopify/orders/create")
 async def create_shopify_order(order_data: ShopifyOrderCreate):
     """Create an order directly in Shopify using Admin API"""
+    if IS_STAGING:
+        raise HTTPException(
+            status_code=503,
+            detail="Crearea de comenzi Shopify este dezactivată în mediul de staging.",
+        )
     admin_token = await get_shopify_admin_token()
     
     if not admin_token:
@@ -5567,6 +5590,15 @@ async def _migrate_legacy_single_token_users():
 async def startup_event():
     """Start background tasks on app startup"""
     global auto_sync_task, crm_reconciliation_task
+
+    if IS_STAGING:
+        logger.warning(
+            "=" * 60 + "\n"
+            "STAGING ENVIRONMENT (ENVIRONMENT=staging)\n"
+            "Shopify order creation, push notifications, and outbound\n"
+            "customer email are all disabled at the application level,\n"
+            "regardless of what credentials are configured.\n" + "=" * 60
+        )
 
     try:
         await db.users.create_index("email", unique=True)
@@ -6015,6 +6047,11 @@ async def create_shopify_order(request: CreateShopifyOrderRequest):
     Create an order directly in Shopify Admin using the Admin API.
     This will make the order appear in Shopify's Orders dashboard.
     """
+    if IS_STAGING:
+        raise HTTPException(
+            status_code=503,
+            detail="Crearea de comenzi Shopify este dezactivată în mediul de staging.",
+        )
     token = await get_admin_access_token()
     
     if not token:
@@ -6408,6 +6445,9 @@ async def get_push_tokens_count():
 
 async def send_push_notification(title: str, body: str, data: dict = None):
     """Send push notification to all registered devices using Firebase Cloud Messaging"""
+    if IS_STAGING:
+        logger.info("Push notification skipped (ENVIRONMENT=staging): %r", title)
+        return 0
     try:
         import firebase_admin
         from firebase_admin import credentials, messaging
@@ -6738,6 +6778,9 @@ async def debug_customer_notes(email: str, request: Request):
 
 async def send_blog_notification_email(recipient_email: str, recipient_name: str, blog_title: str, blog_excerpt: str, blog_url: str):
     """Send email notification about new blog post using Brevo API"""
+    if IS_STAGING:
+        logger.info("Blog notification email skipped (ENVIRONMENT=staging): %s", recipient_email)
+        return False
     try:
         if not BREVO_API_KEY:
             logger.warning("BREVO_API_KEY not set - skipping email")
