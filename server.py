@@ -271,6 +271,25 @@ class EquipmentUpdate(BaseModel):
     front_axle_model: Optional[str] = None
     features: Optional[List[str]] = None
 
+class EquipmentFromCrm(BaseModel):
+    """Inbound payload for POST /integrations/equipment-from-crm - the
+    reverse direction of sync_equipment_to_crm: CRM staff add/edit a
+    tractor on a client record and it should land on that client's web/
+    mobile account equipment list, if they have one. Field names already
+    match our own Equipment fields 1:1 (no renaming needed on this side)."""
+    client_phone: Optional[str] = None
+    client_email: Optional[str] = None
+    client_name: Optional[str] = None
+    crm_tractor_id: str
+    brand: Optional[str] = None
+    model: str
+    chassis_serial: Optional[str] = None
+    engine_serial: Optional[str] = None
+    engine_type: Optional[str] = None
+    transmission_type: Optional[str] = None
+    front_axle_model: Optional[str] = None
+    features: Optional[List[str]] = None
+
 class CustomerInterestCreate(BaseModel):
     """Add-interest request body for POST /auth/interests (favorite /
     price alert / stock alert toggle on a product page)."""
@@ -1943,8 +1962,67 @@ async def create_shopify_checkout(request: CheckoutRequest):
 
 # ==================== AUTH ENDPOINTS ====================
 
+async def sync_account_to_crm(user: dict) -> None:
+    """Fire-and-forget: push a newly registered account (webshop or mobile -
+    both go through this same /auth/register endpoint) into agb-crm as a
+    client record.
+
+    Must never raise - any failure (missing config, timeout, connection
+    error, 4xx/5xx) is logged and swallowed so it can't affect the account
+    that was already created and returned to the client. Mirrors
+    sync_order_to_crm / sync_interest_to_crm.
+    """
+    if not CRM_API_URL or not CRM_INTEGRATION_KEY:
+        logger.error("CRM sync skipped for new account %s: CRM_API_URL/CRM_INTEGRATION_KEY not configured", user.get("id"))
+        return
+
+    is_company = bool(user.get("is_company"))
+    company_street = (user.get("company_address_strada") or "").strip()
+
+    payload = {
+        "nume": user.get("name"),
+        "email": user.get("email"),
+        "telefon": user.get("phone"),
+        "denumire_societate": user.get("company_name") if is_company else None,
+        "cui": user.get("cui") if is_company else None,
+        "adresa_strada": user.get("address_strada"),
+        "adresa_numar": user.get("address_numar"),
+        "adresa_bloc": user.get("address_bloc"),
+        "adresa_scara": user.get("address_scara"),
+        "adresa_ap": user.get("address_ap"),
+        "adresa_oras": user.get("city"),
+        "adresa_judet": user.get("county"),
+        "adresa_cod_postal": user.get("postal_code"),
+        "company_address": {
+            "strada": user.get("company_address_strada"),
+            "numar": user.get("company_address_numar"),
+            "bloc": user.get("company_address_bloc"),
+            "scara": user.get("company_address_scara"),
+            "ap": user.get("company_address_ap"),
+            "oras": user.get("company_address_oras"),
+            "judet": user.get("company_address_judet"),
+            "cod_postal": user.get("company_address_cod_postal"),
+        } if is_company and company_street else None,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as http_client:
+            response = await http_client.post(
+                f"{CRM_API_URL}/integrations/clients",
+                json=payload,
+                headers={"X-Integration-Key": CRM_INTEGRATION_KEY},
+            )
+            if response.status_code >= 400:
+                logger.error(
+                    "CRM account sync failed for user %s: HTTP %s - %s",
+                    user.get("id"), response.status_code, response.text,
+                )
+    except Exception as e:
+        logger.error("CRM account sync failed for user %s: %s", user.get("id"), e)
+
+
 @api_router.post("/auth/register")
-async def register_user(user_data: UserRegister):
+async def register_user(user_data: UserRegister, background_tasks: BackgroundTasks):
     """Register a new user - fully local account, independent of Shopify"""
 
     email = user_data.email.lower().strip()
@@ -2002,6 +2080,8 @@ async def register_user(user_data: UserRegister):
         if "duplicate key" in str(e).lower():
             raise HTTPException(status_code=400, detail="Adresa de email este deja înregistrată")
         raise
+
+    background_tasks.add_task(sync_account_to_crm, user)
 
     return {
         "token": local_token,
@@ -2484,7 +2564,7 @@ async def shopify_customer_login(credentials: ShopifyCustomerLogin):
     return await _authenticate_user(credentials.email, credentials.password)
 
 @api_router.put("/auth/me")
-async def update_current_user(request: Request, update_data: UserUpdate):
+async def update_current_user(request: Request, update_data: UserUpdate, background_tasks: BackgroundTasks):
     """Update current user profile"""
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
@@ -2547,6 +2627,11 @@ async def update_current_user(request: Request, update_data: UserUpdate):
 
     # Fetch updated user
     updated_user = await db.users.find_one({"id": user["id"]})
+
+    # Sync to CRM (fire-and-forget, never blocks/fails the response above) -
+    # uses the freshly-fetched post-update document so the new address/company
+    # data actually reaches CRM instead of the stale pre-update one.
+    background_tasks.add_task(sync_account_to_crm, updated_user)
 
     return _serialize_user(updated_user)
 
@@ -4050,6 +4135,11 @@ def _equipment_match_key(model: str, chassis_serial: str) -> tuple:
 async def parse_equipment_from_shopify_notes(notes: str, existing_equipment: list = None) -> list:
     """Parse equipment from Shopify customer notes format.
 
+    NOTE: no longer used by GET /auth/equipment (that resync-from-Shopify
+    path was removed - see get_user_equipment below for why). Still used by
+    the admin-only GET /debug/customer-notes/{email} diagnostic endpoint,
+    kept as-is for that.
+
     Re-parses on every read (so admin edits made directly in Shopify notes
     show up), but reuses the id/created_at of any existing local entry that
     matches by (model, chassis_serial) instead of always minting a fresh
@@ -4299,43 +4389,36 @@ async def sync_equipment_to_shopify_notes(user_email: str, equipment_list: list)
 
 @api_router.get("/auth/equipment")
 async def get_user_equipment(request: Request):
-    """Get all equipment for authenticated user - syncs from Shopify if notes changed"""
+    """Get all equipment for authenticated user, straight from Mongo.
+
+    Used to also re-derive the list from Shopify customer notes on every
+    call ("ALWAYS prioritize Shopify data") and overwrite equipment[] with
+    that - removed. That path predates this app having its own equipment
+    CRUD + CRM sync; Shopify customers have no way to add/edit equipment
+    themselves through Shopify, so it was never a real second source of
+    truth, only a latent bug source: the notes text format can't represent
+    CRM-only fields like crm_tractor_id, so every resync silently dropped
+    it (and could even swap an entry's id if the notes round-trip failed to
+    match it back to the existing local entry) - breaking the CRM-side
+    create-vs-update idempotency check the moment it happened. The other
+    direction (local equipment -> Shopify notes, sync_equipment_to_shopify_notes,
+    still called from POST/PUT /auth/equipment) is unaffected and stays -
+    that one only ever writes outward, so it can't stomp on local data.
+    """
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Token lipsă sau invalid")
-    
+
     token = auth_header.replace("Bearer ", "")
     # Search by both credential types (our own multi-device tokens/legacy
     # single token, and Shopify access token)
     user = await _find_user_by_token(token, allow_shopify_access_token=True)
-    
+
     if not user:
         raise HTTPException(status_code=401, detail="Token invalid sau expirat")
-    
-    # Get equipment from user's equipment array
+
     local_equipment = user.get("equipment", [])
-    
-    # Try to sync from Shopify notes - ALWAYS prioritize Shopify data
-    try:
-        shopify_notes = await get_shopify_customer_notes(user.get("email", ""))
-        logger.info(f"Shopify notes for {user.get('email')}: {shopify_notes[:200] if shopify_notes else 'empty'}...")
-        
-        if shopify_notes and "UTILAJELE CLIENTULUI:" in shopify_notes:
-            shopify_equipment = await parse_equipment_from_shopify_notes(shopify_notes, local_equipment)
-            logger.info(f"Parsed {len(shopify_equipment)} equipment from Shopify notes")
-            
-            if shopify_equipment:
-                # Always update from Shopify if notes contain equipment data
-                # This ensures edits made in Shopify are reflected in the app
-                await db.users.update_one(
-                    {"_id": user["_id"]},
-                    {"$set": {"equipment": shopify_equipment}}
-                )
-                local_equipment = shopify_equipment
-                logger.info(f"Synced equipment from Shopify for {user.get('email')}")
-    except Exception as e:
-        logger.error(f"Error syncing from Shopify: {e}")
-    
+
     # Convert None values to empty strings for frontend
     cleaned_equipment = []
     for eq in local_equipment:
@@ -4355,8 +4438,111 @@ async def get_user_equipment(request: Request):
     
     return {"equipment": cleaned_equipment, "count": len(cleaned_equipment), "max_allowed": 10}
 
+async def sync_equipment_to_crm(equipment: dict, user: dict, source: str = "webshop") -> None:
+    """Fire-and-forget: push a newly added/updated equipment entry into
+    agb-crm as a tractor record tied to the owning client.
+
+    Must never raise - any failure (missing config, timeout, connection
+    error, 4xx/5xx) is logged and swallowed so it can't affect the write
+    that was already saved/returned to the client. Mirrors
+    sync_order_to_crm / sync_interest_to_crm / sync_account_to_crm.
+
+    On success, writes CRM's returned `tractor_id` back onto the local
+    equipment sub-document as `crm_tractor_id` - without this, equipment
+    added through the normal web/mobile flow (as opposed to migrated in
+    from CRM via receive_equipment_from_crm, which already sets it) would
+    never get a crm_tractor_id at all, silently breaking
+    delete_user_equipment's "only notify CRM if this equipment has a
+    crm_tractor_id" check for every normally-added tractor. Confirmed as a
+    real bug by the coordinator, fixed here.
+
+    NOTE on `source`: /auth/equipment is the exact same endpoint for both
+    webshop and mobile - there is currently no header/user-agent convention
+    in this codebase that reliably distinguishes the two callers, so this
+    defaults to "webshop" for all callers until such a signal is added.
+    """
+    if not CRM_API_URL or not CRM_INTEGRATION_KEY:
+        logger.error("CRM sync skipped for equipment %s: CRM_API_URL/CRM_INTEGRATION_KEY not configured", equipment.get("id"))
+        return
+
+    payload = {
+        "source": source,
+        "source_equipment_id": equipment.get("id"),
+        "customer": {
+            "nume": user.get("name"),
+            "email": user.get("email"),
+            "telefon": user.get("phone"),
+        },
+        "brand": equipment.get("brand"),
+        "model": equipment.get("model"),
+        "chassis_serial": equipment.get("chassis_serial"),
+        "engine_serial": equipment.get("engine_serial"),
+        "engine_type": equipment.get("engine_type"),
+        "transmission_type": equipment.get("transmission_type"),
+        "front_axle_model": equipment.get("front_axle_model"),
+        "features": equipment.get("features") or [],
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as http_client:
+            response = await http_client.post(
+                f"{CRM_API_URL}/integrations/equipment",
+                json=payload,
+                headers={"X-Integration-Key": CRM_INTEGRATION_KEY},
+            )
+            if response.status_code >= 400:
+                logger.error(
+                    "CRM equipment sync failed for equipment %s: HTTP %s - %s",
+                    equipment.get("id"), response.status_code, response.text,
+                )
+                return
+
+            tractor_id = response.json().get("tractor_id")
+            if tractor_id:
+                await db.users.update_one(
+                    {"id": user["id"], "equipment.id": equipment.get("id")},
+                    {"$set": {"equipment.$.crm_tractor_id": tractor_id}},
+                )
+            else:
+                logger.warning(
+                    "CRM equipment sync for equipment %s succeeded but response had no tractor_id: %s",
+                    equipment.get("id"), response.text,
+                )
+    except Exception as e:
+        logger.error("CRM equipment sync failed for equipment %s: %s", equipment.get("id"), e)
+
+
+async def sync_equipment_delete_to_crm(crm_tractor_id: str) -> None:
+    """Fire-and-forget: tell agb-crm a web/mobile account deleted a piece of
+    equipment that was linked to a CRM tractor. Same never-raise contract as
+    sync_equipment_to_crm - only called when the equipment being deleted has
+    a crm_tractor_id at all (nothing to tell CRM about otherwise).
+
+    CRM decides on its own whether to actually delete the tractor or just
+    unlink it (e.g. if it has associated orders) - we just fire the request
+    and log/ignore the outcome, no branching needed on this side.
+    """
+    if not CRM_API_URL or not CRM_INTEGRATION_KEY:
+        logger.error("CRM delete sync skipped for tractor %s: CRM_API_URL/CRM_INTEGRATION_KEY not configured", crm_tractor_id)
+        return
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as http_client:
+            response = await http_client.delete(
+                f"{CRM_API_URL}/integrations/equipment/{crm_tractor_id}",
+                headers={"X-Integration-Key": CRM_INTEGRATION_KEY},
+            )
+            if response.status_code >= 400:
+                logger.error(
+                    "CRM equipment delete sync failed for tractor %s: HTTP %s - %s",
+                    crm_tractor_id, response.status_code, response.text,
+                )
+    except Exception as e:
+        logger.error("CRM equipment delete sync failed for tractor %s: %s", crm_tractor_id, e)
+
+
 @api_router.post("/auth/equipment")
-async def add_user_equipment(request: Request, equipment_data: EquipmentCreate):
+async def add_user_equipment(request: Request, equipment_data: EquipmentCreate, background_tasks: BackgroundTasks):
     """Add new equipment for authenticated user (max 10)"""
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
@@ -4398,11 +4584,14 @@ async def add_user_equipment(request: Request, equipment_data: EquipmentCreate):
     # Sync to Shopify
     updated_equipment = current_equipment + [new_equipment]
     await sync_equipment_to_shopify_notes(user["email"], updated_equipment)
-    
+
+    # Sync to CRM (fire-and-forget, never blocks/fails the response above)
+    background_tasks.add_task(sync_equipment_to_crm, new_equipment, user, "webshop")
+
     return {"message": "Utilaj adăugat cu succes", "equipment": new_equipment}
 
 @api_router.put("/auth/equipment/{equipment_id}")
-async def update_user_equipment(request: Request, equipment_id: str, equipment_data: EquipmentUpdate):
+async def update_user_equipment(request: Request, equipment_id: str, equipment_data: EquipmentUpdate, background_tasks: BackgroundTasks):
     """Update existing equipment"""
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
@@ -4452,41 +4641,181 @@ async def update_user_equipment(request: Request, equipment_id: str, equipment_d
     
     # Sync to Shopify
     await sync_equipment_to_shopify_notes(user["email"], equipment_list)
-    
+
+    # Sync to CRM (fire-and-forget, never blocks/fails the response above)
+    background_tasks.add_task(sync_equipment_to_crm, eq, user, "webshop")
+
     return {"message": "Utilaj actualizat cu succes", "equipment": equipment_list}
 
 @api_router.delete("/auth/equipment/{equipment_id}")
-async def delete_user_equipment(request: Request, equipment_id: str):
+async def delete_user_equipment(request: Request, equipment_id: str, background_tasks: BackgroundTasks):
     """Delete equipment"""
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Token lipsă sau invalid")
-    
+
     token = auth_header.replace("Bearer ", "")
     # Search by both credential types (our own multi-device tokens/legacy
     # single token, and Shopify access token)
     user = await _find_user_by_token(token, allow_shopify_access_token=True)
-    
+
     if not user:
         raise HTTPException(status_code=401, detail="Token invalid sau expirat")
-    
+
     # Remove equipment from list
     equipment_list = user.get("equipment", [])
+    deleted_equipment = next((eq for eq in equipment_list if eq.get("id") == equipment_id), None)
     new_equipment_list = [eq for eq in equipment_list if eq.get("id") != equipment_id]
-    
+
     if len(new_equipment_list) == len(equipment_list):
         raise HTTPException(status_code=404, detail="Utilajul nu a fost găsit")
-    
+
     # Save updated equipment list
     await db.users.update_one(
         {"_id": user["_id"]},
         {"$set": {"equipment": new_equipment_list}}
     )
-    
+
     # Sync to Shopify
     await sync_equipment_to_shopify_notes(user["email"], new_equipment_list)
-    
+
+    # Sync to CRM (fire-and-forget, never blocks/fails the response above) -
+    # only if this piece of equipment was ever linked to a CRM tractor in
+    # the first place.
+    crm_tractor_id = (deleted_equipment or {}).get("crm_tractor_id")
+    if crm_tractor_id:
+        background_tasks.add_task(sync_equipment_delete_to_crm, crm_tractor_id)
+
     return {"message": "Utilaj șters cu succes", "remaining_count": len(new_equipment_list)}
+
+# ==================== INBOUND CRM -> WEB/MOBILE EQUIPMENT SYNC ====================
+# Reverse direction of sync_equipment_to_crm above: CRM staff add/edit a
+# tractor directly on a client's CRM record, and it should land on that
+# client's web/mobile account equipment list automatically, if they have
+# one. Authenticated the same way agb-crm authenticates our outbound calls
+# to it (X-Integration-Key), except here *we* are the ones checking it -
+# confirmed with the coordinator that CRM_INTEGRATION_KEY (this repo's
+# .env) and CRM's own INTEGRATION_API_KEY are the same value, so no new
+# secret was introduced for this.
+
+def _require_crm_integration_key(request: Request) -> None:
+    incoming = request.headers.get("X-Integration-Key", "")
+    if not CRM_INTEGRATION_KEY or not secrets.compare_digest(incoming, CRM_INTEGRATION_KEY):
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Integration-Key")
+
+
+@api_router.post("/integrations/equipment-from-crm")
+async def receive_equipment_from_crm(request: Request, payload: EquipmentFromCrm):
+    """Create/update a piece of equipment on a client's web/mobile account
+    from a CRM-side add/edit, matching the client by email when present,
+    falling back to phone ONLY when the payload has no email at all - same
+    priority rule as CRM's own _resolve_or_create_client (updated on their
+    side to prioritize email over phone for source in ("webshop","mobile")).
+
+    Critically, phone is NOT a fallback for "email didn't match" - only for
+    "email wasn't provided". A failed email lookup must not silently fall
+    through to a phone match, since a phone number can be legitimately
+    shared (e.g. a company phone reused on a separate personal test
+    account) and matching on it in that case would attach the wrong
+    person's equipment to the wrong account. Confirmed with the coordinator
+    after a real mismatch caused by this exact scenario. Matching itself is
+    still an exact string comparison against stored users.phone/email - no
+    phone-format normalization on this side.
+
+    Idempotency key is `crm_tractor_id`, stored on the matched equipment
+    sub-document (new field, mirrors `web_equipment_id` on CRM's side of
+    this same loop) so repeated calls for the same tractor update in place
+    instead of duplicating.
+
+    Deliberately does NOT call sync_equipment_to_crm for the write made
+    here - this is the one path in the whole equipment sync loop that must
+    not echo back to CRM, or every inbound sync would immediately trigger
+    an outbound one back at CRM for the same tractor.
+    """
+    _require_crm_integration_key(request)
+
+    user = None
+    if payload.client_email:
+        user = await db.users.find_one({"email": payload.client_email.lower().strip()})
+    elif payload.client_phone:
+        user = await db.users.find_one({"phone": payload.client_phone})
+
+    if not user:
+        return {"status": "no_matching_account", "equipment_id": None}
+
+    equipment_list = user.get("equipment", [])
+    existing = next((eq for eq in equipment_list if eq.get("crm_tractor_id") == payload.crm_tractor_id), None)
+
+    equipment_fields = {
+        "brand": payload.brand,
+        "model": payload.model,
+        "chassis_serial": payload.chassis_serial,
+        "engine_serial": payload.engine_serial,
+        "engine_type": payload.engine_type,
+        "transmission_type": payload.transmission_type,
+        "front_axle_model": payload.front_axle_model,
+        "features": payload.features or [],
+    }
+
+    if existing:
+        existing.update(equipment_fields)
+        await db.users.update_one(
+            {"_id": user["_id"]},
+            {"$set": {"equipment": equipment_list}}
+        )
+        await sync_equipment_to_shopify_notes(user["email"], equipment_list)
+        return {"status": "updated", "equipment_id": existing["id"]}
+
+    if len(equipment_list) >= 10:
+        logger.warning(
+            "CRM equipment sync: user %s already has 10 equipment entries, "
+            "cannot add crm_tractor_id %s", user.get("id"), payload.crm_tractor_id,
+        )
+        return {"status": "equipment_limit_reached", "equipment_id": None}
+
+    new_equipment = {
+        "id": str(uuid.uuid4()),
+        "crm_tractor_id": payload.crm_tractor_id,
+        **equipment_fields,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {"$push": {"equipment": new_equipment}}
+    )
+    await sync_equipment_to_shopify_notes(user["email"], equipment_list + [new_equipment])
+    return {"status": "created", "equipment_id": new_equipment["id"]}
+
+
+@api_router.delete("/integrations/equipment/{equipment_id}")
+async def receive_equipment_delete_from_crm(request: Request, equipment_id: str):
+    """CRM staff deleted a tractor linked to a web/mobile account - remove
+    the matching entry from that account's equipment[]. CRM only calls this
+    once it's already confirmed the tractor is safe to delete (blocked on
+    their side if it has associated orders), so no branching needed here.
+
+    `equipment_id` here is OUR equipment sub-document id (what
+    receive_equipment_from_crm/sync_equipment_to_crm returned/sent as
+    equipment_id/source_equipment_id - stored by CRM as web_equipment_id),
+    not crm_tractor_id - it's already globally unique, so no
+    phone/email lookup is needed, unlike the create/update endpoint above.
+    """
+    _require_crm_integration_key(request)
+
+    user = await db.users.find_one({"equipment.id": equipment_id})
+    if not user:
+        return {"status": "not_found"}
+
+    equipment_list = user.get("equipment", [])
+    new_equipment_list = [eq for eq in equipment_list if eq.get("id") != equipment_id]
+
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {"$set": {"equipment": new_equipment_list}}
+    )
+    await sync_equipment_to_shopify_notes(user["email"], new_equipment_list)
+
+    return {"status": "deleted"}
 
 # ==================== EQUIPMENT OPTIONS (admin-managed dropdown/checkbox lists) ====================
 # Powers the transmission-type / front-axle-model / features dropdown and
