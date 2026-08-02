@@ -6084,6 +6084,48 @@ async def startup_event():
     except Exception:
         logger.exception("Failed to create unique index on customer_interests")
 
+    # Perf fix (250-concurrent-user staging latency investigation,
+    # 2026-08-02): `id` is looked up via find_one({"id": ...}) all over the
+    # product endpoints (get_product, admin update/delete, cart pricing,
+    # equivalent/complementary lookups, etc.) - without an index each lookup
+    # is a full collection scan. Not marked unique: manual product creation
+    # (_apply "manual" create) generates the id via uuid4() but never checks
+    # for a pre-existing duplicate before inserting, so uniqueness isn't
+    # actually guaranteed by the data/app layer today.
+    try:
+        await db.shopify_products.create_index("id")
+    except Exception:
+        logger.exception("Failed to create index on shopify_products.id")
+
+    # Home/featured product queries filter on is_featured (see the curated
+    # picks logic) - without this, each one scans the whole catalog.
+    try:
+        await db.shopify_products.create_index("is_featured")
+    except Exception:
+        logger.exception("Failed to create index on shopify_products.is_featured")
+
+    # Stock-based filtering/sorting (in-stock vs out-of-stock curated picks,
+    # stock > 0 / == 0 queries) - without this, each one scans the whole
+    # catalog.
+    try:
+        await db.shopify_products.create_index("stock")
+    except Exception:
+        logger.exception("Failed to create index on shopify_products.stock")
+
+    # Account order history (GET /auth/orders) filters by customer.email -
+    # without this, each request scans the whole orders collection.
+    try:
+        await db.orders.create_index("customer.email")
+    except Exception:
+        logger.exception("Failed to create index on orders.customer.email")
+
+    # GET /orders/{session_id} filters by session_id - without this, each
+    # request scans the whole orders collection.
+    try:
+        await db.orders.create_index("session_id")
+    except Exception:
+        logger.exception("Failed to create index on orders.session_id")
+
     # Must run before the app starts accepting traffic under the new
     # tokens[] auth scheme - see docstring.
     await _migrate_legacy_single_token_users()
