@@ -6,6 +6,15 @@
 // match a known production hostname. This is a load test - it must only
 // ever point at a staging environment with synthetic data, never at
 // agb-backend.onrender.com or any other real production host.
+//
+// CONFIRMED PRODUCTION HARDWARE (from George, Render dashboard, not
+// assumed): agb-backend and agb-webshop each run on Render Standard -
+// 2GB RAM / 1 CPU / ~$25/mo. Staging must match this exactly (see
+// tests/load/k6/README.md "Dimensionare") - a bigger staging instance
+// would hide the single-CPU/event-loop-blocking bottleneck the
+// scalability report identified as the actual first ceiling, and a
+// smaller one would give pessimistic numbers that don't reflect what
+// production can really take.
 
 const PRODUCTION_HOSTS = [
   "agb-backend.onrender.com",

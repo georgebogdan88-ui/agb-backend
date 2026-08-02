@@ -4,6 +4,9 @@ import { userJourney } from "./scenario.js";
 // degradation (pre-fix: bcrypt event-loop blocking + unindexed token
 // lookups + regex product search). This run is the key one to compare
 // against the report's prediction now that the CPU/index fixes are live.
+// Production is confirmed Render Standard (2GB RAM / 1 CPU) for both
+// agb-backend and agb-webshop - staging must match exactly, or this
+// comparison isn't meaningful.
 export const options = {
   stages: [
     { duration: "5m", target: 250 },

@@ -8,6 +8,14 @@ Scripturi pregătite conform planului din auditul de scalabilitate. **Nimic din 
 
 Scripturile refuză singure să ruleze dacă `WEBSHOP_URL`/`BACKEND_URL` par a fi domenii de producție (`agb-backend.onrender.com` etc.) — vezi `config.js`.
 
+## Dimensionare staging (obligatoriu de respectat)
+
+Producția reală (confirmată direct din dashboard-ul Render, nu presupusă): `agb-backend` și `agb-webshop` rulează fiecare pe **Render Standard — 2GB RAM / 1 CPU / ~$25/lună**.
+
+**Staging-ul trebuie să folosească exact același plan Standard (2GB/1 CPU) pentru ambele servicii** — nu un plan mai mic (ar da rezultate fals-pesimiste) și nu un plan mai mare (ar ascunde exact blocajul de "1 singur CPU" pe care raportul de scalabilitate l-a identificat ca prima limitare reală, prin apeluri `bcrypt` sincrone care blochează tot event loop-ul). Cu Standard identic producției, rezultatele k6 sunt direct comparabile cu ce rulează azi live.
+
+Cost estimat pentru toată seria de teste (25→1000 + spike + soak, rulate pe parcursul a câtorva zile, servicii oprite după): **~$10-25** pentru partea Render (facturare pe zi, nu lunar), plus opțional ~$57-58 dacă se testează și un upgrade Atlas M0→M10 pentru comparație. Vezi planul complet de staging pentru detalii (variabile de mediu, protecții, date sintetice).
+
 ## Fișiere
 
 | Fișier | Ce face |

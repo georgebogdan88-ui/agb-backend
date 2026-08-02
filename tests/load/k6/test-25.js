@@ -4,6 +4,10 @@ import { userJourney } from "./scenario.js";
 // tier should show no issues at all; this run mainly confirms the test
 // setup itself (staging env, synthetic data, script) works correctly
 // before moving to heavier tiers.
+//
+// Staging must run on Render Standard (2GB RAM / 1 CPU) - confirmed as
+// the exact production spec for agb-backend/agb-webshop, not assumed.
+// See tests/load/k6/README.md "Dimensionare".
 export const options = {
   stages: [
     { duration: "1m", target: 25 }, // ramp up

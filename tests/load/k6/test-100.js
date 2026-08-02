@@ -3,7 +3,10 @@ import { userJourney } from "./scenario.js";
 // 100 concurrent users - per the report, should still be stable, but this
 // is where the first signs of pressure (bcrypt-related stalls, before the
 // scalability fixes; now testing whether those fixes actually held) might
-// start to show under a concentrated login burst.
+// start to show under a concentrated login burst - more so than initially
+// estimated, since production is confirmed single-CPU (Render Standard,
+// 2GB/1 CPU), not the 2-CPU instance the original estimate assumed. A
+// threshold failure at this tier is meaningful signal, not just noise.
 export const options = {
   stages: [
     { duration: "3m", target: 100 },

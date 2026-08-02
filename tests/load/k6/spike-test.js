@@ -5,7 +5,10 @@ import { userJourney } from "./scenario.js";
 // behavior under a sharp step, not just gradual ramping - a system can
 // handle 500 fine when ramped over 5 minutes and still fall over when it
 // arrives in 20 seconds, because connection pools/caches/autoscaling (if
-// any) don't have time to react.
+// any) don't have time to react. Production is single-CPU per instance
+// (Render Standard, confirmed) - a sharp spike is exactly the scenario
+// where that shows up worst, since there's no second core to absorb the
+// sudden burst of concurrent bcrypt/request-handling work.
 export const options = {
   stages: [
     { duration: "1m", target: 50 }, // baseline
