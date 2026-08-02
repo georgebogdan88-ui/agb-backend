@@ -1021,30 +1021,61 @@ def build_products_query(
 
                     regex_conditions.append({"$or": model_conditions})
                 else:
-                    # For regular terms (non-model numbers)
-                    # Short terms (<=4 chars) should use word boundaries to avoid false matches
-                    # e.g., "usa" should not match inside other words like "caUzA"
-                    if len(term) <= 4:
-                        # Short terms - search with word boundary, prioritize title
-                        regex_conditions.append({
-                            "$or": [
-                                {"title_normalized": {"$regex": f"\\b{term}\\b", "$options": "i"}},
-                                {"description_normalized": {"$regex": f"\\b{term}\\b", "$options": "i"}},
-                                {"sku": {"$regex": f"\\b{term}\\b", "$options": "i"}},
-                                {"collections_normalized": {"$regex": f"\\b{term}\\b", "$options": "i"}}
-                            ]
-                        })
+                    # For regular terms (non-model numbers): always anchor
+                    # the START of the term on a word boundary, regardless
+                    # of length.
+                    #
+                    # This used to be split by length - short terms (<=4
+                    # chars) got full word boundaries (\b...\b), longer terms
+                    # searched as a raw, unanchored substring. That split was
+                    # itself meant to fix false positives (e.g. "usa"
+                    # matching inside "caUzA" - see commit 14deda9), but it
+                    # only patched the <=4 char case. Part codes like
+                    # "AL17256" are 7+ chars, so they fell into the unbounded
+                    # branch, and a search for "AL17256" would also match
+                    # "AL172568", "AL172562", ... (any longer code sharing
+                    # the same prefix) - a real wrong-part-ordered risk for a
+                    # webshop selling by exact code.
+                    #
+                    # Whether the END is also anchored depends on the term:
+                    #   - Terms with a digit are treated as part/model codes
+                    #     (e.g. "AL17256"), any length, and get a full
+                    #     \b{term}\b on both ends, so "AL17256" cannot match
+                    #     inside "AL172568".
+                    #   - Purely alphabetic terms of 5+ chars are treated as
+                    #     ordinary Romanian words and only get the term
+                    #     anchored on the left (\b{term}, no trailing \b), so
+                    #     inflected forms still match - e.g. "hidraulic"
+                    #     still finds "hidraulica", "rulment" still finds
+                    #     "rulmenti", "filtru"/"motor" still find "filtrul"/
+                    #     "motorului" while still excluding unrelated
+                    #     compound words like "prefiltru"/"servomotor" (no
+                    #     boundary right before "filtru"/"motor" there).
+                    #   - Purely alphabetic terms under 5 chars (e.g. "AL",
+                    #     "RE", "SE", "AR", "VPJ", "VPD", "VPH") get a full
+                    #     \b{term}\b on both ends too: these are exactly the
+                    #     short manufacturer/part-family code prefixes real
+                    #     customers search for, and without the trailing
+                    #     anchor they'd also match as a left-anchored prefix
+                    #     of unrelated ordinary words (e.g. "SE" as a prefix
+                    #     of "seria", which appears in most descriptions),
+                    #     making the search return almost the entire catalog
+                    #     for a 2-3 letter query. This restores the original,
+                    #     safe both-ends-anchored behaviour for those terms.
+                    has_digit = bool(re.search(r'\d', term))
+                    if has_digit or len(term) < 5:
+                        term_regex = f"\\b{term}\\b"
                     else:
-                        # Longer terms - search normally (including collections)
-                        regex_conditions.append({
-                            "$or": [
-                                {"title_normalized": {"$regex": term, "$options": "i"}},
-                                {"description_normalized": {"$regex": term, "$options": "i"}},
-                                {"compatible_models": {"$regex": term, "$options": "i"}},
-                                {"sku": {"$regex": term, "$options": "i"}},
-                                {"collections_normalized": {"$regex": term, "$options": "i"}}
-                            ]
-                        })
+                        term_regex = f"\\b{term}"
+                    regex_conditions.append({
+                        "$or": [
+                            {"title_normalized": {"$regex": term_regex, "$options": "i"}},
+                            {"description_normalized": {"$regex": term_regex, "$options": "i"}},
+                            {"compatible_models": {"$regex": term_regex, "$options": "i"}},
+                            {"sku": {"$regex": term_regex, "$options": "i"}},
+                            {"collections_normalized": {"$regex": term_regex, "$options": "i"}}
+                        ]
+                    })
 
             if regex_conditions:
                 query["$and"] = regex_conditions
