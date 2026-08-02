@@ -961,6 +961,32 @@ SORT_FIELDS = {
 }
 
 
+def _term_to_spaced_regex(term: str) -> str:
+    """Turns a search term into a regex fragment that also matches the same
+    characters with an optional space inserted at each letter->digit
+    transition (e.g. "8r410" -> "8r\\s*410").
+
+    `compatible_models` stores John Deere's native R/RT/RX/M/T-series codes
+    with a space between the series letters and the model number (e.g.
+    "8R 410", "9RT 470", "6M 105", "6R 110" - confirmed against real data).
+    A customer typing "8r410" with no space would otherwise never match
+    "8R 410" contiguously, while typing "8r 410" happens to work today only
+    because it becomes two independent terms. This makes both spellings
+    behave the same, matching with zero or more spaces at that boundary.
+
+    Only the letter->digit transition gets the optional space. The reverse
+    (digit->letter, e.g. a hypothetical "410 R") does not occur in the real
+    data - suffixes like "R"/"RT" are always glued directly to the model
+    number (e.g. "8320R", "8310R") - so it is intentionally left alone.
+    """
+    parts = []
+    for i, ch in enumerate(term):
+        if i > 0 and term[i - 1].isalpha() and ch.isdigit():
+            parts.append(r"\s*")
+        parts.append(re.escape(ch))
+    return "".join(parts)
+
+
 def build_products_query(
     search: Optional[str],
     product_type: Optional[str],
@@ -992,6 +1018,45 @@ def build_products_query(
         if premium_matches:
             search_terms = [t for t in search_terms if t.lower() != 'premium']
 
+        # Re-merge a split series/model code (e.g. user typed "8r 410" as two
+        # words) back into one term ("8r410") before building regexes below.
+        #
+        # Without this, "8r" and "410" would become two independent \b..\b
+        # conditions ANDed together, each allowed to match a *different*
+        # element of the `compatible_models` array - e.g. a product listing
+        # both "8R 340" and "8RT 410" (but not "8R 410") would wrongly match,
+        # since "8R 340" satisfies the "8r" condition and "8RT 410"
+        # separately satisfies the "410" condition, even though neither
+        # element is actually "8R 410". That's a real false positive
+        # (verified against production data - see fix/search-model-spacing).
+        #
+        # Merging first makes "8r 410" go through the exact same single-term
+        # path as an already-glued "8r410" (see _term_to_spaced_regex below),
+        # which requires the letters and digits to be adjacent (with only an
+        # optional space between them), so both spellings return identical,
+        # correctly-adjacent results.
+        #
+        # Scope is deliberately narrow to avoid merging unrelated ordinary
+        # two-word searches: only triggers when a term made purely of
+        # digits+letters (e.g. "8r", "9rt", "6m" - a partial series code) is
+        # immediately followed by a purely-numeric term.
+        merged_terms = []
+        i = 0
+        while i < len(search_terms):
+            current = search_terms[i]
+            next_term = search_terms[i + 1] if i + 1 < len(search_terms) else None
+            if (
+                next_term
+                and re.match(r'^\d+[a-z]+$', current, re.IGNORECASE)
+                and re.match(r'^\d+$', next_term)
+            ):
+                merged_terms.append(current + next_term)
+                i += 2
+            else:
+                merged_terms.append(current)
+                i += 1
+        search_terms = merged_terms
+
         if search_terms:
             # Build regex patterns for each term
             regex_conditions = []
@@ -1021,30 +1086,69 @@ def build_products_query(
 
                     regex_conditions.append({"$or": model_conditions})
                 else:
-                    # For regular terms (non-model numbers)
-                    # Short terms (<=4 chars) should use word boundaries to avoid false matches
-                    # e.g., "usa" should not match inside other words like "caUzA"
-                    if len(term) <= 4:
-                        # Short terms - search with word boundary, prioritize title
-                        regex_conditions.append({
-                            "$or": [
-                                {"title_normalized": {"$regex": f"\\b{term}\\b", "$options": "i"}},
-                                {"description_normalized": {"$regex": f"\\b{term}\\b", "$options": "i"}},
-                                {"sku": {"$regex": f"\\b{term}\\b", "$options": "i"}},
-                                {"collections_normalized": {"$regex": f"\\b{term}\\b", "$options": "i"}}
-                            ]
-                        })
+                    # For regular terms (non-model numbers): always anchor
+                    # the START of the term on a word boundary, regardless
+                    # of length.
+                    #
+                    # This used to be split by length - short terms (<=4
+                    # chars) got full word boundaries (\b...\b), longer terms
+                    # searched as a raw, unanchored substring. That split was
+                    # itself meant to fix false positives (e.g. "usa"
+                    # matching inside "caUzA" - see commit 14deda9), but it
+                    # only patched the <=4 char case. Part codes like
+                    # "AL17256" are 7+ chars, so they fell into the unbounded
+                    # branch, and a search for "AL17256" would also match
+                    # "AL172568", "AL172562", ... (any longer code sharing
+                    # the same prefix) - a real wrong-part-ordered risk for a
+                    # webshop selling by exact code.
+                    #
+                    # Whether the END is also anchored depends on the term:
+                    #   - Terms with a digit are treated as part/model codes
+                    #     (e.g. "AL17256"), any length, and get a full
+                    #     \b{term}\b on both ends, so "AL17256" cannot match
+                    #     inside "AL172568".
+                    #   - Purely alphabetic terms of 5+ chars are treated as
+                    #     ordinary Romanian words and only get the term
+                    #     anchored on the left (\b{term}, no trailing \b), so
+                    #     inflected forms still match - e.g. "hidraulic"
+                    #     still finds "hidraulica", "rulment" still finds
+                    #     "rulmenti", "filtru"/"motor" still find "filtrul"/
+                    #     "motorului" while still excluding unrelated
+                    #     compound words like "prefiltru"/"servomotor" (no
+                    #     boundary right before "filtru"/"motor" there).
+                    #   - Purely alphabetic terms under 5 chars (e.g. "AL",
+                    #     "RE", "SE", "AR", "VPJ", "VPD", "VPH") get a full
+                    #     \b{term}\b on both ends too: these are exactly the
+                    #     short manufacturer/part-family code prefixes real
+                    #     customers search for, and without the trailing
+                    #     anchor they'd also match as a left-anchored prefix
+                    #     of unrelated ordinary words (e.g. "SE" as a prefix
+                    #     of "seria", which appears in most descriptions),
+                    #     making the search return almost the entire catalog
+                    #     for a 2-3 letter query. This restores the original,
+                    #     safe both-ends-anchored behaviour for those terms.
+                    #
+                    # Additionally, terms that mix letters and digits (e.g.
+                    # "8r410", "9rt470") get an optional space inserted at
+                    # the letter->digit boundary via _term_to_spaced_regex,
+                    # so they match native-spaced codes like "8R 410" in
+                    # `compatible_models` just as well as the glued form -
+                    # see that helper's docstring for details.
+                    has_digit = bool(re.search(r'\d', term))
+                    term_pattern = _term_to_spaced_regex(term) if has_digit else term
+                    if has_digit or len(term) < 5:
+                        term_regex = f"\\b{term_pattern}\\b"
                     else:
-                        # Longer terms - search normally (including collections)
-                        regex_conditions.append({
-                            "$or": [
-                                {"title_normalized": {"$regex": term, "$options": "i"}},
-                                {"description_normalized": {"$regex": term, "$options": "i"}},
-                                {"compatible_models": {"$regex": term, "$options": "i"}},
-                                {"sku": {"$regex": term, "$options": "i"}},
-                                {"collections_normalized": {"$regex": term, "$options": "i"}}
-                            ]
-                        })
+                        term_regex = f"\\b{term_pattern}"
+                    regex_conditions.append({
+                        "$or": [
+                            {"title_normalized": {"$regex": term_regex, "$options": "i"}},
+                            {"description_normalized": {"$regex": term_regex, "$options": "i"}},
+                            {"compatible_models": {"$regex": term_regex, "$options": "i"}},
+                            {"sku": {"$regex": term_regex, "$options": "i"}},
+                            {"collections_normalized": {"$regex": term_regex, "$options": "i"}}
+                        ]
+                    })
 
             if regex_conditions:
                 query["$and"] = regex_conditions
