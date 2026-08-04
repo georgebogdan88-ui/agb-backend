@@ -3327,6 +3327,21 @@ async def admin_create_product(request: Request, product_data: ProductCreate):
     await db.shopify_products.insert_one(product)
     return Product(**product)
 
+_CLOUDFLARE_DELIVERY_URL_RE = re.compile(r"^https://imagedelivery\.net/[^/]+/([^/]+)/[^/]+$")
+
+def _extract_cloudflare_image_id(url: Optional[str]) -> Optional[str]:
+    """Pulls the Cloudflare Images id out of one of our own delivery URLs
+    (https://imagedelivery.net/{account_hash}/{image_id}/{variant}), or
+    returns None if `url` isn't a Cloudflare Images delivery URL at all
+    (e.g. a Cloudinary URL or some other externally-pasted link). Used by
+    _apply_product_update() below to keep cf_image_id/cf_image_url in sync
+    whenever an update changes image_url directly."""
+    if not url:
+        return None
+    match = _CLOUDFLARE_DELIVERY_URL_RE.match(url)
+    return match.group(1) if match else None
+
+
 async def _apply_product_update(product_id: str, product_data: ProductUpdate) -> Optional[dict]:
     """Applies a partial ProductUpdate to a single product by id - shared by
     the single-product and bulk update endpoints so the two code paths can't
@@ -3338,6 +3353,35 @@ async def _apply_product_update(product_id: str, product_data: ProductUpdate) ->
 
     update_dict = {k: v for k, v in product_data.dict().items() if v is not None}
     category = update_dict.pop("category", None)
+
+    # Keep cf_image_id/cf_image_url in sync whenever this update actually
+    # changes image_url. This endpoint is the ONLY way the admin webshop's
+    # ProductForm saves a new image (its upload call never sends product_id,
+    # so the /admin/upload-image sync added for the L79232 fix never fires
+    # in that flow) - without this, apply_cloudflare_rollout() would keep
+    # overwriting image_url with the OLD cf_image_url on every read for any
+    # product with cloudflare_rollout=True, silently reverting whatever
+    # image was just saved here. See apply_cloudflare_rollout() above for
+    # the read-side half of this.
+    if "image_url" in update_dict and update_dict["image_url"] != existing.get("image_url"):
+        new_image_url = update_dict["image_url"]
+        cf_image_id = _extract_cloudflare_image_id(new_image_url)
+        if cf_image_id:
+            # Already a Cloudflare delivery URL (e.g. pasted from a prior
+            # upload) - sync cf_image_id/cf_image_url to match it exactly
+            # and make sure rollout is on, so apply_cloudflare_rollout()
+            # serves exactly this image on every subsequent read.
+            update_dict["cf_image_id"] = cf_image_id
+            update_dict["cf_image_url"] = new_image_url
+            update_dict["cloudflare_rollout"] = True
+        else:
+            # Not a Cloudflare URL (external link, Cloudinary, etc) - turn
+            # rollout off so apply_cloudflare_rollout() doesn't silently
+            # overwrite this newly-saved image_url with a stale/unrelated
+            # cf_image_url on the next read. cf_image_id/cf_image_url are
+            # deliberately left untouched (not cleared) in case rollout is
+            # re-enabled for this product later.
+            update_dict["cloudflare_rollout"] = False
     if "title" in update_dict:
         update_dict["title_normalized"] = normalize_text(update_dict["title"])
         update_dict["handle"] = slugify(update_dict["title"])
