@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Query, BackgroundTasks, Request, UploadFile, File, Body
+from fastapi import FastAPI, APIRouter, HTTPException, Query, BackgroundTasks, Request, UploadFile, File, Form, Body
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
@@ -61,13 +61,34 @@ CRM_INTEGRATION_KEY = os.environ.get('CRM_INTEGRATION_KEY', '')
 # Auto-sync configuration
 AUTO_SYNC_INTERVAL_MINUTES = int(os.environ.get('AUTO_SYNC_INTERVAL_MINUTES', '5'))  # Default 5 minutes
 
-# Cloudinary configuration (admin product image uploads)
+# Cloudinary configuration - legacy, only still used by the one-off
+# Shopify-CDN -> Cloudinary bulk migration below (POST /admin/migrate-images,
+# db.shopify_products has 0 cdn.shopify.com image_url left as of this
+# writing). New admin image uploads go straight to Cloudflare Images
+# instead - see CLOUDFLARE_* below and admin_upload_image().
 cloudinary.config(
     cloud_name=os.environ.get('CLOUDINARY_CLOUD_NAME', ''),
     api_key=os.environ.get('CLOUDINARY_API_KEY', ''),
     api_secret=os.environ.get('CLOUDINARY_API_SECRET', ''),
     secure=True,
 )
+
+# Cloudflare Images configuration (admin product image uploads + the
+# Cloudinary -> Cloudflare product-catalog migration, see
+# scripts/migrate_to_cloudflare_images.py for the original one-off bulk
+# migration this reuses the exact same upload mechanism from).
+CLOUDFLARE_ACCOUNT_ID = os.environ.get('CLOUDFLARE_ACCOUNT_ID', '')
+CLOUDFLARE_API_TOKEN = os.environ.get('CLOUDFLARE_API_TOKEN', '')
+CLOUDFLARE_IMAGES_UPLOAD_URL = "https://api.cloudflare.com/client/v4/accounts/{account_id}/images/v1"
+# Cloudflare's built-in "public" variant only scales an image down to fit
+# 1366x768 - it does NOT crop. A custom variant named "square"
+# (fit=cover, 1000x1000 - center-crops to fill a square) was created in the
+# Cloudflare account for the original migration and is reused here so newly
+# uploaded images look consistent with the rest of the already-migrated
+# catalog (same variant name as DELIVERY_VARIANT in
+# scripts/migrate_to_cloudflare_images.py - keep both in sync if it ever
+# changes).
+CLOUDFLARE_IMAGE_VARIANT = "square"
 
 # Create the main app without a prefix
 app = FastAPI()
@@ -826,17 +847,33 @@ async def sync_all_products():
         # straight from Shopify. Without this, a full resync would silently
         # overwrite every migrated/recropped Cloudinary URL with the original
         # Shopify CDN URL, undoing both the migration and the recrop.
+        #
+        # Same reasoning for cf_image_id/cf_image_url/cloudflare_rollout -
+        # populated by scripts/migrate_to_cloudflare_images.py and by
+        # admin_upload_image() (see the Cloudflare Images upload endpoint
+        # above), never produced by parse_shopify_node(). Without preserving
+        # these too, every periodic auto-sync (AUTO_SYNC_INTERVAL_MINUTES)
+        # would silently wipe the Cloudflare rollout state for every synced
+        # product, undoing both the original migration and any per-product
+        # fix applied through admin_upload_image().
         preserved_images = {
-            p["id"]: {"image_url": p.get("image_url"), "images": p.get("images") or []}
+            p["id"]: {
+                "image_url": p.get("image_url"),
+                "images": p.get("images") or [],
+                "cf_image_id": p.get("cf_image_id"),
+                "cf_image_url": p.get("cf_image_url"),
+                "cloudflare_rollout": p.get("cloudflare_rollout"),
+            }
             for p in await db.shopify_products.find(
                 {
                     "source": {"$ne": "manual"},
                     "$or": [
                         {"image_url": {"$regex": "res.cloudinary.com"}},
                         {"images": {"$regex": "res.cloudinary.com"}},
+                        {"cf_image_url": {"$exists": True, "$ne": None}},
                     ],
                 },
-                {"id": 1, "image_url": 1, "images": 1}
+                {"id": 1, "image_url": 1, "images": 1, "cf_image_id": 1, "cf_image_url": 1, "cloudflare_rollout": 1}
             ).to_list(None)
         }
 
@@ -866,8 +903,15 @@ async def sync_all_products():
                 if product["id"] in preserved_equivalent:
                     product["equivalent_product_ids"] = preserved_equivalent[product["id"]]
                 if product["id"] in preserved_images:
-                    product["image_url"] = preserved_images[product["id"]]["image_url"]
-                    product["images"] = preserved_images[product["id"]]["images"]
+                    preserved = preserved_images[product["id"]]
+                    product["image_url"] = preserved["image_url"]
+                    product["images"] = preserved["images"]
+                    if preserved["cf_image_id"] is not None:
+                        product["cf_image_id"] = preserved["cf_image_id"]
+                    if preserved["cf_image_url"] is not None:
+                        product["cf_image_url"] = preserved["cf_image_url"]
+                    if preserved["cloudflare_rollout"] is not None:
+                        product["cloudflare_rollout"] = preserved["cloudflare_rollout"]
                 batch.append(product)
                 total_products += 1
             
@@ -3417,33 +3461,119 @@ async def admin_delete_product(product_id: str, request: Request):
     await db.shopify_products.delete_one({"id": product_id})
     return {"message": "Produs șters"}
 
+async def _upload_to_cloudflare_images(http_client: httpx.AsyncClient, filename: str, content: bytes) -> dict:
+    """Same upload call as upload_to_cloudflare() in
+    scripts/migrate_to_cloudflare_images.py, adapted to httpx's async
+    client (the migration script uses the sync one since it's a standalone
+    CLI tool). Raises on any non-success response."""
+    url = CLOUDFLARE_IMAGES_UPLOAD_URL.format(account_id=CLOUDFLARE_ACCOUNT_ID)
+    headers = {"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"}
+    resp = await http_client.post(
+        url, headers=headers, files={"file": (filename, content)}, timeout=60.0
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Cloudflare upload a eșuat ({resp.status_code}): {resp.text[:300]}")
+    payload = resp.json()
+    if not payload.get("success"):
+        raise RuntimeError(f"Cloudflare a raportat eșec: {payload.get('errors')}")
+    return payload["result"]
+
+
+def _pick_cloudflare_delivery_url(cf_result: dict) -> Optional[str]:
+    """Identical logic to pick_delivery_url() in
+    scripts/migrate_to_cloudflare_images.py - swap the trailing variant
+    segment of whatever URL Cloudflare returns for CLOUDFLARE_IMAGE_VARIANT,
+    so this always serves the same center-cropped square variant every
+    already-migrated product uses."""
+    variants = cf_result.get("variants") or []
+    if not variants:
+        return None
+    base = variants[0].rsplit("/", 1)[0]
+    return f"{base}/{CLOUDFLARE_IMAGE_VARIANT}"
+
+
 @api_router.post("/admin/upload-image")
-async def admin_upload_image(request: Request, file: UploadFile = File(...)):
-    """Upload a product image (e.g. exported from Canva) to Cloudinary and
-    return its public URL, for pasting into the image fields above."""
+async def admin_upload_image(
+    request: Request,
+    file: UploadFile = File(...),
+    product_id: Optional[str] = Form(None),
+):
+    """Upload a product image (e.g. exported from Canva) to Cloudflare
+    Images - same account/variant ("square", fit=cover, 1000x1000) as the
+    original Cloudinary -> Cloudflare bulk migration
+    (scripts/migrate_to_cloudflare_images.py) - and return its delivery URL,
+    for pasting into the image fields above. No longer touches Cloudinary
+    at all (see CLOUDINARY_* config above, still kept only for the legacy
+    /admin/migrate-images endpoint).
+
+    If `product_id` is given (the admin panel editing an existing product,
+    as opposed to drafting a brand new one), this ALSO atomically updates
+    that product's `cf_image_id`/`cf_image_url` to the newly uploaded image
+    and sets `cloudflare_rollout: True` - fixing the L79232 class of bug,
+    where a re-uploaded `image_url` and the product's `cf_image_id`/
+    `cf_image_url` could drift out of sync (see apply_cloudflare_rollout()
+    above) because this endpoint used to only return a bare URL with no way
+    to know which product it belonged to. `image_url` (and `images[0]` if it
+    mirrored the old `image_url`) is set to the same new Cloudflare URL too,
+    so the product looks right immediately regardless of its
+    `cloudflare_rollout` flag or whatever later reads `apply_cloudflare_rollout()`.
+    `product_id` is optional and backward compatible - omitting it just
+    uploads and returns the URL without touching any product, same as
+    before."""
     await _require_admin(request)
 
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Fișierul trebuie să fie o imagine")
 
-    contents = await file.read()
-    try:
-        # Offloaded to a thread, same reasoning as the bulk migration
-        # function below - cloudinary.uploader.upload() is a blocking
-        # network call, and this process runs a single Uvicorn worker, so
-        # calling it directly would stall every other concurrent request
-        # for the duration of the upload.
-        result = await asyncio.to_thread(
-            cloudinary.uploader.upload,
-            contents,
-            folder="agb-agroparts/products",
-            resource_type="image",
-        )
-    except Exception as e:
-        logger.error(f"Cloudinary upload error: {e}")
+    if not CLOUDFLARE_ACCOUNT_ID or not CLOUDFLARE_API_TOKEN:
+        logger.error("Cloudflare upload error: CLOUDFLARE_ACCOUNT_ID/CLOUDFLARE_API_TOKEN missing")
         raise HTTPException(status_code=502, detail="Încărcarea imaginii a eșuat")
 
-    return {"url": result["secure_url"]}
+    existing_product = None
+    if product_id:
+        existing_product = await db.shopify_products.find_one(
+            {"id": product_id}, {"image_url": 1, "images": 1}
+        )
+        if not existing_product:
+            raise HTTPException(status_code=404, detail="Produs inexistent")
+
+    contents = await file.read()
+    try:
+        async with httpx.AsyncClient() as http_client:
+            cf_result = await _upload_to_cloudflare_images(
+                http_client, file.filename or "upload.jpg", contents
+            )
+    except Exception as e:
+        logger.error(f"Cloudflare upload error: {e}")
+        raise HTTPException(status_code=502, detail="Încărcarea imaginii a eșuat")
+
+    cf_image_id = cf_result.get("id")
+    cf_image_url = _pick_cloudflare_delivery_url(cf_result)
+    if not cf_image_url:
+        logger.error(f"Cloudflare upload error: no variants in response for image {cf_image_id}")
+        raise HTTPException(status_code=502, detail="Încărcarea imaginii a eșuat")
+
+    if existing_product is not None:
+        update = {
+            "cf_image_id": cf_image_id,
+            "cf_image_url": cf_image_url,
+            "image_url": cf_image_url,
+            # Re-enable the normal Cloudflare-serving path for this product.
+            # Covers both the L79232-style case (was explicitly set to
+            # False as a one-off mitigation for a stale cf_image_url, now
+            # freshly back in sync) and brand-new/never-migrated products
+            # (flag unset entirely) - either way, cf_image_url is now
+            # guaranteed to match image_url, so there's no reason to keep
+            # serving Cloudinary/an unrelated stale Cloudflare image.
+            "cloudflare_rollout": True,
+        }
+        old_image_url = existing_product.get("image_url")
+        images = existing_product.get("images") or []
+        if images and images[0] == old_image_url:
+            update["images"] = [cf_image_url] + list(images[1:])
+        await db.shopify_products.update_one({"id": product_id}, {"$set": update})
+
+    return {"url": cf_image_url, "cf_image_id": cf_image_id, "cf_image_url": cf_image_url}
 
 # ==================== IMAGE MIGRATION (Shopify CDN -> Cloudinary) ====================
 # One-off bulk migration so product images no longer depend on Shopify's CDN
