@@ -3144,6 +3144,10 @@ class ProductBulkComplementaryAdd(BaseModel):
     ids: List[str]
     add: List[str]
 
+class ProductBulkEquivalentAdd(BaseModel):
+    ids: List[str]
+    add: List[str]
+
 class ProductBulkSaveItem(BaseModel):
     id: str
     patch: ProductUpdate
@@ -3212,16 +3216,19 @@ async def admin_list_products(request: Request, search: Optional[str] = None, li
     products and manually-created ones alike - both are now owned by this
     database, see sync_all_products()). Returns a total count alongside the
     page of results so the admin list can render real page-number
-    pagination instead of silently truncating at one page."""
+    pagination instead of silently truncating at one page.
+
+    Search reuses `build_products_query` - the same word-split, word-boundary,
+    Premium/PR-normalizing, flexible-model-spacing search logic as the public
+    GET /products - so admins find the same results customers do (e.g.
+    "8r410" and "8r 410" both match "8R 410" in compatible_models, "6630pr"
+    and "6630 premium" both match). No product_type/collection filter is
+    passed since this endpoint doesn't accept those params, and unlike the
+    storefront, admin intentionally has no default stock/status filter -
+    it must be able to find and edit out-of-stock products too."""
     await _require_admin(request)
 
-    query = {}
-    if search:
-        term = normalize_text(search)
-        query["$or"] = [
-            {"title_normalized": {"$regex": term, "$options": "i"}},
-            {"sku": {"$regex": term, "$options": "i"}},
-        ]
+    query = build_products_query(search, None, None)
 
     total = await db.shopify_products.count_documents(query)
     cursor = db.shopify_products.find(query).sort("title_normalized", 1).skip(skip).limit(limit)
@@ -3481,6 +3488,51 @@ async def admin_bulk_add_complementary_products(request: Request, bulk_data: Pro
         await db.shopify_products.update_many(
             {"id": {"$in": list(found_ids)}},
             {"$addToSet": {"complementary_product_ids": {"$each": bulk_data.add}}},
+        )
+
+    return {"updated": len(found_ids), "not_found": not_found}
+
+# NOTE: same literal-path-before-wildcard reasoning as /admin/products/bulk
+# above - this must stay registered before PUT /admin/products/{product_id}.
+@api_router.put("/admin/products/bulk/equivalent-add")
+async def admin_bulk_add_equivalent_products(request: Request, bulk_data: ProductBulkEquivalentAdd):
+    """Adds the ids in `add` to the `equivalent_product_ids` list of every
+    product in `ids`, ADDITIVELY - unlike /admin/products/bulk (which applies
+    a ProductUpdate patch via $set, and would therefore overwrite/wipe out
+    each product's existing equivalent_product_ids). Exact same shape/
+    semantics as /admin/products/bulk/complementary-add, just for the
+    equivalent_product_ids field instead of complementary_product_ids. Ids in
+    `ids` that don't match any product are reported back in `not_found`
+    rather than failing the whole request."""
+    await _require_admin(request)
+
+    if not bulk_data.ids or not bulk_data.add:
+        raise HTTPException(
+            status_code=400,
+            detail="ids și add nu pot fi liste goale",
+        )
+
+    if len(bulk_data.ids) > 500:
+        raise HTTPException(
+            status_code=400,
+            detail="Poți actualiza cel mult 500 de produse într-o singură cerere",
+        )
+
+    if len(bulk_data.add) > 500:
+        raise HTTPException(
+            status_code=400,
+            detail="Poți adăuga cel mult 500 de produse echivalente într-o singură cerere",
+        )
+
+    cursor = db.shopify_products.find({"id": {"$in": bulk_data.ids}}, {"id": 1})
+    found_docs = await cursor.to_list(500)
+    found_ids = {doc["id"] for doc in found_docs}
+    not_found = [product_id for product_id in bulk_data.ids if product_id not in found_ids]
+
+    if found_ids:
+        await db.shopify_products.update_many(
+            {"id": {"$in": list(found_ids)}},
+            {"$addToSet": {"equivalent_product_ids": {"$each": bulk_data.add}}},
         )
 
     return {"updated": len(found_ids), "not_found": not_found}
