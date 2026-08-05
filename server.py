@@ -3140,6 +3140,10 @@ class ProductBulkUpdate(BaseModel):
     ids: List[str]
     patch: ProductUpdate
 
+class ProductBulkComplementaryAdd(BaseModel):
+    ids: List[str]
+    add: List[str]
+
 class ProductBulkSaveItem(BaseModel):
     id: str
     patch: ProductUpdate
@@ -3430,6 +3434,56 @@ async def admin_bulk_update_products(request: Request, bulk_data: ProductBulkUpd
             updated_count += 1
 
     return {"updated": updated_count, "not_found": not_found}
+
+# NOTE: same literal-path-before-wildcard reasoning as /admin/products/bulk
+# above - this must stay registered before PUT /admin/products/{product_id}.
+# (In this particular case the extra "/complementary-add" segment means it
+# could never actually match the single-segment {product_id} route anyway,
+# but keeping it grouped with the other /admin/products/bulk* routes here
+# avoids relying on that.)
+@api_router.put("/admin/products/bulk/complementary-add")
+async def admin_bulk_add_complementary_products(request: Request, bulk_data: ProductBulkComplementaryAdd):
+    """Adds the ids in `add` to the `complementary_product_ids` list of every
+    product in `ids`, ADDITIVELY - unlike /admin/products/bulk (which applies
+    a ProductUpdate patch via $set, and would therefore overwrite/wipe out
+    each product's existing complementary_product_ids). Backs the admin
+    webshop's "add complementary products in bulk" action: e.g. select every
+    oil-filter product as `ids`, pick "Engine Oil" as the single id in `add`,
+    and it gets appended (deduplicated) to all of them in one request. Ids in
+    `ids` that don't match any product are reported back in `not_found`
+    rather than failing the whole request."""
+    await _require_admin(request)
+
+    if not bulk_data.ids or not bulk_data.add:
+        raise HTTPException(
+            status_code=400,
+            detail="ids și add nu pot fi liste goale",
+        )
+
+    if len(bulk_data.ids) > 500:
+        raise HTTPException(
+            status_code=400,
+            detail="Poți actualiza cel mult 500 de produse într-o singură cerere",
+        )
+
+    if len(bulk_data.add) > 500:
+        raise HTTPException(
+            status_code=400,
+            detail="Poți adăuga cel mult 500 de produse complementare într-o singură cerere",
+        )
+
+    cursor = db.shopify_products.find({"id": {"$in": bulk_data.ids}}, {"id": 1})
+    found_docs = await cursor.to_list(500)
+    found_ids = {doc["id"] for doc in found_docs}
+    not_found = [product_id for product_id in bulk_data.ids if product_id not in found_ids]
+
+    if found_ids:
+        await db.shopify_products.update_many(
+            {"id": {"$in": list(found_ids)}},
+            {"$addToSet": {"complementary_product_ids": {"$each": bulk_data.add}}},
+        )
+
+    return {"updated": len(found_ids), "not_found": not_found}
 
 # NOTE: same reasoning as /admin/products/bulk above - "bulk-save" and
 # "by-ids" must stay registered before PUT/DELETE /admin/products/{product_id}
