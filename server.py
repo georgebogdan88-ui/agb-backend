@@ -682,6 +682,42 @@ async def _write_audit_log(
             f"resource_type={resource_type}, resource_id={resource_id})"
         )
 
+
+@api_router.get("/admin/audit-log")
+async def admin_list_audit_log(
+    request: Request,
+    action: Optional[str] = None,
+    resource_type: Optional[str] = None,
+    resource_id: Optional[str] = None,
+    admin_id: Optional[str] = None,
+    limit: int = 100,
+    skip: int = 0,
+):
+    """Read-only, paginated view of db.admin_audit_log, newest first. Same
+    admin-auth tier as every other /admin/* endpoint - no separate role.
+    There is deliberately no update/delete route for this collection
+    anywhere in this file, so this GET is the only way in or out of it aside
+    from _write_audit_log's inserts - append-only by omission."""
+    await _require_admin(request)
+
+    query: dict = {}
+    if action:
+        query["action"] = action
+    if resource_type:
+        query["resource_type"] = resource_type
+    if resource_id:
+        query["resource_id"] = resource_id
+    if admin_id:
+        query["admin_id"] = admin_id
+
+    total = await db.admin_audit_log.count_documents(query)
+    cursor = db.admin_audit_log.find(query).sort("timestamp", -1).skip(skip).limit(limit)
+    entries = await cursor.to_list(limit)
+    for entry in entries:
+        entry.pop("_id", None)
+
+    return {"items": entries, "total": total}
+
 # ==================== SEARCH HELPERS ====================
 
 def normalize_text(text: str) -> str:
@@ -4623,6 +4659,11 @@ class OrderItemInput(BaseModel):
 
 class OrderItemsUpdate(BaseModel):
     items: List[OrderItemInput]
+    # Only actually required when this update ELIMINATES an item that was
+    # previously on the order (see the removed_product_ids check below) -
+    # not for pure add/quantity-adjust edits. Irreversible in the sense that
+    # the removed line simply isn't on the order anymore once saved.
+    reason: Optional[str] = None
 
 
 @api_router.put("/admin/orders/{order_id}/items")
@@ -4637,7 +4678,7 @@ async def admin_update_order_items(
     allowed while the order is still "pending" (not yet processed) - once
     it's moved past that, editing locks, same spirit as Shopify's own order
     editing restrictions."""
-    await _require_admin(request)
+    admin = await _require_admin(request)
 
     order_doc = await db.orders.find_one({"id": order_id})
     if not order_doc:
@@ -4650,7 +4691,22 @@ async def admin_update_order_items(
     if not payload.items:
         raise HTTPException(status_code=400, detail="Comanda trebuie să aibă cel puțin un produs.")
 
+    old_items = order_doc.get("items", [])
     items = [item.dict() for item in payload.items]
+
+    # This endpoint replaces the ENTIRE items list rather than patching
+    # individual lines, so any old product_id missing from the new list has
+    # been eliminated from the order, not just quantity-adjusted - that's
+    # the "removal" case that requires a reason.
+    old_product_ids = {i.get("product_id") for i in old_items}
+    new_product_ids = {i["product_id"] for i in items}
+    removed_product_ids = old_product_ids - new_product_ids
+    if removed_product_ids and (not payload.reason or len(payload.reason.strip()) < 3):
+        raise HTTPException(
+            status_code=400,
+            detail="Este necesar un motiv (minim 3 caractere) pentru eliminarea unui produs din comandă",
+        )
+
     subtotal = sum(item["price"] * item["quantity"] for item in items)
     total = subtotal + order_doc.get("shipping", 25.0)
 
@@ -4663,6 +4719,14 @@ async def admin_update_order_items(
     await db.orders.update_one({"id": order_id}, {"$set": update_dict})
     updated = await db.orders.find_one({"id": order_id})
     updated.pop("_id", None)
+
+    await _write_audit_log(
+        request, admin, action="order.items_update", resource_type="order",
+        resource_id=order_id,
+        before={"items": old_items, "subtotal": order_doc.get("subtotal"), "total": order_doc.get("total")},
+        after={"items": items, "subtotal": subtotal, "total": total},
+        reason=payload.reason.strip() if removed_product_ids else None,
+    )
 
     if was_crm_synced:
         background_tasks.add_task(sync_order_update_to_crm, Order(**updated))
@@ -4936,10 +5000,18 @@ async def admin_import_clients_shopify(
     `cutoff_recorded` value from this run's final status. Pass `limit`
     (query param) to cap it to a handful of customers for a quick
     sanity-check run first."""
-    await _require_admin(request)
+    admin = await _require_admin(request)
     if clients_import_status["is_running"]:
         raise HTTPException(status_code=409, detail="Importul rulează deja")
     background_tasks.add_task(_run_clients_import, since, limit)
+    # As with /admin/migrate-images: this only logs that the import was
+    # TRIGGERED with these params - the actual per-customer/per-order writes
+    # happen later in the background task, well after this request returns.
+    # See db.clients_import_runs / GET .../status for the run's own outcome.
+    await _write_audit_log(
+        request, admin, action="clients.import_shopify_trigger", resource_type="client",
+        after={"since": since, "limit": limit},
+    )
     return {"message": "Import pornit", "since": since, "limit": limit}
 
 
@@ -5112,10 +5184,14 @@ async def admin_import_shopify_orders(request: Request, background_tasks: Backgr
     that _run_clients_import's customer-scoped approach can never reach.
     Idempotent (upserts by Shopify order id) - safe to re-run any time to
     pick up new orders."""
-    await _require_admin(request)
+    admin = await _require_admin(request)
     if shopify_orders_import_status["is_running"]:
         raise HTTPException(status_code=409, detail="Importul rulează deja")
     background_tasks.add_task(_run_shopify_full_orders_import)
+    # Trigger-only log, same reasoning as /admin/clients/import-shopify above.
+    await _write_audit_log(
+        request, admin, action="shopify_orders.import_trigger", resource_type="order",
+    )
     return {"message": "Import pornit"}
 
 
@@ -5978,7 +6054,7 @@ async def admin_add_equipment_option(request: Request, option_data: EquipmentOpt
     categories. Idempotent - a case-insensitive duplicate already present in
     that category is a silent no-op rather than an error, same style as the
     other "add" endpoints in this file (see customer-interests)."""
-    await _require_admin(request)
+    admin = await _require_admin(request)
 
     if option_data.category not in EQUIPMENT_OPTION_CATEGORIES:
         raise HTTPException(status_code=400, detail="Categorie invalidă")
@@ -5991,13 +6067,21 @@ async def admin_add_equipment_option(request: Request, option_data: EquipmentOpt
         "category": option_data.category,
         "value": {"$regex": f"^{re.escape(value)}$", "$options": "i"},
     })
+    option_id = None
     if not existing:
+        option_id = str(uuid.uuid4())
         await db.equipment_options.insert_one({
-            "id": str(uuid.uuid4()),
+            "id": option_id,
             "category": option_data.category,
             "value": value,
             "created_at": datetime.utcnow(),
         })
+
+    await _write_audit_log(
+        request, admin, action="equipment_option.create", resource_type="equipment_option",
+        resource_id=option_id or existing.get("id"),
+        after={"category": option_data.category, "value": value, "was_duplicate": existing is not None},
+    )
 
     return {"message": "ok", "category": option_data.category, "value": value}
 
