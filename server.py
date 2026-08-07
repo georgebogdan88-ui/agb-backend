@@ -1061,17 +1061,19 @@ async def get_sync_status():
     }
 
 @api_router.post("/sync/start")
-async def start_sync(background_tasks: BackgroundTasks):
+async def start_sync(request: Request, background_tasks: BackgroundTasks):
     """Start syncing all products from Shopify"""
+    await _require_admin(request)
     if sync_status["is_syncing"]:
         return {"message": "Sincronizare deja în curs", "status": sync_status}
-    
+
     background_tasks.add_task(sync_all_products)
     return {"message": "Sincronizare pornită! Verificați /api/sync/status pentru progres"}
 
 @api_router.post("/sync/collections")
-async def sync_collections(background_tasks: BackgroundTasks):
+async def sync_collections(request: Request, background_tasks: BackgroundTasks):
     """Sync only collections to existing products"""
+    await _require_admin(request)
     background_tasks.add_task(sync_collections_to_products)
     return {"message": "Sincronizare colecții pornită!"}
 
@@ -7733,8 +7735,9 @@ async def debug_push_tokens(request: Request):
         return {"error": str(e)}
 
 @api_router.post("/push/check-blogs")
-async def trigger_blog_check():
+async def trigger_blog_check(request: Request):
     """Manually trigger a blog check"""
+    await _require_admin(request)
     await check_for_new_blog_posts()
     return {"success": True, "message": "Blog check triggered"}
 
@@ -7836,12 +7839,14 @@ async def send_blog_notification_email(recipient_email: str, recipient_name: str
 
 @api_router.post("/notifications/send-blog-emails")
 async def send_blog_notification_to_matching_users(
+    request: Request,
     blog_title: str,
     blog_excerpt: str = "",
     blog_url: str = "",
     model_tags: list = []
 ):
     """Send email notifications to users whose equipment matches the blog tags"""
+    await _require_admin(request)
     try:
         if not BREVO_API_KEY:
             raise HTTPException(status_code=500, detail="BREVO_API_KEY not configured")
@@ -7889,7 +7894,7 @@ async def send_blog_notification_to_matching_users(
         return {
             "success": True,
             "emails_sent": sent_count,
-            "matched_users": matched_users,
+            "matched_users_count": len(matched_users),
             "model_tags_used": model_tags
         }
         
