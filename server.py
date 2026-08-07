@@ -3769,9 +3769,40 @@ async def admin_list_customer_interests(
 
     return enriched
 
+def _product_audit_summary(product: dict) -> dict:
+    """Compact identifying/business summary of a product doc, for audit-log
+    create/delete snapshots - deliberately excludes the large free-text
+    description/images payloads rather than dumping the whole document."""
+    return {
+        "title": product.get("title"),
+        "sku": product.get("sku"),
+        "price": product.get("price"),
+        "currency": product.get("currency"),
+        "stock": product.get("stock"),
+        "stock_status": product.get("stock_status"),
+        "product_type": product.get("product_type"),
+        "vendor": product.get("vendor"),
+    }
+
+
+def _diff_changed_fields(existing: dict, updated: dict, candidate_fields) -> tuple:
+    """Returns (before, after) containing only the entries from
+    `candidate_fields` whose value actually differs between `existing` and
+    `updated` - used to build audit-log before/after snapshots with just
+    what changed, not the whole document."""
+    before, after = {}, {}
+    for field in candidate_fields:
+        old_value = existing.get(field)
+        new_value = updated.get(field)
+        if old_value != new_value:
+            before[field] = old_value
+            after[field] = new_value
+    return before, after
+
+
 @api_router.post("/admin/products")
 async def admin_create_product(request: Request, product_data: ProductCreate):
-    await _require_admin(request)
+    admin = await _require_admin(request)
 
     product_id = f"local-{uuid.uuid4()}"
     now = datetime.utcnow()
@@ -3815,6 +3846,12 @@ async def admin_create_product(request: Request, product_data: ProductCreate):
         "updated_at": now,
     }
     await db.shopify_products.insert_one(product)
+
+    await _write_audit_log(
+        request, admin, action="product.create", resource_type="product",
+        resource_id=product_id, after=_product_audit_summary(product),
+    )
+
     return Product(**product)
 
 _CLOUDFLARE_DELIVERY_URL_RE = re.compile(r"^https://imagedelivery\.net/[^/]+/([^/]+)/[^/]+$")
@@ -3909,7 +3946,7 @@ async def admin_bulk_update_products(request: Request, bulk_data: ProductBulkUpd
     admin product list's Shopify-style bulk-edit), instead of the frontend
     issuing one PUT per product. Ids that don't match any product are
     reported back in `not_found` rather than failing the whole request."""
-    await _require_admin(request)
+    admin = await _require_admin(request)
 
     if len(bulk_data.ids) > 500:
         raise HTTPException(
@@ -3925,6 +3962,21 @@ async def admin_bulk_update_products(request: Request, bulk_data: ProductBulkUpd
             not_found.append(product_id)
         else:
             updated_count += 1
+
+    # One audit entry for the whole bulk request rather than one per product
+    # - `patch` (the shared fields being $set on every matched id) plus the
+    # affected id lists is what changed here, not a per-product before/after
+    # diff (500 individual diffs would be disproportionate for what's a
+    # single admin action).
+    await _write_audit_log(
+        request, admin, action="product.bulk_update", resource_type="product",
+        after={
+            "patch": {k: v for k, v in bulk_data.patch.dict().items() if v is not None},
+            "product_ids": bulk_data.ids,
+            "updated_count": updated_count,
+            "not_found": not_found,
+        },
+    )
 
     return {"updated": updated_count, "not_found": not_found}
 
@@ -3945,7 +3997,7 @@ async def admin_bulk_add_complementary_products(request: Request, bulk_data: Pro
     and it gets appended (deduplicated) to all of them in one request. Ids in
     `ids` that don't match any product are reported back in `not_found`
     rather than failing the whole request."""
-    await _require_admin(request)
+    admin = await _require_admin(request)
 
     if not bulk_data.ids or not bulk_data.add:
         raise HTTPException(
@@ -3983,6 +4035,18 @@ async def admin_bulk_add_complementary_products(request: Request, bulk_data: Pro
             },
         )
 
+    # Single audit entry for the whole bulk request - see the same reasoning
+    # in admin_bulk_update_products above.
+    await _write_audit_log(
+        request, admin, action="product.bulk_complementary_add", resource_type="product",
+        after={
+            "add": bulk_data.add,
+            "product_ids": bulk_data.ids,
+            "updated_count": len(found_ids),
+            "not_found": not_found,
+        },
+    )
+
     return {"updated": len(found_ids), "not_found": not_found}
 
 # NOTE: same literal-path-before-wildcard reasoning as /admin/products/bulk
@@ -3997,7 +4061,7 @@ async def admin_bulk_add_equivalent_products(request: Request, bulk_data: Produc
     equivalent_product_ids field instead of complementary_product_ids. Ids in
     `ids` that don't match any product are reported back in `not_found`
     rather than failing the whole request."""
-    await _require_admin(request)
+    admin = await _require_admin(request)
 
     if not bulk_data.ids or not bulk_data.add:
         raise HTTPException(
@@ -4032,6 +4096,18 @@ async def admin_bulk_add_equivalent_products(request: Request, bulk_data: Produc
             },
         )
 
+    # Single audit entry for the whole bulk request - see the same reasoning
+    # in admin_bulk_update_products above.
+    await _write_audit_log(
+        request, admin, action="product.bulk_equivalent_add", resource_type="product",
+        after={
+            "add": bulk_data.add,
+            "product_ids": bulk_data.ids,
+            "updated_count": len(found_ids),
+            "not_found": not_found,
+        },
+    )
+
     return {"updated": len(found_ids), "not_found": not_found}
 
 # NOTE: same reasoning as /admin/products/bulk above - "bulk-save" and
@@ -4047,7 +4123,7 @@ async def admin_bulk_save_products(request: Request, bulk_data: ProductBulkSave)
     diverge from the single-product/shared-bulk code paths. Ids that don't
     match any product are reported back in `not_found` rather than failing
     the whole request."""
-    await _require_admin(request)
+    admin = await _require_admin(request)
 
     if len(bulk_data.updates) > 500:
         raise HTTPException(
@@ -4063,6 +4139,21 @@ async def admin_bulk_save_products(request: Request, bulk_data: ProductBulkSave)
             not_found.append(item.id)
         else:
             updated_count += 1
+
+    # One audit entry for the whole grid-save request - each item's own
+    # patch (the fields it actually submitted), not a per-product before/
+    # after diff (same reasoning as the other bulk endpoints above).
+    await _write_audit_log(
+        request, admin, action="product.bulk_save", resource_type="product",
+        after={
+            "updates": [
+                {"id": item.id, "patch": {k: v for k, v in item.patch.dict().items() if v is not None}}
+                for item in bulk_data.updates
+            ],
+            "updated_count": updated_count,
+            "not_found": not_found,
+        },
+    )
 
     return {"updated": updated_count, "not_found": not_found}
 
@@ -4089,23 +4180,59 @@ async def admin_get_products_by_ids(request: Request, ids: str):
 
 @api_router.put("/admin/products/{product_id}")
 async def admin_update_product(product_id: str, request: Request, product_data: ProductUpdate):
-    await _require_admin(request)
+    admin = await _require_admin(request)
+
+    # Fetched separately (on top of _apply_product_update()'s own internal
+    # existence check) purely so the pre-update values are available here to
+    # build the audit-log before/after diff - see _diff_changed_fields.
+    existing = await db.shopify_products.find_one({"id": product_id})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Produs inexistent")
 
     updated = await _apply_product_update(product_id, product_data)
     if updated is None:
         raise HTTPException(status_code=404, detail="Produs inexistent")
 
+    submitted = product_data.dict()
+    candidate_fields = [k for k, v in submitted.items() if v is not None and k != "category"]
+    if submitted.get("product_type") is not None or submitted.get("category") is not None:
+        # Not a stored field itself (see _apply_product_update) - it's what
+        # actually changes on the document when either of these is set.
+        candidate_fields.append("collections")
+    before, after = _diff_changed_fields(existing, updated, candidate_fields)
+
+    await _write_audit_log(
+        request, admin, action="product.update", resource_type="product",
+        resource_id=product_id, before=before, after=after,
+    )
+
     return Product(**updated)
 
 @api_router.delete("/admin/products/{product_id}")
-async def admin_delete_product(product_id: str, request: Request):
-    await _require_admin(request)
+async def admin_delete_product(product_id: str, request: Request, reason: Optional[str] = Body(default=None, embed=True)):
+    """Permanently deletes a product. Irreversible, so a genuine reason
+    (>= 3 characters after trimming) is required - passed in the JSON body
+    as {"reason": "..."} - and recorded on the resulting audit-log entry."""
+    admin = await _require_admin(request)
+
+    if not reason or len(reason.strip()) < 3:
+        raise HTTPException(
+            status_code=400,
+            detail="Este necesar un motiv (minim 3 caractere) pentru ștergerea unui produs",
+        )
 
     existing = await db.shopify_products.find_one({"id": product_id})
     if not existing:
         raise HTTPException(status_code=404, detail="Produs inexistent")
 
     await db.shopify_products.delete_one({"id": product_id})
+
+    await _write_audit_log(
+        request, admin, action="product.delete", resource_type="product",
+        resource_id=product_id, before=_product_audit_summary(existing),
+        reason=reason.strip(),
+    )
+
     return {"message": "Produs șters"}
 
 async def _upload_to_cloudflare_images(http_client: httpx.AsyncClient, filename: str, content: bytes) -> dict:
@@ -4177,7 +4304,7 @@ async def admin_upload_image(
     `product_id` is optional and backward compatible - omitting it just
     uploads and returns the URL without touching any product, same as
     before."""
-    await _require_admin(request)
+    admin = await _require_admin(request)
 
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Fișierul trebuie să fie o imagine")
@@ -4268,6 +4395,13 @@ async def admin_upload_image(
         if images and images[0] == old_image_url:
             update["images"] = [cf_image_url] + list(images[1:])
         await db.shopify_products.update_one({"id": product_id}, {"$set": update})
+
+        await _write_audit_log(
+            request, admin, action="product.image_upload", resource_type="product",
+            resource_id=product_id,
+            before={"image_url": old_image_url},
+            after={"image_url": cf_image_url},
+        )
 
     return {"url": cf_image_url, "cf_image_id": cf_image_id, "cf_image_url": cf_image_url}
 
@@ -4377,10 +4511,20 @@ async def _run_image_migration(limit: Optional[int] = None):
 async def admin_migrate_images(request: Request, background_tasks: BackgroundTasks, limit: Optional[int] = None):
     """Kick off the Shopify-CDN -> Cloudinary image migration in the
     background. Pass `limit` to test on a handful of images first."""
-    await _require_admin(request)
+    admin = await _require_admin(request)
     if image_migration_status["is_running"]:
         raise HTTPException(status_code=409, detail="Migrarea rulează deja")
     background_tasks.add_task(_run_image_migration, limit)
+    # This only logs that the migration was TRIGGERED with these params - the
+    # actual per-image writes happen later in the background task above, well
+    # after this request has already returned, so there's no meaningful
+    # per-image before/after to attach to a single request-scoped log entry
+    # here (see db.image_migrations / GET /admin/migrate-images/status for
+    # the actual run's own progress/outcome tracking).
+    await _write_audit_log(
+        request, admin, action="images.migrate_trigger", resource_type="image_migration",
+        after={"limit": limit},
+    )
     return {"message": "Migrare pornită"}
 
 @api_router.get("/admin/migrate-images/status")
