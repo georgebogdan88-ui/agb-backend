@@ -22,6 +22,8 @@ import secrets
 import bcrypt
 import cloudinary
 import cloudinary.uploader
+import io
+from PIL import Image
 
 ROOT_DIR = Path(__file__).parent
 # Load .env but don't override existing environment variables (important for Render deployment)
@@ -3771,6 +3773,16 @@ def _pick_cloudflare_delivery_url(cf_result: dict) -> Optional[str]:
     return f"{base}/{CLOUDFLARE_IMAGE_VARIANT}"
 
 
+# `file.content_type` below is just a client-supplied header - trivially
+# spoofable (e.g. a .php/.svg/.html file renamed with an "image/jpeg"
+# Content-Type) - so it's only used as a cheap early rejection, never as
+# the actual security check. MAX_UPLOAD_IMAGE_BYTES/_ALLOWED_UPLOAD_IMAGE_FORMATS
+# below back it up with a real size cap and Pillow actually opening/decoding
+# the file to confirm it's one of a small allowlist of real image formats.
+MAX_UPLOAD_IMAGE_BYTES = 10 * 1024 * 1024  # 10MB
+_ALLOWED_UPLOAD_IMAGE_FORMATS = {"JPEG", "PNG", "WEBP"}
+
+
 @api_router.post("/admin/upload-image")
 async def admin_upload_image(
     request: Request,
@@ -3816,7 +3828,43 @@ async def admin_upload_image(
         if not existing_product:
             raise HTTPException(status_code=404, detail="Produs inexistent")
 
-    contents = await file.read()
+    # Read in bounded chunks and bail out as soon as the cap is exceeded,
+    # instead of first buffering an arbitrarily large upload fully into
+    # memory before checking its size.
+    chunks = bytearray()
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        chunks.extend(chunk)
+        if len(chunks) > MAX_UPLOAD_IMAGE_BYTES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Imaginea depășește dimensiunea maximă permisă ({MAX_UPLOAD_IMAGE_BYTES // (1024 * 1024)}MB)",
+            )
+    contents = bytes(chunks)
+
+    if not contents:
+        raise HTTPException(status_code=400, detail="Fișierul este gol")
+
+    # Verify the REAL file content (magic bytes/actual decoded format), not
+    # just the client-supplied filename/Content-Type header - both are
+    # trivial to spoof. Image.verify() raises on anything that isn't a
+    # genuine, undamaged image of a format Pillow recognizes.
+    try:
+        with Image.open(io.BytesIO(contents)) as probe_image:
+            probe_image.verify()
+        with Image.open(io.BytesIO(contents)) as format_image:
+            detected_format = (format_image.format or "").upper()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Fișierul nu este o imagine validă")
+
+    if detected_format not in _ALLOWED_UPLOAD_IMAGE_FORMATS:
+        raise HTTPException(
+            status_code=400,
+            detail="Tip de imagine nepermis - sunt acceptate doar JPEG, PNG sau WEBP",
+        )
+
     try:
         async with httpx.AsyncClient() as http_client:
             cf_result = await _upload_to_cloudflare_images(
