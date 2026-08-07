@@ -8,7 +8,7 @@ import os
 import logging
 from pathlib import Path
 from pydantic import BaseModel, Field
-from typing import List, Optional, Literal
+from typing import List, Optional, Literal, Dict, Deque
 import uuid
 from datetime import datetime, timedelta
 import httpx
@@ -20,6 +20,9 @@ import hashlib
 import hmac
 import secrets
 import bcrypt
+import time
+import random
+from collections import defaultdict, deque
 import cloudinary
 import cloudinary.uploader
 import io
@@ -421,6 +424,113 @@ async def _find_user_by_token(token: str, allow_shopify_access_token: bool = Fal
     if allow_shopify_access_token:
         or_clauses.append({"shopify_access_token": token})
     return await db.users.find_one({"$or": or_clauses})
+
+# ==================== RATE LIMITING ====================
+# In-memory abuse-prevention limiter for the auth endpoints (brute-force
+# login guard, registration/forgot-password spam guard) and for the 4
+# admin-only sync/notification triggers hardened in the previous security
+# pass. Deliberately NOT slowapi/Redis/any new dependency: this service
+# always runs as a single uvicorn worker on the current Render tier
+# (worker=1 was re-confirmed deliberately after multi-worker measured
+# worse on this tier - see Procfile), so a single in-process dict is both
+# sufficient and inherently consistent - there's only ever one process's
+# state to keep straight. State lives purely in memory and resets on every
+# restart/redeploy - acceptable here because this is abuse mitigation
+# layered on top of real checks (password hash, admin role), never the
+# only line of defense.
+
+class _SlidingWindowRateLimiter:
+    """Per-key sliding-window hit counter. Safe without locks: every
+    operation here is plain synchronous dict/deque manipulation with no
+    `await` in between reading and mutating state, so an asyncio task can
+    never be pre-empted mid-update (and this only ever runs in a single
+    process/worker anyway - see module note above)."""
+
+    def __init__(self):
+        self._hits: Dict[str, Deque[float]] = defaultdict(deque)
+
+    def hit(self, key: str, limit: int, window_seconds: float) -> Optional[int]:
+        """Record one attempt for `key`. Returns None if `key` is still
+        within `limit` attempts over the trailing `window_seconds`.
+        Otherwise returns the whole number of seconds until the oldest
+        attempt in the window ages out (a reasonable Retry-After value) -
+        the over-limit attempt itself is NOT recorded, so a caller that
+        keeps retrying immediately doesn't keep pushing the window forward
+        forever."""
+        now = time.monotonic()
+        q = self._hits[key]
+        cutoff = now - window_seconds
+        while q and q[0] < cutoff:
+            q.popleft()
+
+        # Cheap, probabilistic housekeeping so keys that go permanently
+        # quiet (e.g. a one-off attacker IP) eventually get evicted instead
+        # of sitting in memory forever - not worth a dedicated background
+        # task for something this low-stakes.
+        if random.random() < 0.001:
+            self._sweep()
+
+        if len(q) >= limit:
+            retry_after = q[0] + window_seconds - now
+            return max(1, int(retry_after) + 1)
+
+        q.append(now)
+        return None
+
+    def _sweep(self, max_age_seconds: float = 3600) -> None:
+        """Drop any key whose hits are all older than `max_age_seconds`
+        (1 hour = the largest window any limiter below uses)."""
+        now = time.monotonic()
+        cutoff = now - max_age_seconds
+        stale = []
+        for key, q in self._hits.items():
+            while q and q[0] < cutoff:
+                q.popleft()
+            if not q:
+                stale.append(key)
+        for key in stale:
+            del self._hits[key]
+
+
+_rate_limiter = _SlidingWindowRateLimiter()
+
+# Tunable limits - (max attempts, window in seconds) per bucket. See the
+# call sites below for exactly what's used as the key.
+LOGIN_IP_EMAIL_LIMIT, LOGIN_IP_EMAIL_WINDOW_SECONDS = 10, 15 * 60   # 10 / 15 min per IP+email combo
+LOGIN_IP_LIMIT, LOGIN_IP_WINDOW_SECONDS = 30, 15 * 60               # 30 / 15 min per IP (catches email-rotation)
+REGISTER_IP_LIMIT, REGISTER_IP_WINDOW_SECONDS = 5, 60 * 60          # 5 / hour per IP
+FORGOT_PASSWORD_IP_LIMIT, FORGOT_PASSWORD_IP_WINDOW_SECONDS = 5, 60 * 60  # 5 / hour per IP
+ADMIN_ACTION_LIMIT, ADMIN_ACTION_WINDOW_SECONDS = 10, 60 * 60       # 10 / hour per admin, per protected action
+
+
+def _client_ip(request: Request) -> str:
+    """Best-effort real client IP to key rate limits on. This service sits
+    behind Render's edge proxy, which sets X-Forwarded-For to the original
+    client IP; uvicorn here is NOT started with --forwarded-allow-ips (see
+    Procfile), so request.client.host alone would just be Render's own
+    internal proxy address - identical for every request - which would
+    make an IP-based limit either a no-op (an attacker could never be
+    singled out) or, worse, a limit shared by every real user at once. This
+    reads X-Forwarded-For directly instead and only falls back to
+    request.client.host when there's no such header (e.g. local dev with
+    no proxy in front)."""
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _enforce_rate_limit(key: str, limit: int, window_seconds: float, message: str) -> None:
+    """Raise HTTP 429 (with a Retry-After header) if `key` is already over
+    `limit` hits within `window_seconds`; otherwise records this attempt
+    and returns normally."""
+    retry_after = _rate_limiter.hit(key, limit, window_seconds)
+    if retry_after is not None:
+        raise HTTPException(
+            status_code=429,
+            detail=message,
+            headers={"Retry-After": str(retry_after)},
+        )
 
 # ==================== SEARCH HELPERS ====================
 
@@ -1064,7 +1174,11 @@ async def get_sync_status():
 @api_router.post("/sync/start")
 async def start_sync(request: Request, background_tasks: BackgroundTasks):
     """Start syncing all products from Shopify"""
-    await _require_admin(request)
+    admin = await _require_admin(request)
+    _enforce_rate_limit(
+        f"admin:sync-start:{admin['id']}", ADMIN_ACTION_LIMIT, ADMIN_ACTION_WINDOW_SECONDS,
+        "Prea multe sincronizări pornite recent. Încearcă din nou mai târziu.",
+    )
     if sync_status["is_syncing"]:
         return {"message": "Sincronizare deja în curs", "status": sync_status}
 
@@ -1074,7 +1188,11 @@ async def start_sync(request: Request, background_tasks: BackgroundTasks):
 @api_router.post("/sync/collections")
 async def sync_collections(request: Request, background_tasks: BackgroundTasks):
     """Sync only collections to existing products"""
-    await _require_admin(request)
+    admin = await _require_admin(request)
+    _enforce_rate_limit(
+        f"admin:sync-collections:{admin['id']}", ADMIN_ACTION_LIMIT, ADMIN_ACTION_WINDOW_SECONDS,
+        "Prea multe sincronizări pornite recent. Încearcă din nou mai târziu.",
+    )
     background_tasks.add_task(sync_collections_to_products)
     return {"message": "Sincronizare colecții pornită!"}
 
@@ -2318,8 +2436,12 @@ async def sync_account_to_crm(user: dict) -> None:
 
 
 @api_router.post("/auth/register")
-async def register_user(user_data: UserRegister, background_tasks: BackgroundTasks):
+async def register_user(user_data: UserRegister, background_tasks: BackgroundTasks, request: Request):
     """Register a new user - fully local account, independent of Shopify"""
+    _enforce_rate_limit(
+        f"register:ip:{_client_ip(request)}", REGISTER_IP_LIMIT, REGISTER_IP_WINDOW_SECONDS,
+        "Prea multe conturi create de la această adresă. Încearcă din nou mai târziu.",
+    )
 
     email = user_data.email.lower().strip()
 
@@ -2460,10 +2582,14 @@ async def send_password_reset_email(recipient_email: str, recipient_name: str, r
 
 
 @api_router.post("/auth/forgot-password")
-async def forgot_password(request: ForgotPasswordRequest):
+async def forgot_password(request: ForgotPasswordRequest, http_request: Request):
     """Send a local password reset email. Always returns a generic success
     message regardless of whether the address is registered, to avoid
     leaking which emails have accounts."""
+    _enforce_rate_limit(
+        f"forgot-password:ip:{_client_ip(http_request)}", FORGOT_PASSWORD_IP_LIMIT, FORGOT_PASSWORD_IP_WINDOW_SECONDS,
+        "Prea multe cereri de resetare a parolei de la această adresă. Încearcă din nou mai târziu.",
+    )
     email = request.email.lower().strip()
     user = await db.users.find_one({"email": email})
 
@@ -2806,12 +2932,30 @@ def _serialize_user(user: dict) -> dict:
     }
 
 
-async def _authenticate_user(email: str, password: str) -> dict:
+async def _authenticate_user(email: str, password: str, request: Request) -> dict:
     """Authenticate a customer for login. Checks the local password hash
     first; only falls back to Shopify (and silently migrates) for accounts
     that don't have one yet. See `_legacy_shopify_login_and_migrate`.
+
+    Shared by both /auth/login and /auth/shopify-login (the latter is kept
+    only for backward compatibility with older app builds but is exactly
+    as brute-forceable, so rate limiting lives here once rather than being
+    duplicated - and possibly forgotten - on each caller).
     """
     email = email.lower().strip()
+    ip = _client_ip(request)
+    # Coarser, IP-only bucket first: every login attempt from this IP counts
+    # against it regardless of which email was tried, so rotating through
+    # many emails from one IP can't be used to dodge the tighter per-email
+    # bucket below entirely.
+    _enforce_rate_limit(
+        f"login:ip:{ip}", LOGIN_IP_LIMIT, LOGIN_IP_WINDOW_SECONDS,
+        "Prea multe încercări de autentificare de la această adresă. Încearcă din nou mai târziu.",
+    )
+    _enforce_rate_limit(
+        f"login:ip-email:{ip}:{email}", LOGIN_IP_EMAIL_LIMIT, LOGIN_IP_EMAIL_WINDOW_SECONDS,
+        "Prea multe încercări de autentificare pentru acest cont. Încearcă din nou mai târziu.",
+    )
     existing_user = await db.users.find_one({"email": email})
 
     if existing_user and existing_user.get("password_hash"):
@@ -2832,9 +2976,9 @@ async def _authenticate_user(email: str, password: str) -> dict:
 
 
 @api_router.post("/auth/login")
-async def login_user(credentials: UserLogin):
+async def login_user(credentials: UserLogin, request: Request):
     """Login a user - local password first, Shopify fallback for legacy accounts"""
-    return await _authenticate_user(credentials.email, credentials.password)
+    return await _authenticate_user(credentials.email, credentials.password, request)
 
 @api_router.get("/auth/me")
 async def get_current_user(request: Request):
@@ -2854,10 +2998,11 @@ async def get_current_user(request: Request):
 # ==================== SHOPIFY CUSTOMER AUTH ====================
 
 @api_router.post("/auth/shopify-login")
-async def shopify_customer_login(credentials: ShopifyCustomerLogin):
+async def shopify_customer_login(credentials: ShopifyCustomerLogin, request: Request):
     """Kept for backward compatibility with older app builds that call this
-    route specifically; behaves identically to /auth/login now."""
-    return await _authenticate_user(credentials.email, credentials.password)
+    route specifically; behaves identically to /auth/login now (including
+    the same login rate limiting - see _authenticate_user)."""
+    return await _authenticate_user(credentials.email, credentials.password, request)
 
 @api_router.put("/auth/me")
 async def update_current_user(request: Request, update_data: UserUpdate, background_tasks: BackgroundTasks):
@@ -7767,7 +7912,11 @@ async def debug_push_tokens(request: Request):
 @api_router.post("/push/check-blogs")
 async def trigger_blog_check(request: Request):
     """Manually trigger a blog check"""
-    await _require_admin(request)
+    admin = await _require_admin(request)
+    _enforce_rate_limit(
+        f"admin:check-blogs:{admin['id']}", ADMIN_ACTION_LIMIT, ADMIN_ACTION_WINDOW_SECONDS,
+        "Prea multe verificări de blog pornite recent. Încearcă din nou mai târziu.",
+    )
     await check_for_new_blog_posts()
     return {"success": True, "message": "Blog check triggered"}
 
@@ -7876,7 +8025,11 @@ async def send_blog_notification_to_matching_users(
     model_tags: list = []
 ):
     """Send email notifications to users whose equipment matches the blog tags"""
-    await _require_admin(request)
+    admin = await _require_admin(request)
+    _enforce_rate_limit(
+        f"admin:send-blog-emails:{admin['id']}", ADMIN_ACTION_LIMIT, ADMIN_ACTION_WINDOW_SECONDS,
+        "Prea multe trimiteri de notificări pornite recent. Încearcă din nou mai târziu.",
+    )
     try:
         if not BREVO_API_KEY:
             raise HTTPException(status_code=500, detail="BREVO_API_KEY not configured")
