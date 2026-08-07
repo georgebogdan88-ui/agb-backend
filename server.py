@@ -574,6 +574,114 @@ def _enforce_rate_limit(key: str, limit: int, window_seconds: float, message: st
             headers={"Retry-After": str(retry_after)},
         )
 
+# ==================== ADMIN AUDIT LOG ====================
+# Append-only trail of every admin action that mutates data (product/order/
+# equipment-option writes, image uploads, bulk imports, etc) - see
+# _write_audit_log below and its call sites at each admin write endpoint.
+# db.admin_audit_log has deliberately no update/delete route anywhere in
+# this file - GET /admin/audit-log is the only way to read it back.
+
+_AUDIT_SECRET_KEY_RE = re.compile(
+    r"password|passwd|pwd|token|secret|api[_-]?key|authorization", re.IGNORECASE
+)
+_AUDIT_PII_KEY_RE = re.compile(
+    r"email|phone|telefon|address|adresa", re.IGNORECASE
+)
+_AUDIT_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _mask_audit_email(value: str) -> str:
+    """"j.popescu@example.ro" -> "j***@***.ro" - keeps just enough to be
+    recognizable to someone who already knows the address, without storing
+    it in clear text in the audit trail."""
+    local, _, domain = value.partition("@")
+    first = local[0] if local else "*"
+    tld = domain.rsplit(".", 1)[-1] if "." in domain else "***"
+    return f"{first}***@***.{tld}"
+
+
+def _mask_audit_pii(value: str) -> str:
+    """Generic partial mask for any other PII-looking string (phone number,
+    free-text address, etc) - keeps only the last 2 characters visible."""
+    value = value.strip()
+    if len(value) <= 2:
+        return "***"
+    return ("*" * (len(value) - 2)) + value[-2:]
+
+
+def _sanitize_audit_value(key: str, value):
+    if isinstance(value, dict):
+        return _sanitize_audit_payload(value)
+    if isinstance(value, list):
+        return [_sanitize_audit_value(key, v) for v in value]
+    if isinstance(value, str):
+        if _AUDIT_EMAIL_RE.match(value):
+            return _mask_audit_email(value)
+        if key and _AUDIT_PII_KEY_RE.search(key):
+            return _mask_audit_pii(value)
+    return value
+
+
+def _sanitize_audit_payload(data: Optional[dict]) -> Optional[dict]:
+    """Applied to every `before`/`after` snapshot right before it's written
+    to db.admin_audit_log: drops any secret-looking field (password/token/
+    api key/etc) entirely, and masks any customer-PII-looking field (email/
+    phone/address - by key name, plus any string anywhere that simply looks
+    like an email address regardless of its key) so the audit trail never
+    stores a password, token, or a customer's contact details in clear
+    text. This is defense-in-depth on top of callers already being expected
+    to only pass the specific fields that changed, never a full document."""
+    if not data:
+        return data
+    sanitized = {}
+    for k, v in data.items():
+        if _AUDIT_SECRET_KEY_RE.search(k):
+            continue
+        sanitized[k] = _sanitize_audit_value(k, v)
+    return sanitized
+
+
+async def _write_audit_log(
+    request: Request,
+    admin: dict,
+    action: str,
+    resource_type: str,
+    resource_id: Optional[str] = None,
+    before: Optional[dict] = None,
+    after: Optional[dict] = None,
+    result: str = "success",
+    reason: Optional[str] = None,
+) -> None:
+    """Best-effort write of one admin-audit-log entry. Must never fail or
+    block the admin action it's logging - any error writing the log itself
+    (e.g. a transient Mongo issue) is caught and logged to the app logger,
+    never re-raised, so a problem here can't turn an otherwise-successful
+    admin action into a 500 for the admin. `before`/`after` should only ever
+    contain the fields that actually changed (never a full document) - see
+    _sanitize_audit_payload for how they're scrubbed of secrets/PII before
+    being persisted."""
+    try:
+        await db.admin_audit_log.insert_one({
+            "id": str(uuid.uuid4()),
+            "timestamp": datetime.utcnow(),
+            "admin_id": admin.get("id"),
+            "admin_email": admin.get("email"),
+            "action": action,
+            "resource_type": resource_type,
+            "resource_id": resource_id,
+            "before": _sanitize_audit_payload(before),
+            "after": _sanitize_audit_payload(after),
+            "result": result,
+            "reason": reason,
+            "request_id": str(uuid.uuid4()),
+            "ip": _client_ip(request),
+        })
+    except Exception:
+        logger.exception(
+            f"Failed to write admin audit log entry (action={action}, "
+            f"resource_type={resource_type}, resource_id={resource_id})"
+        )
+
 # ==================== SEARCH HELPERS ====================
 
 def normalize_text(text: str) -> str:
@@ -6893,6 +7001,20 @@ async def startup_event():
         await db.orders.create_index("session_id")
     except Exception:
         logger.exception("Failed to create index on orders.session_id")
+
+    # GET /admin/audit-log lists newest-first, and per-admin activity is a
+    # common follow-up lookup - without this, each request scans the whole
+    # (append-only, ever-growing) audit log collection.
+    try:
+        await db.admin_audit_log.create_index([("timestamp", -1), ("admin_id", 1)])
+    except Exception:
+        logger.exception("Failed to create index on admin_audit_log.(timestamp, admin_id)")
+    # Supports "show every audit entry for this specific action + resource"
+    # lookups (e.g. the full edit history of one product/order).
+    try:
+        await db.admin_audit_log.create_index([("action", 1), ("resource_id", 1)])
+    except Exception:
+        logger.exception("Failed to create index on admin_audit_log.(action, resource_id)")
 
     # Must run before the app starts accepting traffic under the new
     # tokens[] auth scheme - see docstring.
