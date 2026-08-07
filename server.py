@@ -3603,9 +3603,16 @@ async def admin_bulk_add_complementary_products(request: Request, bulk_data: Pro
     not_found = [product_id for product_id in bulk_data.ids if product_id not in found_ids]
 
     if found_ids:
+        # This is an explicit admin edit, same as _apply_product_update()
+        # (which this endpoint deliberately bypasses to get $addToSet
+        # instead of $set semantics) - so it must stamp updated_at the same
+        # way, regardless of whether any id in `add` was already present.
         await db.shopify_products.update_many(
             {"id": {"$in": list(found_ids)}},
-            {"$addToSet": {"complementary_product_ids": {"$each": bulk_data.add}}},
+            {
+                "$addToSet": {"complementary_product_ids": {"$each": bulk_data.add}},
+                "$set": {"updated_at": datetime.utcnow()},
+            },
         )
 
     return {"updated": len(found_ids), "not_found": not_found}
@@ -3648,9 +3655,13 @@ async def admin_bulk_add_equivalent_products(request: Request, bulk_data: Produc
     not_found = [product_id for product_id in bulk_data.ids if product_id not in found_ids]
 
     if found_ids:
+        # Same reasoning as /admin/products/bulk/complementary-add above.
         await db.shopify_products.update_many(
             {"id": {"$in": list(found_ids)}},
-            {"$addToSet": {"equivalent_product_ids": {"$each": bulk_data.add}}},
+            {
+                "$addToSet": {"equivalent_product_ids": {"$each": bulk_data.add}},
+                "$set": {"updated_at": datetime.utcnow()},
+            },
         )
 
     return {"updated": len(found_ids), "not_found": not_found}
@@ -4575,7 +4586,11 @@ async def admin_list_clients(request: Request, search: Optional[str] = None, lim
         ]
 
     total = await db.clients.count_documents(query)
-    cursor = db.clients.find(query).sort("name_normalized", 1).skip(skip).limit(limit)
+    # Newest-created client first, so admin sees recently-registered/-imported
+    # clients up top instead of alphabetically buried among 278+ others.
+    # Verified all db.clients docs already carry created_at (see import flow
+    # above) before switching off name_normalized ascending.
+    cursor = db.clients.find(query).sort("created_at", -1).skip(skip).limit(limit)
     clients = await cursor.to_list(limit)
     for c in clients:
         c.pop("_id", None)
