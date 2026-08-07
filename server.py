@@ -6338,10 +6338,33 @@ async def create_shopify_order(order_data: ShopifyOrderCreate):
         logger.error(f"Error creating Shopify order: {e}")
         raise HTTPException(status_code=500, detail=f"Eroare la crearea comenzii: {str(e)}")
 
+def _get_cors_allowed_origins() -> List[str]:
+    """Explicit CORS allowlist - allow_origins=["*"] together with
+    allow_credentials=True effectively let ANY origin make credentialed
+    requests against this API, which is what browsers' CORS spec is
+    supposed to prevent. CORS_ALLOWED_ORIGINS is a new, comma-separated
+    env var (e.g. "https://agb-agroparts.ro,https://admin.agb-agroparts.ro").
+    WEBSHOP_PUBLIC_URL (already used elsewhere, e.g. password-reset email
+    links) is always folded in too when set, as a reasonable default for
+    the storefront's own origin so this doesn't need to be configured
+    twice. If neither is set, the allowlist is empty (fail restrictive,
+    not "*") rather than silently falling back to allow-all."""
+    origins = set()
+    for origin in os.environ.get("CORS_ALLOWED_ORIGINS", "").split(","):
+        origin = origin.strip()
+        if origin:
+            origins.add(origin.rstrip("/"))
+
+    webshop_public_url = os.environ.get("WEBSHOP_PUBLIC_URL", "").strip()
+    if webshop_public_url:
+        origins.add(webshop_public_url.rstrip("/"))
+
+    return sorted(origins)
+
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=["*"],
+    allow_origins=_get_cors_allowed_origins(),
     allow_methods=["*"],
     allow_headers=["*"],
 )
