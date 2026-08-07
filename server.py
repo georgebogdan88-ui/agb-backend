@@ -24,6 +24,7 @@ import cloudinary
 import cloudinary.uploader
 import io
 from PIL import Image
+import bleach
 
 ROOT_DIR = Path(__file__).parent
 # Load .env but don't override existing environment variables (important for Render deployment)
@@ -3175,6 +3176,33 @@ async def get_user_shopify_orders(request: Request):
 
 # ==================== ADMIN ENDPOINTS ====================
 
+# `product.description` is stored here as the source of truth and later
+# rendered by the storefront (agb-webshop) via dangerouslySetInnerHTML - so
+# it must be sanitized server-side, at write time, not just trusted client
+# input. A strict allowlist (bleach, not hand-rolled regex - HTML
+# sanitization is notoriously easy to get subtly wrong that way) keeps only
+# basic formatting tags; script/style/iframe/on*-event-handler attributes/
+# javascript: URIs etc. are all stripped.
+_DESCRIPTION_ALLOWED_TAGS = ["p", "br", "b", "strong", "i", "em", "ul", "ol", "li", "a"]
+_DESCRIPTION_ALLOWED_ATTRS = {"a": ["href"]}
+_DESCRIPTION_ALLOWED_PROTOCOLS = ["http", "https", "mailto"]
+
+def sanitize_description_html(raw: Optional[str]) -> str:
+    """Strips anything outside the basic-formatting allowlist from a
+    product description before it's ever written to the database. Called
+    from every code path that writes `description` (admin_create_product,
+    _apply_product_update - shared by the single-product PUT and all bulk
+    update/save endpoints)."""
+    if not raw:
+        return raw or ""
+    return bleach.clean(
+        raw,
+        tags=_DESCRIPTION_ALLOWED_TAGS,
+        attributes=_DESCRIPTION_ALLOWED_ATTRS,
+        protocols=_DESCRIPTION_ALLOWED_PROTOCOLS,
+        strip=True,
+    )
+
 class ProductCreate(BaseModel):
     title: str
     description: str = ""
@@ -3414,13 +3442,14 @@ async def admin_create_product(request: Request, product_data: ProductCreate):
     product_id = f"local-{uuid.uuid4()}"
     now = datetime.utcnow()
     collections = build_collections(product_data.product_type, product_data.category, [])
+    sanitized_description = sanitize_description_html(product_data.description)
     product = {
         "id": product_id,
         "title": product_data.title,
         "handle": slugify(product_data.title),
-        "description": product_data.description,
+        "description": sanitized_description,
         "technical_specs": product_data.technical_specs,
-        "description_normalized": normalize_text(product_data.description),
+        "description_normalized": normalize_text(sanitized_description),
         "title_normalized": normalize_text(product_data.title),
         "price": product_data.price,
         "currency": product_data.currency,
@@ -3513,6 +3542,7 @@ async def _apply_product_update(product_id: str, product_data: ProductUpdate) ->
         update_dict["title_normalized"] = normalize_text(update_dict["title"])
         update_dict["handle"] = slugify(update_dict["title"])
     if "description" in update_dict:
+        update_dict["description"] = sanitize_description_html(update_dict["description"])
         update_dict["description_normalized"] = normalize_text(update_dict["description"])
     # ProductForm always resubmits the full Tip+Categorie selection together,
     # so it's safe to always rebuild `collections` here rather than trying
