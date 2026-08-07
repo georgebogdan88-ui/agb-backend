@@ -6803,13 +6803,31 @@ async def shopify_oauth_callback(code: str = None, state: str = None, shop: str 
     try:
         if not code:
             raise HTTPException(status_code=400, detail="No authorization code provided")
-        
-        # Exchange code for access token
-        # Use shop domain from callback or fallback to configured store
-        shop_domain = shop if shop else SHOPIFY_STORE
-        if shop_domain and not shop_domain.endswith('.myshopify.com'):
-            shop_domain = f"{shop_domain}.myshopify.com"
-        
+
+        # CSRF/nonce validation: `state` must match a nonce we generated and
+        # stored in /shopify/install, so this callback can only be completed
+        # as part of an OAuth flow we actually started - not replayed or
+        # forged by a third party. Single-use: find_one_and_delete both
+        # validates it and consumes it atomically, so the same nonce can
+        # never be redeemed twice.
+        if not state:
+            raise HTTPException(status_code=400, detail="Parametrul state lipsește")
+
+        nonce_doc = await db.shopify_nonces.find_one_and_delete({"nonce": state})
+        if not nonce_doc:
+            raise HTTPException(status_code=400, detail="Parametrul state este invalid sau a fost deja folosit")
+
+        expires_at = nonce_doc.get("expires_at")
+        if not expires_at or datetime.utcnow() > expires_at:
+            raise HTTPException(status_code=400, detail="Parametrul state a expirat")
+
+        # `shop` is client-controlled input - only ever proceed with the
+        # single store this backend is actually configured for, never
+        # whatever domain the query string happens to contain.
+        if shop and shop != SHOPIFY_STORE:
+            raise HTTPException(status_code=400, detail="Magazin Shopify nerecunoscut")
+
+        shop_domain = SHOPIFY_STORE
         token_url = f"https://{shop_domain}/admin/oauth/access_token"
         
         logger.info(f"Exchanging code at: {token_url}")
@@ -6854,31 +6872,28 @@ async def shopify_oauth_callback(code: str = None, state: str = None, shop: str 
                 upsert=True
             )
             
-            logger.info(f"Successfully obtained and stored Shopify Admin API token")
-            
-            # Return success HTML page
-            html = f"""
+            logger.info("Successfully obtained and stored Shopify Admin API token")
+
+            # Return a generic success page - the token itself is never
+            # rendered/logged anywhere, not even partially. It's already
+            # persisted in db.shopify_tokens (see the update_one() above);
+            # anyone needing it for the SHOPIFY_ADMIN_TOKEN env var should
+            # read it from there directly, not from this response.
+            html = """
             <!DOCTYPE html>
             <html>
             <head>
                 <title>AGB Mobile API - Succes!</title>
                 <style>
-                    body {{ font-family: Arial, sans-serif; text-align: center; padding: 50px; background: #1a1a1a; color: #fff; }}
-                    .success {{ color: #367c2b; font-size: 24px; margin-bottom: 20px; }}
-                    .token {{ background: #2a2a2a; padding: 20px; border-radius: 8px; margin: 20px auto; max-width: 600px; word-break: break-all; }}
-                    .note {{ color: #f5a623; margin-top: 20px; }}
+                    body { font-family: Arial, sans-serif; text-align: center; padding: 50px; background: #1a1a1a; color: #fff; }
+                    .success { color: #367c2b; font-size: 24px; margin-bottom: 20px; }
+                    .note { color: #f5a623; margin-top: 20px; }
                 </style>
             </head>
             <body>
                 <h1 class="success">✅ Autorizare Reușită!</h1>
                 <p>Aplicația AGB Mobile API a fost autorizată cu succes.</p>
-                <div class="token">
-                    <strong>Access Token (salvat în baza de date):</strong><br><br>
-                    <code>{access_token[:20]}...{access_token[-10:]}</code>
-                </div>
-                <p class="note">⚠️ Pentru siguranță, adăugați acest token ca variabilă de mediu SHOPIFY_ADMIN_TOKEN în Render.</p>
-                <p>Token complet: <code>{access_token}</code></p>
-                <p>Puteți închide această pagină.</p>
+                <p class="note">Token-ul a fost salvat direct în baza de date. Puteți închide această pagină.</p>
             </body>
             </html>
             """
