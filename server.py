@@ -385,6 +385,32 @@ def generate_token() -> str:
 # session rather than being rejected (see _issue_session_token).
 MAX_DEVICE_TOKENS = 3
 
+# TTL for session tokens minted from this deploy onward (see
+# _new_session_token_doc). Configurable via SESSION_TOKEN_TTL_DAYS;
+# defaults to 30 days - this is a customer-facing storefront, not an
+# internal admin console, so sessions don't need to be as short-lived as
+# e.g. a back-office tool's.
+SESSION_TOKEN_TTL_DAYS = int(os.environ.get("SESSION_TOKEN_TTL_DAYS", "30"))
+
+
+def _new_session_token_doc() -> dict:
+    """Build a new `tokens[]` entry for a freshly-issued session.
+
+    Sessions minted from this deploy onward are stored as OBJECTS
+    (`{"token", "created_at", "expires_at"}`), not bare strings, so they
+    carry a real, enforced expiry - see _find_user_by_token for how expiry
+    is actually checked. Sessions issued before this deploy remain bare
+    strings in `tokens[]` and are intentionally left alone (never
+    retroactively expired - see _find_user_by_token's docstring): this
+    only changes what NEW logins/registrations get from here on.
+    """
+    now = datetime.utcnow()
+    return {
+        "token": generate_token(),
+        "created_at": now,
+        "expires_at": now + timedelta(days=SESSION_TOKEN_TTL_DAYS),
+    }
+
 
 async def _issue_session_token(email: str) -> str:
     """Mint and persist a new session token for the given user. Enforces
@@ -397,30 +423,46 @@ async def _issue_session_token(email: str) -> str:
 
     Atomic by construction: `$push` with `$each`/`$slice` is a single
     update_one, so concurrent logins for the same account can't race into
-    an over-sized array.
+    an over-sized array. `$slice` works the same regardless of whether the
+    array holds legacy bare-string entries, new object entries, or a mix
+    of both (it just keeps the last MAX_DEVICE_TOKENS elements, whatever
+    their type) - so an account transitioning from all-legacy to
+    mixed-to-all-new tokens over several logins evicts correctly at every
+    step.
     """
-    new_token = generate_token()
+    token_doc = _new_session_token_doc()
     await db.users.update_one(
         {"email": email},
-        {"$push": {"tokens": {"$each": [new_token], "$slice": -MAX_DEVICE_TOKENS}}},
+        {"$push": {"tokens": {"$each": [token_doc], "$slice": -MAX_DEVICE_TOKENS}}},
     )
-    return new_token
+    return token_doc["token"]
 
 
 async def _find_user_by_token(token: str, allow_shopify_access_token: bool = False) -> Optional[dict]:
     """Resolve a bearer token to a user doc.
 
-    Checks the `tokens` array (current, multi-device scheme) first, then
-    falls back to a legacy singular `token` field for any account the
-    one-time startup migration hasn't converted yet (belt-and-braces safety
-    net - in steady state every account should already have `tokens`).
+    Matches, in a single query, ALL of:
+    - a legacy bare-string entry in `tokens[]` (pre-this-deploy sessions -
+      still never expire; forcing them to would silently log out every
+      real customer with an active session the moment this ships), OR
+    - a legacy singular `token` field for any account the one-time startup
+      migration hasn't converted yet (belt-and-braces safety net - in
+      steady state every account should already have `tokens`), OR
+    - a new-format object entry in `tokens[]` (`{"token", "expires_at",
+      ...}`) whose `expires_at` hasn't passed yet - once it has, that
+      token simply stops matching here (effectively expired) without any
+      separate cleanup job needing to run.
 
     When `allow_shopify_access_token` is set, also matches on the user's
     stored Shopify customer access token, matching the handful of endpoints
     (equipment CRUD) that have always accepted either credential type as a
     bearer token.
     """
-    or_clauses = [{"tokens": token}, {"token": token}]
+    or_clauses = [
+        {"tokens": token},
+        {"token": token},
+        {"tokens": {"$elemMatch": {"token": token, "expires_at": {"$gt": datetime.utcnow()}}}},
+    ]
     if allow_shopify_access_token:
         or_clauses.append({"shopify_access_token": token})
     return await db.users.find_one({"$or": or_clauses})
@@ -2453,7 +2495,8 @@ async def register_user(user_data: UserRegister, background_tasks: BackgroundTas
         raise HTTPException(status_code=400, detail="Adresa de email este deja înregistrată")
 
     user_id = str(uuid.uuid4())
-    local_token = generate_token()
+    token_doc = _new_session_token_doc()
+    local_token = token_doc["token"]
     created_at = datetime.utcnow()
 
     user = {
@@ -2485,7 +2528,7 @@ async def register_user(user_data: UserRegister, background_tasks: BackgroundTas
         "company_address_oras": None,
         "company_address_judet": None,
         "company_address_cod_postal": None,
-        "tokens": [local_token],
+        "tokens": [token_doc],
         "is_shopify_customer": False,
         "created_at": created_at
     }
@@ -2865,8 +2908,9 @@ async def _legacy_shopify_login_and_migrate(email: str, password: str, existing_
         user_update_data["created_at"] = datetime.utcnow()
         created_at = user_update_data["created_at"]
         # Brand new account - no existing sessions, so no cap check needed.
-        local_token = generate_token()
-        user_update_data["tokens"] = [local_token]
+        token_doc = _new_session_token_doc()
+        local_token = token_doc["token"]
+        user_update_data["tokens"] = [token_doc]
         await db.users.insert_one(user_update_data)
 
     # Extract Shopify orders (only available on this legacy/Shopify-verified path)
@@ -3081,13 +3125,27 @@ async def update_current_user(request: Request, update_data: UserUpdate, backgro
 async def logout_user(request: Request):
     """Logout the current device only: free up this token's slot in the
     `tokens` array so the user can log back in elsewhere without hitting the
-    device cap, without touching that user's other active sessions."""
+    device cap, without touching that user's other active sessions.
+
+    `tokens[]` now holds a mix of legacy bare-string entries and new
+    object entries (see _new_session_token_doc/_find_user_by_token), and a
+    single `$pull` condition can't match both a scalar-equality entry and
+    an embedded-document field match at the same time - so this runs two
+    separate $pull operations, one per shape. Both always run rather than
+    looking up the token's shape first (cheap, and idempotent - whichever
+    one doesn't match this token is just a no-op)."""
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
         token = auth_header.replace("Bearer ", "")
+        # Legacy bare-string entries.
         await db.users.update_one(
             {"tokens": token},
             {"$pull": {"tokens": token}}
+        )
+        # New-format object entries.
+        await db.users.update_one(
+            {"tokens": {"$elemMatch": {"token": token}}},
+            {"$pull": {"tokens": {"token": token}}}
         )
         # Legacy safety net: also clear it if this account still had it
         # stored as a single un-migrated `token` field (see
@@ -3097,6 +3155,29 @@ async def logout_user(request: Request):
             {"$unset": {"token": ""}}
         )
     return {"message": "Deconectat cu succes"}
+
+
+@api_router.post("/auth/logout-all")
+async def logout_all_devices(request: Request):
+    """Logout every device/session for the current account at once (full
+    session revocation) - clears `tokens[]` entirely, same as what
+    /auth/reset-password already does as a side effect of changing the
+    password. Requires a currently-valid token to call, same as any other
+    authenticated endpoint."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Token lipsă sau invalid")
+
+    token = auth_header.replace("Bearer ", "")
+    user = await _find_user_by_token(token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Token invalid sau expirat")
+
+    await db.users.update_one(
+        {"id": user["id"]},
+        {"$set": {"tokens": []}, "$unset": {"token": ""}},
+    )
+    return {"message": "Toate sesiunile au fost deconectate cu succes"}
 
 @api_router.get("/auth/orders")
 async def get_user_orders(request: Request):
@@ -6731,6 +6812,15 @@ async def startup_event():
         await db.users.create_index("token")
     except Exception:
         logger.exception("Failed to create index on users.token")
+    # New-format session entries are embedded documents inside tokens[]
+    # (see _new_session_token_doc) - the plain "tokens" index above indexes
+    # each array element as a whole (works for the legacy bare-string
+    # match), but the $elemMatch-on-subfield lookup for these needs its own
+    # index on the "tokens.token" dotted path to avoid a collection scan.
+    try:
+        await db.users.create_index("tokens.token")
+    except Exception:
+        logger.exception("Failed to create index on users.tokens.token")
 
     # Every cart read/write filters by session_id (get_cart, add_to_cart's
     # existing-item lookup, create_order's cleanup) - without this, each one
