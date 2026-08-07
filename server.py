@@ -136,6 +136,15 @@ class Product(BaseModel):
     complementary_product_ids: List[str] = []
     equivalent_product_ids: List[str] = []
     is_featured: bool = False
+    # When this product doc was first created (manual admin create, or first
+    # picked up by sync_all_products()) / last had a real content change
+    # (admin edit, or a Shopify resync that actually picked up different
+    # data - NOT a resync that just re-confirms identical data). Optional
+    # because products synced before this field existed won't have it until
+    # scripts/backfill_product_timestamps.py runs; None is a legitimate,
+    # if hopefully transient, value here.
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
     # Utilaje de vânzare only (product_type == "Utilaje") - a used-equipment
     # spec sheet, same shape as a marketplace listing (year/hours/power/
     # transmission/tires/max speed). Left unset for spare-parts products.
@@ -794,6 +803,33 @@ async def sync_collections_to_products():
     logger.info(f"Updated {updates} products with collection info")
     return updates
 
+# Fields sync_all_products() itself derives fresh from Shopify on every run
+# (via parse_shopify_node(), plus the preserved-image/complementary/featured/
+# equivalent overrides applied right before the comparison). Deliberately
+# excludes bookkeeping-only fields (synced_at, created_at, updated_at) and
+# admin-curated fields that are always copied verbatim from the existing doc
+# when present (complementary_product_ids, equivalent_product_ids,
+# is_featured, cf_image_id, cf_image_url, cloudflare_rollout) - those can
+# never differ here, so comparing them would be a no-op at best.
+_PRODUCT_SYNC_COMPARISON_FIELDS = [
+    "title", "handle", "description", "description_normalized", "title_normalized",
+    "price", "currency", "image_url", "images", "tags", "product_type", "vendor",
+    "stock", "stock_status", "sku", "compatible_models",
+]
+
+def _product_sync_content_changed(new_product: dict, existing_doc: dict) -> bool:
+    """Whether a freshly-parsed Shopify product actually differs from what's
+    already stored in db.shopify_products, on the fields sync_all_products()
+    derives from Shopify. Used to decide whether a periodic auto-resync
+    should bump `updated_at`: re-confirming identical data (the common case,
+    since most products don't change between two syncs) must NOT look like a
+    fresh edit, but picking up a real Shopify-side change (price, stock,
+    description, ...) should."""
+    for field in _PRODUCT_SYNC_COMPARISON_FIELDS:
+        if new_product.get(field) != existing_doc.get(field):
+            return True
+    return False
+
 async def sync_all_products():
     """Sync ALL products from Shopify to MongoDB"""
     global sync_status
@@ -877,10 +913,38 @@ async def sync_all_products():
             ).to_list(None)
         }
 
+        # Preserve created_at/updated_at across the delete+reinsert below, and
+        # capture enough of each existing doc's own Shopify-derived fields to
+        # tell whether this sync actually changed anything for it (see
+        # _product_sync_content_changed() below). Without this, every single
+        # periodic auto-sync (AUTO_SYNC_INTERVAL_MINUTES) would look like a
+        # fresh edit of all ~15,000 products, making updated_at useless for
+        # "what did an admin actually touch recently" sorting/display.
+        existing_products_by_id = {
+            p["id"]: p
+            for p in await db.shopify_products.find(
+                {"source": {"$ne": "manual"}},
+                {
+                    "id": 1, "title": 1, "handle": 1, "description": 1,
+                    "description_normalized": 1, "title_normalized": 1,
+                    "price": 1, "currency": 1, "image_url": 1, "images": 1,
+                    "tags": 1, "product_type": 1, "vendor": 1, "stock": 1,
+                    "stock_status": 1, "sku": 1, "compatible_models": 1,
+                    "created_at": 1, "updated_at": 1, "synced_at": 1,
+                },
+            ).to_list(None)
+        }
+
         # Clear existing Shopify-synced products, but keep manually-created
         # products (source="manual") - those aren't part of the Shopify catalog
         # and would be permanently lost if wiped here.
         await db.shopify_products.delete_many({"source": {"$ne": "manual"}})
+
+        # Single timestamp for everything created_at/updated_at stamps during
+        # this whole sync run, rather than a slightly different one per
+        # product - matches how sync_status["last_sync"] is stamped once at
+        # the end below.
+        sync_run_at = datetime.utcnow()
 
         after = None
         total_products = 0
@@ -912,6 +976,23 @@ async def sync_all_products():
                         product["cf_image_url"] = preserved["cf_image_url"]
                     if preserved["cloudflare_rollout"] is not None:
                         product["cloudflare_rollout"] = preserved["cloudflare_rollout"]
+
+                existing_doc = existing_products_by_id.get(product["id"])
+                if existing_doc is None:
+                    # Genuinely new to the catalog since the last sync.
+                    product["created_at"] = sync_run_at
+                    product["updated_at"] = sync_run_at
+                else:
+                    product["created_at"] = (
+                        existing_doc.get("created_at")
+                        or existing_doc.get("synced_at")
+                        or sync_run_at
+                    )
+                    if _product_sync_content_changed(product, existing_doc):
+                        product["updated_at"] = sync_run_at
+                    else:
+                        product["updated_at"] = existing_doc.get("updated_at") or product["created_at"]
+
                 batch.append(product)
                 total_products += 1
             
@@ -941,7 +1022,10 @@ async def sync_all_products():
         await db.shopify_products.create_index("product_type")
         await db.shopify_products.create_index("compatible_models")
         await db.shopify_products.create_index("collections")  # New index for collections
-        
+        # created_at/updated_at indexes are created once in startup_event()
+        # below (try/except-wrapped there so an index hiccup never blocks
+        # server boot) rather than re-created on every sync run here.
+
         sync_status["total_synced"] = total_products
         sync_status["last_sync"] = datetime.utcnow().isoformat()
         logger.info(f"Sync complete! Total products: {total_products}")
@@ -1004,6 +1088,15 @@ SORT_FIELDS = {
     "price_asc": ("price", 1),
     "price_desc": ("price", -1),
     "title_asc": ("title_normalized", 1),
+    # Used by the admin product list (GET /admin/products?sort=...) to show
+    # newest-created / most-recently-modified products first. Also usable on
+    # the public GET /products (opt-in only - the default, unsorted/relevance
+    # behavior there is unchanged). Products synced/created before this field
+    # existed sort as if created_at/updated_at were missing (Mongo puts
+    # missing-field docs first in ascending sort / last in descending sort)
+    # until scripts/backfill_product_timestamps.py backfills them.
+    "created_at_desc": ("created_at", -1),
+    "updated_at_desc": ("updated_at", -1),
 }
 
 
@@ -3211,7 +3304,13 @@ async def _require_admin(request: Request) -> dict:
     return user
 
 @api_router.get("/admin/products")
-async def admin_list_products(request: Request, search: Optional[str] = None, limit: int = 100, skip: int = 0):
+async def admin_list_products(
+    request: Request,
+    search: Optional[str] = None,
+    sort: Optional[str] = None,
+    limit: int = 100,
+    skip: int = 0,
+):
     """List/search the full product catalog (originally Shopify-imported
     products and manually-created ones alike - both are now owned by this
     database, see sync_all_products()). Returns a total count alongside the
@@ -3225,13 +3324,25 @@ async def admin_list_products(request: Request, search: Optional[str] = None, li
     and "6630 premium" both match). No product_type/collection filter is
     passed since this endpoint doesn't accept those params, and unlike the
     storefront, admin intentionally has no default stock/status filter -
-    it must be able to find and edit out-of-stock products too."""
+    it must be able to find and edit out-of-stock products too.
+
+    `sort` accepts the same values as the public GET /products (see
+    SORT_FIELDS - e.g. "created_at_desc", "updated_at_desc", "price_asc",
+    "price_desc", "title_asc") and defaults to the pre-existing
+    title_normalized-ascending order when omitted or unrecognized, so
+    existing admin callers are unaffected."""
     await _require_admin(request)
 
     query = build_products_query(search, None, None)
 
     total = await db.shopify_products.count_documents(query)
-    cursor = db.shopify_products.find(query).sort("title_normalized", 1).skip(skip).limit(limit)
+    cursor = db.shopify_products.find(query)
+    if sort and sort in SORT_FIELDS:
+        field, direction = SORT_FIELDS[sort]
+        cursor = cursor.sort(field, direction)
+    else:
+        cursor = cursor.sort("title_normalized", 1)
+    cursor = cursor.skip(skip).limit(limit)
     products = await cursor.to_list(limit)
     return {"items": [Product(**p) for p in products], "total": total}
 
@@ -3334,6 +3445,7 @@ async def admin_create_product(request: Request, product_data: ProductCreate):
         "equipment_max_speed": product_data.equipment_max_speed,
         "source": "manual",
         "created_at": now,
+        "updated_at": now,
     }
     await db.shopify_products.insert_one(product)
     return Product(**product)
@@ -3408,6 +3520,12 @@ async def _apply_product_update(product_id: str, product_data: ProductUpdate) ->
     # full resync ever runs again, it won't get silently reverted back to
     # its old Shopify-imported values.
     update_dict["source"] = "manual"
+    # This function is only ever reached via an explicit admin edit (single
+    # or bulk) - unlike sync_all_products()'s periodic auto-resync, which
+    # deliberately does NOT bump updated_at when it's just re-confirming
+    # unchanged data - so every call here is a real edit and always stamps
+    # updated_at, regardless of which fields the patch actually touched.
+    update_dict["updated_at"] = datetime.utcnow()
 
     if update_dict:
         await db.shopify_products.update_one({"id": product_id}, {"$set": update_dict})
@@ -3716,6 +3834,9 @@ async def admin_upload_image(
             # guaranteed to match image_url, so there's no reason to keep
             # serving Cloudinary/an unrelated stale Cloudflare image.
             "cloudflare_rollout": True,
+            # Directly changes this product's image, so it counts as a real
+            # edit the same way _apply_product_update()'s PUT does.
+            "updated_at": datetime.utcnow(),
         }
         old_image_url = existing_product.get("image_url")
         images = existing_product.get("images") or []
@@ -6393,6 +6514,18 @@ async def startup_event():
         await db.shopify_products.create_index("stock")
     except Exception:
         logger.exception("Failed to create index on shopify_products.stock")
+
+    # Admin product list "sort by newest/recently updated"
+    # (?sort=created_at_desc / ?sort=updated_at_desc, see SORT_FIELDS) -
+    # without these, each such sort scans the whole catalog.
+    try:
+        await db.shopify_products.create_index("created_at")
+    except Exception:
+        logger.exception("Failed to create index on shopify_products.created_at")
+    try:
+        await db.shopify_products.create_index("updated_at")
+    except Exception:
+        logger.exception("Failed to create index on shopify_products.updated_at")
 
     # Account order history (GET /auth/orders) filters by customer.email -
     # without this, each request scans the whole orders collection.
