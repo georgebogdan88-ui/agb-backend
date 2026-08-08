@@ -20,6 +20,7 @@ import hashlib
 import hmac
 import secrets
 import bcrypt
+import jwt
 import time
 import random
 from collections import defaultdict, deque
@@ -63,6 +64,17 @@ BREVO_API_KEY = os.environ.get('BREVO_API_KEY', '')
 # CRM Integration Configuration (fire-and-forget order sync to agb-crm)
 CRM_API_URL = os.environ.get('CRM_API_URL', '')
 CRM_INTEGRATION_KEY = os.environ.get('CRM_INTEGRATION_KEY', '')
+
+# BFF (Backend-for-Frontend) admin auth: CRM signs short-lived (5-15 min)
+# Ed25519 JWTs after a staff member authenticates on the CRM side, and this
+# backend only ever VERIFIES them (see _verify_bff_jwt) with the matching
+# public key, as an additional accepted credential type for /admin/* routes
+# alongside the existing native webshop admin session tokens - see
+# _require_admin. This backend never signs/issues these tokens - that
+# happens exclusively on CRM. Deliberately no default/fallback value: if
+# unset, the BFF path is simply inactive and every environment keeps
+# authenticating admins exactly the way it does today.
+CRM_BFF_JWT_PUBLIC_KEY = os.environ.get('CRM_BFF_JWT_PUBLIC_KEY', '')
 
 # Auto-sync configuration
 AUTO_SYNC_INTERVAL_MINUTES = int(os.environ.get('AUTO_SYNC_INTERVAL_MINUTES', '5'))  # Default 5 minutes
@@ -3686,15 +3698,130 @@ def build_collections(product_type: Optional[str], category: Optional[str], exis
 
     return preserved + derived
 
+# ==================== BFF ADMIN JWT (CRM-signed, verify-only) ====================
+# CRM signs short-lived (5-15 min) Ed25519 JWTs for a staff member's admin
+# session and this backend verifies them as an additional accepted
+# credential for /admin/* routes, alongside (not instead of) the existing
+# native webshop admin session tokens - see _require_admin below, which
+# tries this path first only when the bearer value structurally looks like
+# a JWT, and otherwise falls through unchanged to the native-token lookup.
+# This backend never signs/mints these tokens itself.
+
+BFF_JWT_AUDIENCE = "agb-backend-admin"
+BFF_JWT_ISSUER = "agb-crm-bff"
+_JWT_SEGMENT_RE = re.compile(r'^[A-Za-z0-9_-]+$')
+
+
+def _looks_like_jwt(token: str) -> bool:
+    """Cheap structural check (3 non-empty base64url segments separated by
+    '.') used to route a bearer token to the BFF-JWT verification path
+    instead of the native-token lookup, without waiting for jwt.decode to
+    fail first. Native webshop session tokens are opaque uuid4-derived hex
+    strings (see _new_session_token_doc) and never contain a '.', so they
+    always fail this check and fall through unchanged."""
+    parts = token.split(".")
+    return len(parts) == 3 and all(p and _JWT_SEGMENT_RE.match(p) for p in parts)
+
+
+async def _is_bff_session_revoked(staff_user_id: str, issued_at: datetime) -> bool:
+    """True if CRM revoked this staff user's BFF admin sessions at/after the
+    moment this particular token was issued (see POST
+    /api/internal/revoke-bff-admin below, which inserts the record this
+    checks against). A revocation only invalidates tokens issued at or
+    before the revocation instant - a *new* token CRM mints for the same
+    staff user afterwards is unaffected."""
+    doc = await db.bff_revoked_sessions.find_one({
+        "staff_user_id": staff_user_id,
+        "revoked_at": {"$gte": issued_at},
+    })
+    return doc is not None
+
+
+async def _verify_bff_jwt(token: str) -> dict:
+    """Verify a CRM-issued BFF admin JWT (Ed25519 / EdDSA) and return it in
+    the same shape the native-token path in _require_admin returns
+    ({"id", "email", "role": "admin"}), plus "jti"/"auth_source" so existing
+    code that only ever read admin["id"]/admin.get("email") (e.g. the audit
+    log) keeps working unmodified no matter which auth path was used.
+
+    Every failure mode (missing public key, bad signature, expired, wrong
+    audience/issuer, missing/malformed claims, revoked) raises the same
+    generic HTTPException(401) with no internal detail exposed - callers
+    (i.e. _require_admin) can treat this function as all-or-nothing."""
+    if not CRM_BFF_JWT_PUBLIC_KEY:
+        # Mechanism not provisioned in this environment. _require_admin
+        # already guards the call site on this same env var so this branch
+        # shouldn't normally be reached, but fail closed here too rather
+        # than ever risk treating an unverifiable token as valid.
+        raise HTTPException(status_code=401, detail="Token invalid sau expirat")
+
+    try:
+        payload = jwt.decode(
+            token,
+            CRM_BFF_JWT_PUBLIC_KEY,
+            algorithms=["EdDSA"],
+            audience=BFF_JWT_AUDIENCE,
+            issuer=BFF_JWT_ISSUER,
+            # exp/iat aren't required by PyJWT's own defaults (a token
+            # simply omitting "exp" would otherwise be accepted with no
+            # expiry check at all) - explicitly require both: exp because
+            # every BFF token is supposed to be short-lived, and iat
+            # because _is_bff_session_revoked needs it as the "issued at"
+            # instant to compare against a revocation. aud/iss presence is
+            # already implicitly required by passing audience=/issuer=
+            # above (PyJWT rejects a token missing either claim, confirmed
+            # by test - see the coordinator report for this task).
+            options={"require": ["exp", "iat"]},
+        )
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Token invalid sau expirat")
+
+    sub = payload.get("sub")
+    email = payload.get("email")
+    jti = payload.get("jti")
+    scopes = payload.get("scopes")
+    iat = payload.get("iat")
+
+    if (
+        not isinstance(sub, str) or not sub
+        or not isinstance(email, str) or not email
+        or not isinstance(jti, str) or not jti
+        or not isinstance(scopes, list)
+        or "webshop_admin" not in scopes
+    ):
+        raise HTTPException(status_code=401, detail="Token invalid sau expirat")
+
+    issued_at = datetime.utcfromtimestamp(iat)
+    if await _is_bff_session_revoked(sub, issued_at):
+        raise HTTPException(status_code=401, detail="Token invalid sau expirat")
+
+    return {"id": sub, "email": email, "role": "admin", "jti": jti, "auth_source": "bff"}
+
+
 async def _require_admin(request: Request) -> dict:
     """Resolve the bearer token to a user and confirm they have the admin
     role. There's no self-serve way to become admin - the role is only ever
-    set directly in the database for the store owner's own account."""
+    set directly in the database for the store owner's own account.
+
+    Accepts two credential types, tried in this order:
+    1. A CRM-signed BFF admin JWT (see _verify_bff_jwt) - only attempted
+       when CRM_BFF_JWT_PUBLIC_KEY is actually configured in this
+       environment AND the bearer value structurally looks like a JWT (see
+       _looks_like_jwt). Environments where the BFF mechanism isn't
+       provisioned, or requests carrying a native token, never enter this
+       branch at all.
+    2. The existing native webshop admin session token lookup (unchanged
+       from before the BFF mechanism existed) - every other case.
+    """
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Token lipsă sau invalid")
 
     token = auth_header.replace("Bearer ", "")
+
+    if CRM_BFF_JWT_PUBLIC_KEY and _looks_like_jwt(token):
+        return await _verify_bff_jwt(token)
+
     user = await _find_user_by_token(token)
 
     if not user:
