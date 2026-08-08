@@ -4,6 +4,7 @@ from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo.errors import OperationFailure
 import os
 import logging
 from pathlib import Path
@@ -2382,6 +2383,189 @@ async def sync_order_update_to_crm(order: Order):
         )
 
 
+class _InsufficientStockAbort(Exception):
+    """Raised inside a stock-reservation transaction callback to force
+    with_transaction() to abort (not commit, not retry) as soon as any line
+    item fails its conditional stock check. Never raised outside that
+    callback - caught immediately around the with_transaction() call, never
+    allowed to bubble further."""
+
+    def __init__(self, product_ids: List[str]):
+        self.product_ids = product_ids
+
+
+# Substrings that identify "this Mongo deployment doesn't support
+# multi-document transactions" as opposed to some other, genuine
+# OperationFailure we should NOT swallow. Real pymongo against a standalone
+# (non-replica-set) mongod raises OperationFailure with a message like
+# "Transaction numbers are only allowed on a replica set member or mongos".
+# mongomock-motor (used in tests - see scripts/test_stock_checkout.py)
+# doesn't implement sessions at all and raises NotImplementedError with
+# "Mongomock does not support sessions yet" instead - different exception
+# type, so it's listed separately below, but detected the same way.
+_NO_TRANSACTION_SUPPORT_MARKERS = ("replica set", "mongos", "does not support sessions")
+
+
+def _looks_like_no_transaction_support(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(marker in message for marker in _NO_TRANSACTION_SUPPORT_MARKERS)
+
+
+async def _decrement_stock_once(quantities: Dict[str, int], session) -> List[str]:
+    """Try to atomically check-and-decrement every product in `quantities`
+    (product_id -> total quantity requested across the order's line items).
+
+    Each product's check-and-decrement is a single conditional
+    find_one_and_update: the filter requires stock >= requested quantity,
+    and the update $inc's stock down by that quantity in the same
+    operation, so a single product's decrement is always race-safe against
+    concurrent checkouts on its own, transaction or not. When stock lands
+    exactly on 0, stock_status also flips to "out_of_stock" in the same
+    pass - unless it's "supplier_stock" (backorder-from-supplier, still
+    orderable at 0 stock - see _shopify_product_to_dict), which must not be
+    overwritten by a plain zero-stock decrement.
+
+    Returns the list of product_ids that did NOT have enough stock (or
+    don't exist). Does not itself decide what to do about a non-empty
+    result - see the two callers below (transaction path just lets the
+    caller abort; no-session fallback path compensates manually)."""
+    insufficient: List[str] = []
+    for product_id, qty in quantities.items():
+        result = await db.shopify_products.find_one_and_update(
+            {"id": product_id, "stock": {"$gte": qty}},
+            {"$inc": {"stock": -qty}},
+            session=session,
+            return_document=True,
+        )
+        if result is None:
+            insufficient.append(product_id)
+            continue
+        if result["stock"] == 0 and result.get("stock_status") != "supplier_stock":
+            await db.shopify_products.update_one(
+                {"id": product_id},
+                {"$set": {"stock_status": "out_of_stock"}},
+                session=session,
+            )
+    return insufficient
+
+
+async def _compensate_stock(quantities: Dict[str, int], succeeded: List[str]) -> None:
+    """No-session fallback only: undo the decrements already applied for
+    `succeeded` product_ids after a later item in the same order failed its
+    check. Not needed on the transaction path - an aborted transaction
+    never persists any of its writes, so there's nothing to undo there."""
+    for product_id in succeeded:
+        await db.shopify_products.update_one(
+            {"id": product_id},
+            {"$inc": {"stock": quantities[product_id]}},
+        )
+        # Best-effort: if this put stock back above 0, flip stock_status
+        # back off "out_of_stock" so a rolled-back item doesn't get stuck
+        # looking unavailable. Not atomic with the $inc above (fallback
+        # path only - see _reserve_stock_for_order), but this is a rollback
+        # of our own just-made change, not a customer-facing race.
+        product = await db.shopify_products.find_one({"id": product_id}, {"stock": 1, "stock_status": 1})
+        if product and product.get("stock", 0) > 0 and product.get("stock_status") == "out_of_stock":
+            await db.shopify_products.update_one(
+                {"id": product_id},
+                {"$set": {"stock_status": "in_stock"}},
+            )
+
+
+async def _reserve_stock_for_order(items: List[dict]) -> None:
+    """Atomically check-and-decrement stock for every line item of an
+    order, all-or-nothing: if ANY line item doesn't have enough stock, NO
+    line item's stock ends up decremented. Raises HTTPException(409) naming
+    the out-of-stock product(s) if the reservation can't be made.
+
+    Primary strategy: a single multi-document Mongo transaction wrapping
+    every line item's conditional find_one_and_update (see
+    _decrement_stock_once). This process's Mongo connection is an Atlas
+    cluster (see the maxPoolSize comment near the top of this file, which
+    explicitly says this process shares an Atlas M0 budget with agb-crm) -
+    every Atlas cluster, including the free M0 tier, is provisioned as a
+    replica set, so multi-document transactions are available and are the
+    right tool here: wrap all of an order's per-item decrements in one
+    transaction and let a failed item abort the whole thing, rather than
+    hand-rolling compensating rollback for the common case.
+
+    Defensive fallback: if this ever runs against a Mongo deployment that
+    is NOT a replica set (e.g. a bare local mongod in some future dev
+    setup - this should never happen against the real Atlas deployment),
+    the driver raises OperationFailure the moment the transaction's first
+    operation runs. Rather than let checkout hard-fail with a 500 in that
+    case, that specific condition is caught once and we fall back to
+    sequential per-item atomic find_one_and_update calls with manual
+    compensating rollback (re-$inc any already-decremented items) if a
+    later item fails. Each individual item's check-and-decrement is still
+    race-safe on this fallback path since find_one_and_update is always
+    atomic per-document - the only thing the fallback can't guarantee is
+    that a concurrent checkout can never interleave BETWEEN two items of
+    the SAME multi-item order (a vanishingly narrow window, and still never
+    results in oversell of any single product, only a slightly late
+    rollback of one already-decremented item)."""
+    quantities: Dict[str, int] = {}
+    for item in items:
+        product_id = item.get("product_id")
+        quantity = int(item.get("quantity", 1))
+        # A zero/negative quantity here isn't just meaningless, it's
+        # actively dangerous against the $inc-based decrement below: a
+        # negative quantity would make {"stock": {"$gte": qty}} match
+        # almost anything and turn "$inc stock by -qty" into a stock
+        # INCREASE, letting a crafted request inflate a product's stock.
+        # Reject before any stock is touched.
+        if quantity <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cantitate invalidă pentru produsul {product_id}.",
+            )
+        quantities[product_id] = quantities.get(product_id, 0) + quantity
+
+    insufficient: List[str] = []
+
+    async def _txn_callback(session):
+        nonlocal insufficient
+        insufficient = await _decrement_stock_once(quantities, session=session)
+        if insufficient:
+            # Abort - do not commit any of this callback's writes. Not
+            # labeled TransientTransactionError, so with_transaction()
+            # propagates it immediately without retrying.
+            raise _InsufficientStockAbort(insufficient)
+
+    try:
+        async with await client.start_session() as session:
+            await session.with_transaction(_txn_callback)
+    except _InsufficientStockAbort as abort:
+        insufficient = abort.product_ids
+    except (OperationFailure, NotImplementedError) as e:
+        if not _looks_like_no_transaction_support(e):
+            raise
+        logger.warning(
+            "Stock reservation: Mongo deployment doesn't support multi-document "
+            "transactions (%s) - falling back to sequential per-item reservation "
+            "with manual compensating rollback.", e,
+        )
+        # No session: every find_one_and_update below is individually
+        # atomic and commits immediately (there's no transaction to abort),
+        # so unlike the transaction path we must explicitly undo whichever
+        # items DID succeed if any other item in the same order failed.
+        insufficient = await _decrement_stock_once(quantities, session=None)
+        if insufficient:
+            succeeded = [pid for pid in quantities if pid not in insufficient]
+            await _compensate_stock(quantities, succeeded)
+
+    if insufficient:
+        products = await db.shopify_products.find(
+            {"id": {"$in": insufficient}}, {"id": 1, "title": 1}
+        ).to_list(len(insufficient))
+        titles_by_id = {p["id"]: p.get("title") for p in products}
+        names = [titles_by_id.get(pid) or pid for pid in insufficient]
+        raise HTTPException(
+            status_code=409,
+            detail=f"Stoc epuizat de un alt client pentru: {', '.join(names)}.",
+        )
+
+
 @api_router.post("/orders", response_model=Order)
 async def create_order(order_data: OrderCreate, background_tasks: BackgroundTasks):
     """Create a new order"""
@@ -2392,6 +2576,12 @@ async def create_order(order_data: OrderCreate, background_tasks: BackgroundTask
     order_data.subtotal = sum(item["price"] * item.get("quantity", 1) for item in order_data.items)
     order_data.shipping = 25.0
     order_data.total = order_data.subtotal + order_data.shipping
+    # Atomic check-and-decrement of stock for every line item, all-or-
+    # nothing across the whole order - must happen after pricing (so a bad
+    # product_id already 400'd via _get_authoritative_price above) and
+    # before the order is actually persisted, so a rejected order never
+    # gets written to db.orders at all.
+    await _reserve_stock_for_order(order_data.items)
     order = Order(**order_data.dict())
     await db.orders.insert_one(order.dict())
     await db.cart.delete_many({"session_id": order_data.session_id})
