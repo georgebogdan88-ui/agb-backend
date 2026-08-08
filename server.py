@@ -75,6 +75,10 @@ CRM_INTEGRATION_KEY = os.environ.get('CRM_INTEGRATION_KEY', '')
 # unset, the BFF path is simply inactive and every environment keeps
 # authenticating admins exactly the way it does today.
 CRM_BFF_JWT_PUBLIC_KEY = os.environ.get('CRM_BFF_JWT_PUBLIC_KEY', '')
+# Separate shared secret from CRM_INTEGRATION_KEY above (that one is for the
+# unrelated /integrations/* channel) - authenticates CRM's call to
+# POST /api/internal/revoke-bff-admin. See _require_crm_bff_service_key.
+CRM_BFF_SERVICE_KEY = os.environ.get('CRM_BFF_SERVICE_KEY', '')
 
 # Auto-sync configuration
 AUTO_SYNC_INTERVAL_MINUTES = int(os.environ.get('AUTO_SYNC_INTERVAL_MINUTES', '5'))  # Default 5 minutes
@@ -6035,6 +6039,57 @@ def _require_crm_integration_key(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Invalid or missing X-Integration-Key")
 
 
+# ==================== INBOUND CRM -> BFF ADMIN SESSION REVOCATION ====================
+# Lets CRM force-invalidate an already-issued BFF admin JWT immediately
+# (staff logout, account disabled, suspected token leak, etc.) instead of
+# waiting out its own short (5-15 min) expiry - see _is_bff_session_revoked
+# and _verify_bff_jwt above. Deliberately a DIFFERENT shared secret
+# (CRM_BFF_SERVICE_KEY) from CRM_INTEGRATION_KEY just above, which is for
+# the unrelated /integrations/* channel - rotating/compromising one must
+# never affect the other.
+
+class RevokeBffAdminRequest(BaseModel):
+    staff_user_id: str
+
+
+def _require_crm_bff_service_key(request: Request) -> None:
+    """Same compare_digest pattern as _require_crm_integration_key just
+    above, with one deliberate difference: if CRM_BFF_SERVICE_KEY isn't
+    configured in this environment at all, this fails CLOSED with 503
+    (service unavailable) rather than 401. An unconfigured secret must
+    never be reachable by "just don't send the header" the way a wrong
+    value would be blocked - 503 makes the "this channel isn't provisioned
+    here" case unambiguous, both to CRM and in logs/monitoring, without
+    ever falling back to accepting all requests (fail-open)."""
+    if not CRM_BFF_SERVICE_KEY:
+        raise HTTPException(status_code=503, detail="BFF revocation channel not configured")
+    incoming = request.headers.get("X-CRM-BFF-Service-Key", "")
+    if not secrets.compare_digest(incoming, CRM_BFF_SERVICE_KEY):
+        raise HTTPException(status_code=401, detail="Invalid or missing X-CRM-BFF-Service-Key")
+
+
+@api_router.post("/internal/revoke-bff-admin")
+async def revoke_bff_admin(request: Request, payload: RevokeBffAdminRequest):
+    """Record an immediate revocation for every BFF admin JWT already issued
+    to `staff_user_id` at or before this moment. Idempotent to call
+    repeatedly (each call just inserts another row - _is_bff_session_revoked
+    only cares whether *any* matching row exists). Self-cleans via the TTL
+    index on bff_revoked_sessions.expires_at created in startup_event - no
+    separate purge job needed. The 24h expires_at window is intentionally
+    generous relative to any plausible BFF JWT TTL (5-15 min); it only
+    exists so this collection doesn't grow forever, not as a meaningful
+    revocation duration."""
+    _require_crm_bff_service_key(request)
+
+    now = datetime.utcnow()
+    await db.bff_revoked_sessions.insert_one({
+        "staff_user_id": payload.staff_user_id,
+        "revoked_at": now,
+        "expires_at": now + timedelta(hours=24),
+    })
+    return {"status": "revoked", "staff_user_id": payload.staff_user_id}
+
+
 @api_router.post("/integrations/equipment-from-crm")
 async def receive_equipment_from_crm(request: Request, payload: EquipmentFromCrm):
     """Create/update a piece of equipment on a client's web/mobile account
@@ -7370,6 +7425,18 @@ async def startup_event():
         await db.admin_audit_log.create_index([("action", 1), ("resource_id", 1)])
     except Exception:
         logger.exception("Failed to create index on admin_audit_log.(action, resource_id)")
+
+    # BFF admin-session revocation records (see POST
+    # /api/internal/revoke-bff-admin and _is_bff_session_revoked) should
+    # self-expire instead of accumulating forever - expireAfterSeconds=0
+    # means "expire exactly at the datetime stored in expires_at" (each
+    # document sets its own expires_at = revoked_at + 24h, see the
+    # endpoint), the standard Mongo TTL-index idiom for a per-document
+    # expiry instant rather than a fixed age.
+    try:
+        await db.bff_revoked_sessions.create_index("expires_at", expireAfterSeconds=0)
+    except Exception:
+        logger.exception("Failed to create TTL index on bff_revoked_sessions.expires_at")
 
     # Must run before the app starts accepting traffic under the new
     # tokens[] auth scheme - see docstring.
