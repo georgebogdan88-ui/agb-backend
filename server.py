@@ -69,12 +69,14 @@ CRM_INTEGRATION_KEY = os.environ.get('CRM_INTEGRATION_KEY', '')
 # BFF (Backend-for-Frontend) admin auth: CRM signs short-lived (5-15 min)
 # Ed25519 JWTs after a staff member authenticates on the CRM side, and this
 # backend only ever VERIFIES them (see _verify_bff_jwt) with the matching
-# public key, as an additional accepted credential type for /admin/* routes
-# alongside the existing native webshop admin session tokens - see
-# _require_admin. This backend never signs/issues these tokens - that
-# happens exclusively on CRM. Deliberately no default/fallback value: if
-# unset, the BFF path is simply inactive and every environment keeps
-# authenticating admins exactly the way it does today.
+# public key. This is now the ONLY accepted credential type for /admin/*
+# (and the other _require_admin-gated routes) - see _require_admin. The
+# legacy native webshop admin session token fallback has been retired.
+# This backend never signs/issues these JWTs - that happens exclusively on
+# CRM. MANDATORY, not optional: if unset, _require_admin fails closed with
+# 503 on every gated route, with no fallback - every environment that runs
+# this code (staging AND production) must have this set to the real public
+# key matching CRM's signing key before deploying.
 CRM_BFF_JWT_PUBLIC_KEY = os.environ.get('CRM_BFF_JWT_PUBLIC_KEY', '')
 # Separate shared secret from CRM_INTEGRATION_KEY above (that one is for the
 # unrelated /integrations/* channel) - authenticates CRM's call to
@@ -3894,12 +3896,12 @@ def build_collections(product_type: Optional[str], category: Optional[str], exis
 
 # ==================== BFF ADMIN JWT (CRM-signed, verify-only) ====================
 # CRM signs short-lived (5-15 min) Ed25519 JWTs for a staff member's admin
-# session and this backend verifies them as an additional accepted
-# credential for /admin/* routes, alongside (not instead of) the existing
-# native webshop admin session tokens - see _require_admin below, which
-# tries this path first only when the bearer value structurally looks like
-# a JWT, and otherwise falls through unchanged to the native-token lookup.
-# This backend never signs/mints these tokens itself.
+# session and this backend verifies them as the ONLY accepted credential
+# for /admin/* (and the other _require_admin-gated routes) - see
+# _require_admin below. The legacy native webshop admin session token
+# fallback has been retired; a native token is never sufficient here
+# anymore, regardless of the account's role. This backend never signs/
+# mints these tokens itself.
 
 BFF_JWT_AUDIENCE = "agb-backend-admin"
 BFF_JWT_ISSUER = "agb-crm-bff"
@@ -3997,15 +3999,18 @@ async def _require_admin(request: Request) -> dict:
     role. There's no self-serve way to become admin - the role is only ever
     set directly in the database for the store owner's own account.
 
-    Accepts two credential types, tried in this order:
-    1. A CRM-signed BFF admin JWT (see _verify_bff_jwt) - only attempted
-       when CRM_BFF_JWT_PUBLIC_KEY is actually configured in this
-       environment AND the bearer value structurally looks like a JWT (see
-       _looks_like_jwt). Environments where the BFF mechanism isn't
-       provisioned, or requests carrying a native token, never enter this
-       branch at all.
-    2. The existing native webshop admin session token lookup (unchanged
-       from before the BFF mechanism existed) - every other case.
+    The only accepted credential is a CRM-signed BFF admin JWT (see
+    _verify_bff_jwt) - the legacy native webshop admin session token lookup
+    that used to run as a fallback has been retired entirely, so a native
+    token (or anything else that isn't a valid BFF JWT) is never sufficient
+    here anymore.
+
+    If CRM_BFF_JWT_PUBLIC_KEY isn't configured in this environment, this
+    fails CLOSED with 503 (same fail-closed pattern used elsewhere in this
+    file for other "not configured" cases, e.g. _require_crm_bff_service_key
+    further down) rather than ever falling through to another lookup - an
+    unconfigured verification key must never be reachable by "just don't
+    send a JWT" the way a bad token would be blocked.
     """
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
@@ -4013,18 +4018,13 @@ async def _require_admin(request: Request) -> dict:
 
     token = auth_header.replace("Bearer ", "")
 
-    if CRM_BFF_JWT_PUBLIC_KEY and _looks_like_jwt(token):
-        return await _verify_bff_jwt(token)
+    if not CRM_BFF_JWT_PUBLIC_KEY:
+        raise HTTPException(status_code=503, detail="Admin auth not configured")
 
-    user = await _find_user_by_token(token)
-
-    if not user:
+    if not _looks_like_jwt(token):
         raise HTTPException(status_code=401, detail="Token invalid sau expirat")
 
-    if user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Acces interzis")
-
-    return user
+    return await _verify_bff_jwt(token)
 
 @api_router.get("/admin/products")
 async def admin_list_products(
