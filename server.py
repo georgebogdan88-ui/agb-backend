@@ -69,12 +69,14 @@ CRM_INTEGRATION_KEY = os.environ.get('CRM_INTEGRATION_KEY', '')
 # BFF (Backend-for-Frontend) admin auth: CRM signs short-lived (5-15 min)
 # Ed25519 JWTs after a staff member authenticates on the CRM side, and this
 # backend only ever VERIFIES them (see _verify_bff_jwt) with the matching
-# public key, as an additional accepted credential type for /admin/* routes
-# alongside the existing native webshop admin session tokens - see
-# _require_admin. This backend never signs/issues these tokens - that
-# happens exclusively on CRM. Deliberately no default/fallback value: if
-# unset, the BFF path is simply inactive and every environment keeps
-# authenticating admins exactly the way it does today.
+# public key. This is now the ONLY accepted credential type for /admin/*
+# (and the other _require_admin-gated routes) - see _require_admin. The
+# legacy native webshop admin session token fallback has been retired.
+# This backend never signs/issues these JWTs - that happens exclusively on
+# CRM. MANDATORY, not optional: if unset, _require_admin fails closed with
+# 503 on every gated route, with no fallback - every environment that runs
+# this code (staging AND production) must have this set to the real public
+# key matching CRM's signing key before deploying.
 CRM_BFF_JWT_PUBLIC_KEY = os.environ.get('CRM_BFF_JWT_PUBLIC_KEY', '')
 # Separate shared secret from CRM_INTEGRATION_KEY above (that one is for the
 # unrelated /integrations/* channel) - authenticates CRM's call to
@@ -3894,12 +3896,12 @@ def build_collections(product_type: Optional[str], category: Optional[str], exis
 
 # ==================== BFF ADMIN JWT (CRM-signed, verify-only) ====================
 # CRM signs short-lived (5-15 min) Ed25519 JWTs for a staff member's admin
-# session and this backend verifies them as an additional accepted
-# credential for /admin/* routes, alongside (not instead of) the existing
-# native webshop admin session tokens - see _require_admin below, which
-# tries this path first only when the bearer value structurally looks like
-# a JWT, and otherwise falls through unchanged to the native-token lookup.
-# This backend never signs/mints these tokens itself.
+# session and this backend verifies them as the ONLY accepted credential
+# for /admin/* (and the other _require_admin-gated routes) - see
+# _require_admin below. The legacy native webshop admin session token
+# fallback has been retired; a native token is never sufficient here
+# anymore, regardless of the account's role. This backend never signs/
+# mints these tokens itself.
 
 BFF_JWT_AUDIENCE = "agb-backend-admin"
 BFF_JWT_ISSUER = "agb-crm-bff"
