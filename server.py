@@ -3997,15 +3997,18 @@ async def _require_admin(request: Request) -> dict:
     role. There's no self-serve way to become admin - the role is only ever
     set directly in the database for the store owner's own account.
 
-    Accepts two credential types, tried in this order:
-    1. A CRM-signed BFF admin JWT (see _verify_bff_jwt) - only attempted
-       when CRM_BFF_JWT_PUBLIC_KEY is actually configured in this
-       environment AND the bearer value structurally looks like a JWT (see
-       _looks_like_jwt). Environments where the BFF mechanism isn't
-       provisioned, or requests carrying a native token, never enter this
-       branch at all.
-    2. The existing native webshop admin session token lookup (unchanged
-       from before the BFF mechanism existed) - every other case.
+    The only accepted credential is a CRM-signed BFF admin JWT (see
+    _verify_bff_jwt) - the legacy native webshop admin session token lookup
+    that used to run as a fallback has been retired entirely, so a native
+    token (or anything else that isn't a valid BFF JWT) is never sufficient
+    here anymore.
+
+    If CRM_BFF_JWT_PUBLIC_KEY isn't configured in this environment, this
+    fails CLOSED with 503 (same fail-closed pattern used elsewhere in this
+    file for other "not configured" cases, e.g. _require_crm_bff_service_key
+    further down) rather than ever falling through to another lookup - an
+    unconfigured verification key must never be reachable by "just don't
+    send a JWT" the way a bad token would be blocked.
     """
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
@@ -4013,18 +4016,13 @@ async def _require_admin(request: Request) -> dict:
 
     token = auth_header.replace("Bearer ", "")
 
-    if CRM_BFF_JWT_PUBLIC_KEY and _looks_like_jwt(token):
-        return await _verify_bff_jwt(token)
+    if not CRM_BFF_JWT_PUBLIC_KEY:
+        raise HTTPException(status_code=503, detail="Admin auth not configured")
 
-    user = await _find_user_by_token(token)
-
-    if not user:
+    if not _looks_like_jwt(token):
         raise HTTPException(status_code=401, detail="Token invalid sau expirat")
 
-    if user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Acces interzis")
-
-    return user
+    return await _verify_bff_jwt(token)
 
 @api_router.get("/admin/products")
 async def admin_list_products(
