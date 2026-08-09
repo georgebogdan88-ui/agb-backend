@@ -7,6 +7,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import OperationFailure
 import os
 import logging
+import html
 from pathlib import Path
 from pydantic import BaseModel, Field
 from typing import List, Optional, Literal, Dict, Deque
@@ -146,6 +147,12 @@ class Product(BaseModel):
     description_normalized: Optional[str] = ""
     technical_specs: Optional[str] = None
     title_normalized: Optional[str] = ""
+    # Storefront SEO metadata (<title>/<meta name="description">) - purely
+    # editorial, admin-set overrides of what would otherwise be derived from
+    # title/description on the storefront. None means "not set", storefront
+    # falls back to its own defaults.
+    meta_title: Optional[str] = None
+    meta_description: Optional[str] = None
     price: float
     currency: str = "RON"
     image_url: Optional[str] = None
@@ -2612,6 +2619,97 @@ async def _reserve_stock_for_order(items: List[dict]) -> None:
         )
 
 
+_PAYMENT_METHOD_LABELS = {
+    "ramburs": "Ramburs la livrare",
+    "card": "Card online",
+    "online": "Plată online",
+}
+
+
+async def _send_order_confirmation_email(order: Order) -> bool:
+    """Send an order-confirmation email to the customer via Brevo - same
+    provider/call pattern as send_password_reset_email above (only the
+    template content differs). Fire-and-forget by convention: the ONLY
+    caller (create_order, via background_tasks.add_task) never awaits this
+    directly, so a False return here just gets logged, never surfaced to
+    the customer whose order already succeeded."""
+    try:
+        if not BREVO_API_KEY:
+            logger.warning("BREVO_API_KEY not set - skipping order confirmation email for order %s", order.id)
+            return False
+
+        import sib_api_v3_sdk
+
+        configuration = sib_api_v3_sdk.Configuration()
+        configuration.api_key['api-key'] = BREVO_API_KEY
+        api_instance = sib_api_v3_sdk.TransactionalEmailsApi(sib_api_v3_sdk.ApiClient(configuration))
+
+        items_rows = "".join(
+            f"""
+                <tr>
+                    <td style="padding: 8px; border-bottom: 1px solid #eee;">{html.escape(str(item.get('product_name', '')))}</td>
+                    <td style="padding: 8px; border-bottom: 1px solid #eee; text-align: center;">{html.escape(str(item.get('quantity', 1)))}</td>
+                    <td style="padding: 8px; border-bottom: 1px solid #eee; text-align: right;">{item.get('price', 0):.2f} RON</td>
+                </tr>
+            """
+            for item in order.items
+        )
+        payment_method_label = _PAYMENT_METHOD_LABELS.get(order.payment_method, order.payment_method)
+
+        html_content = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif; background-color: #f5f5f5; padding: 20px;">
+            <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 10px; overflow: hidden;">
+                <div style="background-color: #367c2b; padding: 20px; text-align: center;">
+                    <h1 style="color: #ffffff; margin: 0;">🚜 AGB Agroparts</h1>
+                </div>
+                <div style="padding: 30px;">
+                    <h2 style="color: #333;">Îți mulțumim pentru comandă!</h2>
+                    <p style="color: #666; line-height: 1.6;">Am înregistrat comanda ta cu numărul <strong>{html.escape(order.id)}</strong>. Te vom contacta în cel mai scurt timp pentru confirmare și livrare.</p>
+                    <table style="width: 100%; border-collapse: collapse; margin-top: 20px;">
+                        <thead>
+                            <tr>
+                                <th style="text-align: left; padding: 8px; border-bottom: 2px solid #367c2b; color: #333;">Produs</th>
+                                <th style="text-align: center; padding: 8px; border-bottom: 2px solid #367c2b; color: #333;">Cant.</th>
+                                <th style="text-align: right; padding: 8px; border-bottom: 2px solid #367c2b; color: #333;">Preț</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {items_rows}
+                        </tbody>
+                    </table>
+                    <div style="margin-top: 20px; text-align: right; color: #333;">
+                        <p style="margin: 4px 0;">Subtotal: {order.subtotal:.2f} RON</p>
+                        <p style="margin: 4px 0;">Transport: {order.shipping:.2f} RON</p>
+                        <p style="margin: 4px 0; font-size: 18px; font-weight: bold;">Total: {order.total:.2f} RON</p>
+                    </div>
+                    <p style="color: #666; line-height: 1.6; margin-top: 20px;">Metodă de plată: <strong>{html.escape(payment_method_label)}</strong></p>
+                    <p style="color: #666; line-height: 1.6; margin-top: 20px;">Îți mulțumim că ai ales AGB Agroparts!</p>
+                </div>
+                <div style="background-color: #f0f0f0; padding: 15px; text-align: center; font-size: 12px; color: #999;">
+                    <p>AGB Agroparts Solution S.R.L.</p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+
+        send_smtp_email = sib_api_v3_sdk.SendSmtpEmail(
+            to=[{"email": order.customer.email, "name": order.customer.name or order.customer.email}],
+            sender={"email": "noreply@agb-agroparts.ro", "name": "AGB Agroparts"},
+            subject=f"✅ Confirmare comandă #{order.id} - AGB Agroparts",
+            html_content=html_content
+        )
+
+        api_instance.send_transac_email(send_smtp_email)
+        logger.info(f"Order confirmation email sent to {order.customer.email} for order {order.id}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Error sending order confirmation email for order {order.id}: {e}")
+        return False
+
+
 @api_router.post("/orders", response_model=Order)
 async def create_order(order_data: OrderCreate, background_tasks: BackgroundTasks):
     """Create a new order"""
@@ -2632,6 +2730,7 @@ async def create_order(order_data: OrderCreate, background_tasks: BackgroundTask
     await db.orders.insert_one(order.dict())
     await db.cart.delete_many({"session_id": order_data.session_id})
     background_tasks.add_task(sync_order_to_crm, order)
+    background_tasks.add_task(_send_order_confirmation_email, order)
     return order
 
 # NOTE: must stay registered *before* GET /orders/{session_id} below - same
@@ -3829,6 +3928,8 @@ class ProductCreate(BaseModel):
     title: str
     description: str = ""
     technical_specs: Optional[str] = None
+    meta_title: Optional[str] = None
+    meta_description: Optional[str] = None
     price: float
     currency: str = "RON"
     image_url: Optional[str] = None
@@ -3858,6 +3959,8 @@ class ProductUpdate(BaseModel):
     title: Optional[str] = None
     description: Optional[str] = None
     technical_specs: Optional[str] = None
+    meta_title: Optional[str] = None
+    meta_description: Optional[str] = None
     price: Optional[float] = None
     currency: Optional[str] = None
     image_url: Optional[str] = None
@@ -4217,6 +4320,8 @@ async def admin_create_product(request: Request, product_data: ProductCreate):
         "technical_specs": product_data.technical_specs,
         "description_normalized": normalize_text(sanitized_description),
         "title_normalized": normalize_text(product_data.title),
+        "meta_title": product_data.meta_title,
+        "meta_description": product_data.meta_description,
         "price": product_data.price,
         "currency": product_data.currency,
         "image_url": product_data.image_url,
