@@ -100,6 +100,9 @@ async def scenario_a_found_exact_match_returns_serialize_user_shape():
         check("a) found: password_hash NOT present", "password_hash" not in result, result)
         check("a) found: tokens NOT present", "tokens" not in result, result)
         # Full expected key set per _serialize_user's current definition.
+        # Includes consent_accepted_at/consent_terms_version (added for the
+        # registration-consent/GDPR change) - present as None here since
+        # this fixture doc predates that change and has neither key set.
         expected_keys = {
             "id", "email", "name", "phone", "address", "address_strada", "address_numar",
             "address_bloc", "address_scara", "address_ap", "city", "county", "postal_code",
@@ -107,7 +110,7 @@ async def scenario_a_found_exact_match_returns_serialize_user_shape():
             "company_address_strada", "company_address_numar", "company_address_bloc",
             "company_address_scara", "company_address_ap", "company_address_oras",
             "company_address_judet", "company_address_cod_postal", "is_shopify_customer",
-            "created_at", "role",
+            "created_at", "role", "consent_accepted_at", "consent_terms_version",
         }
         check("a) found: response keys exactly match _serialize_user's shape",
               set(result.keys()) == expected_keys,
