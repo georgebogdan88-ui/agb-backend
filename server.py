@@ -1,5 +1,6 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Query, BackgroundTasks, Request, UploadFile, File, Form, Body
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, Response
+from fastapi.encoders import jsonable_encoder
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -526,7 +527,15 @@ async def _find_user_by_token(token: str, allow_shopify_access_token: bool = Fal
     ]
     if allow_shopify_access_token:
         or_clauses.append({"shopify_access_token": token})
-    return await db.users.find_one({"$or": or_clauses})
+    user = await db.users.find_one({"$or": or_clauses})
+    if user and user.get("is_deleted"):
+        # A deleted account's session tokens are cleared on deletion (see
+        # delete_current_user_account), so this only ever matches via a
+        # still-live shopify_access_token that deletion doesn't invalidate -
+        # exactly the bypass this guard exists to close. Treat a deleted
+        # account as unauthenticated everywhere, not just at /auth/login.
+        return None
+    return user
 
 # ==================== RATE LIMITING ====================
 # In-memory abuse-prevention limiter for the auth endpoints (brute-force
@@ -604,6 +613,7 @@ LOGIN_IP_LIMIT, LOGIN_IP_WINDOW_SECONDS = 30, 15 * 60               # 30 / 15 mi
 REGISTER_IP_LIMIT, REGISTER_IP_WINDOW_SECONDS = 5, 60 * 60          # 5 / hour per IP
 FORGOT_PASSWORD_IP_LIMIT, FORGOT_PASSWORD_IP_WINDOW_SECONDS = 5, 60 * 60  # 5 / hour per IP
 ADMIN_ACTION_LIMIT, ADMIN_ACTION_WINDOW_SECONDS = 10, 60 * 60       # 10 / hour per admin, per protected action
+ACCOUNT_DELETE_LIMIT, ACCOUNT_DELETE_WINDOW_SECONDS = 5, 15 * 60    # 5 / 15 min per account (password re-check)
 
 
 def _client_ip(request: Request) -> str:
@@ -3531,6 +3541,21 @@ async def _authenticate_user(email: str, password: str, request: Request) -> dic
     )
     existing_user = await db.users.find_one({"email": email})
 
+    # Deleted accounts (see POST /auth/me/delete) are rejected outright,
+    # before even checking the password - checked BEFORE the password_hash
+    # branch below so this always produces the specific message rather than
+    # ever falling through to the generic "Email sau parolă incorectă". In
+    # practice deletion also anonymizes `email`, so this only matches if
+    # someone is somehow still looking the account up by its current
+    # (post-deletion) email - belt-and-suspenders alongside the unusable
+    # password hash that deletion also sets (see that endpoint's docstring
+    # for why both exist).
+    if existing_user and existing_user.get("is_deleted"):
+        raise HTTPException(
+            status_code=403,
+            detail="Acest cont a fost șters și nu se mai poate autentifica. Creează un cont nou dacă dorești să continui.",
+        )
+
     if existing_user and existing_user.get("password_hash"):
         if not await verify_password(password, existing_user["password_hash"]):
             raise HTTPException(status_code=401, detail="Email sau parolă incorectă")
@@ -3567,6 +3592,74 @@ async def get_current_user(request: Request):
         raise HTTPException(status_code=401, detail="Token invalid sau expirat")
 
     return _serialize_user(user)
+
+
+@api_router.get("/auth/me/export")
+async def export_current_user_data(request: Request):
+    """GDPR Art. 15/20 data export: everything this account holds, as a
+    single downloadable JSON file. Deliberately reuses the exact same auth
+    pattern and underlying queries as GET /auth/me, GET /auth/orders and
+    GET /auth/equipment (and the query pattern of GET /admin/customer-
+    interests, scoped to this user) so this can't silently drift from what
+    those endpoints already show - see _serialize_user's docstring for why
+    that matters here."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Token lipsă sau invalid")
+
+    token = auth_header.replace("Bearer ", "")
+    user = await _find_user_by_token(token)
+
+    if not user:
+        raise HTTPException(status_code=401, detail="Token invalid sau expirat")
+
+    # comenzi - identical query to GET /auth/orders, full order objects
+    # (not a summary), so nothing about a past order is left out.
+    orders = await db.orders.find({"customer.email": user["email"]}).sort("created_at", -1).to_list(100)
+    comenzi = [Order(**order) for order in orders]
+
+    # utilaje - same shape/cleanup as GET /auth/equipment (see
+    # _clean_equipment_list).
+    utilaje = _clean_equipment_list(user.get("equipment", []))
+
+    # favorite - same collection/idea as GET /admin/customer-interests,
+    # scoped to this user only, with the same product-enrichment fields.
+    interests = await db.customer_interests.find({"user_id": user["id"]}).sort("created_at", -1).to_list(1000)
+    product_ids = list({i["product_id"] for i in interests})
+    products_by_id = {}
+    if product_ids:
+        async for p in db.shopify_products.find({"id": {"$in": product_ids}}):
+            products_by_id[p["id"]] = p
+    favorite = []
+    for i in interests:
+        product = products_by_id.get(i["product_id"])
+        favorite.append({
+            "id": i["id"],
+            "product_id": i["product_id"],
+            "type": i["type"],
+            "created_at": i["created_at"],
+            "product_title": product.get("title") if product else None,
+            "product_price": product.get("price") if product else None,
+            "product_currency": product.get("currency") if product else None,
+            "product_image_url": product.get("image_url") if product else None,
+            "product_stock_status": product.get("stock_status") if product else None,
+        })
+
+    export_payload = {
+        "profil": _serialize_user(user),
+        "comenzi": comenzi,
+        "utilaje": utilaje,
+        "favorite": favorite,
+        "exportat_la": datetime.utcnow(),
+    }
+
+    filename = f"date-personale-agb-{datetime.utcnow().strftime('%Y-%m-%d')}.json"
+    body = json.dumps(jsonable_encoder(export_payload), ensure_ascii=False, indent=2)
+    return Response(
+        content=body,
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 # ==================== SHOPIFY CUSTOMER AUTH ====================
 
@@ -3648,6 +3741,127 @@ async def update_current_user(request: Request, update_data: UserUpdate, backgro
     background_tasks.add_task(sync_account_to_crm, updated_user)
 
     return _serialize_user(updated_user)
+
+
+class AccountDeleteRequest(BaseModel):
+    password: str
+
+
+@api_router.post("/auth/me/delete")
+async def delete_current_user_account(request: Request, delete_data: AccountDeleteRequest):
+    """GDPR 'right to be forgotten' account deletion - anonymizes and
+    deactivates the LOGIN ACCOUNT (db.users) ONLY.
+
+    Scope is deliberate: Romanian fiscal law requires retaining invoice/
+    order records for ~10 years, and GDPR Art. 17(3)(b) explicitly permits
+    NOT erasing data still needed for legal/fiscal compliance. Every order
+    already snapshots its own customer/company/invoice data onto itself
+    independently of the live account (see CustomerInfo's company_*
+    fields) specifically so historical orders stay accurate even after the
+    account that placed them is deleted. So this handler must NEVER touch
+    db.orders, and must NEVER trigger a CRM sync/notification of any kind -
+    if a future change "fixes" that, it would violate the fiscal retention
+    requirement above. Chosen POST (not DELETE-with-body) to match this
+    repo's existing convention for other sensitive/destructive auth actions
+    that take a JSON body (POST /auth/reset-password, /auth/logout-all).
+
+    Requires re-entering the CURRENT password (re-authentication, not just
+    an already-valid session token) since this is irreversible-in-practice.
+    """
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Token lipsă sau invalid")
+
+    token = auth_header.replace("Bearer ", "")
+    user = await _find_user_by_token(token)
+
+    if not user:
+        raise HTTPException(status_code=401, detail="Token invalid sau expirat")
+
+    _enforce_rate_limit(
+        f"account-delete:{user['id']}", ACCOUNT_DELETE_LIMIT, ACCOUNT_DELETE_WINDOW_SECONDS,
+        "Prea multe încercări. Încearcă din nou mai târziu.",
+    )
+
+    if not await verify_password(delete_data.password, user.get("password_hash") or ""):
+        raise HTTPException(status_code=403, detail="Parolă incorectă. Contul nu a fost șters.")
+
+    # Guaranteed-unique placeholder - db.users has a unique index on
+    # `email` (see startup_event), so this can never collide with it or
+    # with another deleted account's placeholder. Also frees up the
+    # original email for a brand new registration, which is the expected
+    # behaviour of "delete my account".
+    anonymized_email = f"deleted-{uuid.uuid4()}@deleted.local"
+    # Fresh random (never-typed-by-anyone) password, hashed the same way a
+    # real password would be - makes the stored hash unusable even if
+    # someone somehow learned the new anonymized email. Belt-and-suspenders
+    # with the explicit is_deleted flag checked in _authenticate_user below
+    # (no prior "deactivated account" pattern existed in this codebase to
+    # match instead, per George's instructions - so both guards are used).
+    unusable_password_hash = await hash_password(secrets.token_urlsafe(32))
+
+    await db.users.update_one(
+        {"id": user["id"]},
+        {
+            "$set": {
+                "name": "Cont șters",
+                "email": anonymized_email,
+                "phone": None,
+                "address": None,
+                "address_strada": None,
+                "address_numar": None,
+                "address_bloc": None,
+                "address_scara": None,
+                "address_ap": None,
+                "city": None,
+                "county": None,
+                "postal_code": None,
+                "company_name": None,
+                "cui": None,
+                "reg_com": None,
+                "administrator": None,
+                "company_address": None,
+                "company_address_strada": None,
+                "company_address_numar": None,
+                "company_address_bloc": None,
+                "company_address_scara": None,
+                "company_address_ap": None,
+                "company_address_oras": None,
+                "company_address_judet": None,
+                "company_address_cod_postal": None,
+                "password_hash": unusable_password_hash,
+                # All sessions revoked - an already-logged-in device can't
+                # keep using this account after deletion either.
+                "tokens": [],
+                "is_deleted": True,
+                "deleted_at": datetime.utcnow(),
+                # Also revoke the Shopify customer access token as a login
+                # credential: _find_user_by_token(allow_shopify_access_token=True)
+                # would otherwise keep matching this "deleted" account on it
+                # (that helper now also checks is_deleted directly, but this
+                # closes the same hole at the source instead of relying on
+                # a single guard). is_shopify_customer/shopify_customer_id
+                # are dropped too - no reason to keep advertising this
+                # (now-anonymized) account as Shopify-linked.
+                "shopify_access_token": None,
+                "shopify_customer_id": None,
+                "is_shopify_customer": False,
+                # Equipment (machine serial/model records) has no
+                # equivalent fiscal-retention basis to db.orders - unlike
+                # orders, nothing legally requires AGB to keep a deleted
+                # customer's self-reported equipment list. Cleared here so
+                # "right to be forgotten" actually forgets it, not just the
+                # profile fields above.
+                "equipment": [],
+                # consent_accepted_at/consent_terms_version intentionally
+                # left untouched - harmless historical record of when this
+                # (now-anonymized) account originally consented.
+            },
+            "$unset": {"token": ""},
+        },
+    )
+
+    return {"message": "Contul a fost șters cu succes"}
 
 
 @api_router.post("/auth/logout")
@@ -6123,6 +6337,28 @@ async def sync_equipment_to_shopify_notes(user_email: str, equipment_list: list)
         logger.error(f"Error syncing equipment to Shopify: {e}")
         return False
 
+def _clean_equipment_list(local_equipment: list) -> list:
+    """Convert None values to empty strings for frontend consumption -
+    shared by GET /auth/equipment and GET /auth/me/export so both surfaces
+    of the same data can't silently drift apart (same idiom as
+    _serialize_user)."""
+    cleaned_equipment = []
+    for eq in local_equipment:
+        cleaned_equipment.append({
+            "id": eq.get("id", ""),
+            "brand": eq.get("brand") or "",
+            "model": eq.get("model", ""),
+            "chassis_serial": eq.get("chassis_serial") or "",
+            "engine_serial": eq.get("engine_serial") or "",
+            "engine_type": eq.get("engine_type") or "",
+            "transmission_type": eq.get("transmission_type") or "",
+            "front_axle_model": eq.get("front_axle_model") or "",
+            "features": eq.get("features") or [],
+            "created_at": eq.get("created_at", ""),
+        })
+    return cleaned_equipment
+
+
 @api_router.get("/auth/equipment")
 async def get_user_equipment(request: Request):
     """Get all equipment for authenticated user, straight from Mongo.
@@ -6153,25 +6389,8 @@ async def get_user_equipment(request: Request):
     if not user:
         raise HTTPException(status_code=401, detail="Token invalid sau expirat")
 
-    local_equipment = user.get("equipment", [])
+    cleaned_equipment = _clean_equipment_list(user.get("equipment", []))
 
-    # Convert None values to empty strings for frontend
-    cleaned_equipment = []
-    for eq in local_equipment:
-        cleaned_eq = {
-            "id": eq.get("id", ""),
-            "brand": eq.get("brand") or "",
-            "model": eq.get("model", ""),
-            "chassis_serial": eq.get("chassis_serial") or "",
-            "engine_serial": eq.get("engine_serial") or "",
-            "engine_type": eq.get("engine_type") or "",
-            "transmission_type": eq.get("transmission_type") or "",
-            "front_axle_model": eq.get("front_axle_model") or "",
-            "features": eq.get("features") or [],
-            "created_at": eq.get("created_at", ""),
-        }
-        cleaned_equipment.append(cleaned_eq)
-    
     return {"equipment": cleaned_equipment, "count": len(cleaned_equipment), "max_allowed": 10}
 
 async def sync_equipment_to_crm(equipment: dict, user: dict, source: str = "webshop") -> None:
@@ -7592,6 +7811,11 @@ app.add_middleware(
     allow_origins=_get_cors_allowed_origins(),
     allow_methods=["*"],
     allow_headers=["*"],
+    # Without this, cross-origin JS (webshop/mobile) can't read
+    # Content-Disposition off a fetch() response even though the header is
+    # sent - it's not on the browser's default-exposed safelist. Needed for
+    # GET /auth/me/export's suggested-filename download to actually work.
+    expose_headers=["Content-Disposition"],
 )
 
 # ==================== AUTO-SYNC BACKGROUND TASK ====================
