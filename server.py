@@ -282,11 +282,25 @@ class OrderCreate(BaseModel):
 
 # ==================== AUTH MODELS ====================
 
+# Literal version string for the Terms of Service / Privacy Policy text
+# shown at registration. Bump this (and only this) whenever that text
+# changes materially, so consent_terms_version on existing users keeps
+# reflecting exactly what they agreed to - never rewrite/backfill past
+# users' stored version when bumping it.
+CURRENT_TERMS_VERSION = "2026-08-09"
+
+
 class UserRegister(BaseModel):
     email: str
     password: str
     name: str
     phone: str
+    # Required explicit GDPR consent to Terms + Privacy Policy. Defaults to
+    # False (rather than being a plain required field) so that both an
+    # omitted field AND an explicit `false` hit the same clear Romanian
+    # error message below, instead of the omitted case falling through to
+    # FastAPI's generic 422 validation error.
+    terms_accepted: bool = False
 
 class UserLogin(BaseModel):
     email: str
@@ -402,6 +416,8 @@ class UserResponse(BaseModel):
     reg_com: Optional[str] = None
     company_address: Optional[str] = None
     created_at: datetime
+    consent_accepted_at: Optional[datetime] = None
+    consent_terms_version: Optional[str] = None
 
 # Password hashing helper
 async def hash_password(password: str) -> str:
@@ -2985,6 +3001,12 @@ async def register_user(user_data: UserRegister, background_tasks: BackgroundTas
     if len(user_data.password) < 6:
         raise HTTPException(status_code=400, detail="Parola trebuie să aibă minim 6 caractere")
 
+    if not user_data.terms_accepted:
+        raise HTTPException(
+            status_code=400,
+            detail="Trebuie să accepți Termenii și Politica de confidențialitate.",
+        )
+
     existing_user = await db.users.find_one({"email": email})
     if existing_user:
         raise HTTPException(status_code=400, detail="Adresa de email este deja înregistrată")
@@ -3025,7 +3047,14 @@ async def register_user(user_data: UserRegister, background_tasks: BackgroundTas
         "company_address_cod_postal": None,
         "tokens": [token_doc],
         "is_shopify_customer": False,
-        "created_at": created_at
+        "created_at": created_at,
+        # GDPR consent to Terms + Privacy Policy, recorded at registration
+        # time only - see CURRENT_TERMS_VERSION above. Only ever set here,
+        # on NEW registrations; existing users predating this field simply
+        # have it absent/None and are never backfilled or forced to
+        # re-consent at login.
+        "consent_accepted_at": created_at,
+        "consent_terms_version": CURRENT_TERMS_VERSION,
     }
 
     try:
@@ -3468,6 +3497,11 @@ def _serialize_user(user: dict) -> dict:
         "is_shopify_customer": user.get("is_shopify_customer", False),
         "created_at": user["created_at"],
         "role": user.get("role", "customer"),
+        # GDPR consent - absent/None for accounts created before this field
+        # existed (never backfilled), populated for accounts registered
+        # from now on. See CURRENT_TERMS_VERSION near UserRegister.
+        "consent_accepted_at": user.get("consent_accepted_at"),
+        "consent_terms_version": user.get("consent_terms_version"),
     }
 
 
