@@ -9223,6 +9223,56 @@ async def get_news():
         logger.error(f"Error fetching news: {e}")
         return {"articles": [], "count": 0, "error": str(e)}
 
+# ==================== BLOG POSTS (webshop, from db.blog_posts) ====================
+# Public read-only endpoints over the `blog_posts` collection populated by
+# scripts/migrate_blog_from_shopify.py (one-off migration of Shopify blog
+# articles into Mongo, keyed by the article's Shopify handle - see that
+# script's docstring for the field mapping and idempotency model).
+#
+# Deliberately independent of GET /news above and of
+# check_for_new_blog_posts (the push-notification blog checker): both of
+# those keep reading LIVE from Shopify, unchanged. This is a separate,
+# additive read path for the webshop's blog section, over the migrated
+# Mongo copy - repointing /news or the blog checker at db.blog_posts is a
+# distinct, deliberate future decision and out of scope here.
+
+@api_router.get("/blog/posts")
+async def get_blog_posts(limit: int = 20, offset: int = 0):
+    """List blog posts (paginated), sorted by published_at descending.
+    Omits content_html/excerpt_html/blog_title to keep the list payload
+    small - use GET /blog/posts/{handle} for the full article."""
+    limit = max(1, min(limit, 50))
+    offset = max(0, offset)
+
+    total = await db.blog_posts.count_documents({})
+    cursor = db.blog_posts.find({}).sort("published_at", -1).skip(offset).limit(limit)
+    docs = await cursor.to_list(limit)
+
+    posts = [
+        {
+            "id": doc.get("id"),
+            "handle": doc.get("handle"),
+            "title": doc.get("title"),
+            "excerpt": doc.get("excerpt"),
+            "image_url": doc.get("image_url"),
+            "published_at": doc.get("published_at"),
+            "tags": doc.get("tags", []),
+        }
+        for doc in docs
+    ]
+
+    return {"posts": posts, "total": total}
+
+
+@api_router.get("/blog/posts/{handle}")
+async def get_blog_post_by_handle(handle: str):
+    """Full article body for a single blog post, by its Shopify handle."""
+    post = await db.blog_posts.find_one({"handle": handle})
+    if not post:
+        raise HTTPException(status_code=404, detail="Articolul nu a fost găsit")
+    post.pop("_id", None)
+    return post
+
 # ==================== PUSH NOTIFICATIONS ====================
 
 class PushTokenRequest(BaseModel):
