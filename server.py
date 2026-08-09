@@ -221,6 +221,25 @@ class CustomerInfo(BaseModel):
     county: str
     postal_code: str
     notes: Optional[str] = ""
+    # Company/invoice fields (checkout "issue on company" toggle) - mirrors
+    # the exact naming already used on the User account model above
+    # (is_company/company_name/cui/reg_com/administrator/company_address_*)
+    # and on agb-webshop's cont/profil page, so nothing needs translating
+    # across the shared contract. All optional/backward-compatible: a
+    # personal (is_company=False) order looks identical to before.
+    is_company: bool = False
+    company_name: Optional[str] = None
+    cui: Optional[str] = None
+    reg_com: Optional[str] = None
+    administrator: Optional[str] = None
+    company_address_strada: Optional[str] = None
+    company_address_numar: Optional[str] = None
+    company_address_bloc: Optional[str] = None
+    company_address_scara: Optional[str] = None
+    company_address_ap: Optional[str] = None
+    company_address_oras: Optional[str] = None
+    company_address_judet: Optional[str] = None
+    company_address_cod_postal: Optional[str] = None
 
 class Order(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -2274,20 +2293,45 @@ async def sync_order_to_crm(order: Order):
         logger.error("CRM sync skipped for order %s: CRM_API_URL/CRM_INTEGRATION_KEY not configured", order.id)
         return
 
+    customer_payload = {
+        "nume": order.customer.name,
+        "email": order.customer.email,
+        "telefon": order.customer.phone,
+        "adresa_strada": order.customer.address,
+        "adresa_oras": order.customer.city,
+        "adresa_judet": order.customer.county,
+        "adresa_cod_postal": order.customer.postal_code,
+    }
+    # Company/invoice fields only when the customer opted to have the order
+    # invoiced on their company at checkout - omitted entirely (not sent as
+    # null/empty) for personal orders, so the payload shape for is_company=
+    # False orders is byte-identical to before this field was added. Mirrors
+    # the shape already used for the /admin/customer-account lookup payload
+    # above (denumire_societate/cui/reg_com/administrator/company_address).
+    if order.customer.is_company:
+        customer_payload.update({
+            "denumire_societate": order.customer.company_name,
+            "cui": order.customer.cui,
+            "reg_com": order.customer.reg_com,
+            "administrator": order.customer.administrator,
+            "company_address": {
+                "strada": order.customer.company_address_strada,
+                "numar": order.customer.company_address_numar,
+                "bloc": order.customer.company_address_bloc,
+                "scara": order.customer.company_address_scara,
+                "ap": order.customer.company_address_ap,
+                "oras": order.customer.company_address_oras,
+                "judet": order.customer.company_address_judet,
+                "cod_postal": order.customer.company_address_cod_postal,
+            },
+        })
+
     payload = {
         "source": "webshop",
         "source_order_id": order.id,
         "payment_method": order.payment_method,
         "note": order.customer.notes,
-        "customer": {
-            "nume": order.customer.name,
-            "email": order.customer.email,
-            "telefon": order.customer.phone,
-            "adresa_strada": order.customer.address,
-            "adresa_oras": order.customer.city,
-            "adresa_judet": order.customer.county,
-            "adresa_cod_postal": order.customer.postal_code,
-        },
+        "customer": customer_payload,
         "items": _build_crm_order_items_payload(order.items),
     }
 
