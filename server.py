@@ -13,7 +13,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 from typing import List, Optional, Literal, Dict, Deque
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import httpx
 import re
 import json
@@ -280,6 +280,12 @@ class OrderCreate(BaseModel):
     shipping: float = 25.0
     total: float
     payment_method: str = "ramburs"
+    # Optional link back to the anonymous browsing session that converted
+    # (agb-webshop's localStorage-persisted `agb_analytics_session_id`, see
+    # POST /analytics/pageview) - entirely backward-compatible: omitted by
+    # any pre-existing webshop/mobile client, in which case create_order
+    # simply skips recording a conversion (see below).
+    analytics_session_id: Optional[str] = None
 
 # ==================== AUTH MODELS ====================
 
@@ -2755,6 +2761,28 @@ async def create_order(order_data: OrderCreate, background_tasks: BackgroundTask
     order = Order(**order_data.dict())
     await db.orders.insert_one(order.dict())
     await db.cart.delete_many({"session_id": order_data.session_id})
+
+    # Best-effort conversion link for the traffic/conversion analytics
+    # (GET /admin/analytics/traffic) - only when the checkout actually sent
+    # one (pre-existing webshop/mobile clients never will). Deliberately a
+    # plain synchronous DB insert rather than a background task: it's a
+    # single small local-DB write (not an outbound network call like
+    # sync_order_to_crm/the confirmation email), so there's no latency
+    # reason to defer it, and doing it inline means it's reliably done by
+    # the time this response returns. Wrapped in try/except so a failure
+    # here (e.g. a transient DB hiccup) can never affect the order response
+    # - same fire-and-forget philosophy as sync_order_to_crm.
+    if order_data.analytics_session_id:
+        try:
+            await db.analytics_conversions.insert_one({
+                "_id": str(uuid.uuid4()),
+                "session_id": order_data.analytics_session_id,
+                "order_id": order.id,
+                "created_at": datetime.utcnow(),
+            })
+        except Exception:
+            logger.exception("Failed to record analytics conversion for order %s", order.id)
+
     background_tasks.add_task(sync_order_to_crm, order)
     background_tasks.add_task(_send_order_confirmation_email, order)
     return order
@@ -5298,6 +5326,27 @@ async def admin_list_orders(request: Request, limit: int = 100, skip: int = 0):
         order.pop("_id", None)
     return orders
 
+async def _fetch_native_and_shopify_orders_raw():
+    """Shared raw fetch behind GET /admin/orders/history and the
+    GET /admin/analytics/sales aggregation below: native webshop/mobile
+    orders (db.orders) plus the imported historical Shopify catalog
+    (db.shopify_order_history), plus a batch-fetched {client_id: client_doc}
+    map for the older customer-scoped-import Shopify records that only
+    carry client_id (see _shopify_order_to_merged). Extracted so every
+    caller reuses the exact same two-collection dataset/fetch instead of
+    re-implementing this ad hoc."""
+    native_orders = await db.orders.find({}).to_list(5000)
+    shopify_orders = await db.shopify_order_history.find({}).to_list(5000)
+
+    client_ids = list({o["client_id"] for o in shopify_orders if o.get("client_id")})
+    clients_by_id = {}
+    if client_ids:
+        async for c in db.clients.find({"id": {"$in": client_ids}}):
+            clients_by_id[c["id"]] = c
+
+    return native_orders, shopify_orders, clients_by_id
+
+
 # NOTE: must stay registered *before* GET /admin/orders/{order_id} below -
 # same literal-path-before-wildcard ordering gotcha as /admin/products/bulk,
 # otherwise "history" would be swallowed as an order_id.
@@ -5317,14 +5366,7 @@ async def admin_list_order_history(
     order count is in the hundreds, not a scale where that matters."""
     await _require_admin(request)
 
-    native_orders = await db.orders.find({}).to_list(5000)
-    shopify_orders = await db.shopify_order_history.find({}).to_list(5000)
-
-    client_ids = list({o["client_id"] for o in shopify_orders if o.get("client_id")})
-    clients_by_id = {}
-    if client_ids:
-        async for c in db.clients.find({"id": {"$in": client_ids}}):
-            clients_by_id[c["id"]] = c
+    native_orders, shopify_orders, clients_by_id = await _fetch_native_and_shopify_orders_raw()
 
     merged = [_native_order_to_merged(o) for o in native_orders] + [
         _shopify_order_to_merged(o, clients_by_id) for o in shopify_orders
@@ -6010,6 +6052,347 @@ def _merged_order_sort_key(entry: dict):
     if isinstance(value, str):
         return _parse_shopify_datetime(value) or datetime.min
     return datetime.min
+
+
+# ==================== ANALYTICS (sales + traffic/conversion) ====================
+# Part 1 (sales) is derived entirely from EXISTING order data (db.orders +
+# db.shopify_order_history, via the same native/shopify merge helpers
+# above) - no new tracking needed. Part 2 (traffic/conversion) is brand new:
+# a public pageview beacon fired by agb-webshop
+# (localStorage `agb_analytics_session_id`, NOT a cookie - matches this
+# app's cookie-less, localStorage-only session architecture) feeding
+# db.analytics_pageviews, plus a best-effort conversion link recorded in
+# create_order (see db.analytics_conversions and OrderCreate.analytics_
+# session_id above). Both admin-aggregation endpoints below are gated the
+# same way as every other /admin/* route - see _require_admin.
+
+
+def _analytics_order_datetime(entry: dict) -> Optional[datetime]:
+    """Normalizes a merged order entry's `date` field (see
+    _native_order_to_merged/_shopify_order_to_merged) to a naive UTC
+    datetime for analytics date-range filtering/bucketing. Native orders
+    store a naive UTC datetime (Order.created_at's datetime.utcnow()
+    default); imported Shopify orders may carry a timezone-aware datetime
+    (see _parse_shopify_datetime) or, in older records, a raw ISO string -
+    without normalizing both to the same (naive UTC) shape, comparing them
+    against the naive `start`/`end_exclusive` bounds from
+    _parse_analytics_date_range would raise. Returns None when the value
+    can't be parsed at all, so the caller can simply exclude that entry from
+    date-bounded aggregates rather than risk a crash or a silently-wrong
+    bucket."""
+    value = entry.get("date")
+    if isinstance(value, str):
+        value = _parse_shopify_datetime(value)
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is not None:
+        value = value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
+def _analytics_bucket_key(value: datetime, granularity: str) -> str:
+    """Buckets a naive-UTC datetime into a 'YYYY-MM-DD' or 'YYYY-MM' string
+    key, shared by revenue_over_time (sales) and pageviews_over_time
+    (traffic)."""
+    return value.strftime("%Y-%m") if granularity == "month" else value.strftime("%Y-%m-%d")
+
+
+def _parse_analytics_date_range(date_from: str, date_to: str, granularity: str):
+    """Shared by GET /admin/analytics/sales and GET /admin/analytics/traffic:
+    parses/validates the from=/to=/granularity= query params (from/to as
+    plain YYYY-MM-DD calendar dates, both inclusive) into a
+    [start, end_exclusive) naive-UTC datetime range plus the validated
+    granularity - or raises a clear 400, rather than FastAPI's generic 422
+    validation-error page, since these are simple enough to explain in
+    Romanian directly."""
+    if granularity not in ("day", "month"):
+        raise HTTPException(status_code=400, detail="granularity trebuie să fie 'day' sau 'month'")
+    try:
+        start = datetime.strptime(date_from, "%Y-%m-%d")
+        end_day = datetime.strptime(date_to, "%Y-%m-%d")
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Format dată invalid, folosiți YYYY-MM-DD pentru from/to")
+    end_exclusive = end_day + timedelta(days=1)
+    if end_exclusive <= start:
+        raise HTTPException(status_code=400, detail="Intervalul 'to' trebuie să fie după 'from'")
+    return start, end_exclusive, granularity
+
+
+@api_router.get("/admin/analytics/sales")
+async def admin_analytics_sales(
+    request: Request,
+    date_from: str = Query(..., alias="from"),
+    date_to: str = Query(..., alias="to"),
+    granularity: str = Query("day"),
+):
+    """Sales analytics over [from, to] (inclusive calendar dates), pulled
+    from BOTH native webshop/mobile orders (db.orders) and imported
+    historical Shopify orders (db.shopify_order_history) - reuses the exact
+    same fetch (_fetch_native_and_shopify_orders_raw) and per-source
+    normalization (_native_order_to_merged/_shopify_order_to_merged) as
+    GET /admin/orders/history rather than reimplementing the merge.
+
+    - revenue_over_time: total `total` and order count, bucketed by day or
+      month per `granularity`.
+    - top_products: order line items aggregated by product (by product_id
+      when available - only native db.orders items carry one; older
+      Shopify line items only have a title, so those are grouped by title
+      instead), top 10 by revenue.
+    - aov: average order value (total revenue / order count) over the
+      period.
+    - orders_by_status: count grouped by the merged entry's unified
+      `financial_status` (native orders' own `status`; Shopify orders'
+      `financial_status`), same field GET /admin/orders/history already
+      exposes.
+    - new_vs_returning: for each in-period order matched by customer email
+      (case-insensitive, same matching already used by
+      GET /admin/clients/{client_id}), whether it's that customer's very
+      first order ever (across ALL orders, not just this period) or a
+      repeat. Orders without a usable email are excluded from this one
+      breakdown (can't be matched to a customer at all).
+    """
+    await _require_admin(request)
+    start, end_exclusive, granularity = _parse_analytics_date_range(date_from, date_to, granularity)
+
+    native_orders, shopify_orders, clients_by_id = await _fetch_native_and_shopify_orders_raw()
+
+    all_entries = [
+        (_native_order_to_merged(o), o) for o in native_orders
+    ] + [
+        (_shopify_order_to_merged(o, clients_by_id), o) for o in shopify_orders
+    ]
+
+    # Global (all-time, not period-bounded) earliest order per customer
+    # email - needed to classify an in-period order as new-vs-returning
+    # below regardless of whether that customer's actual first order falls
+    # inside or outside the requested period.
+    earliest_by_email: Dict[str, tuple] = {}
+    for merged, _raw in all_entries:
+        dt = _analytics_order_datetime(merged)
+        email = (merged.get("customer_email") or "").strip().lower()
+        if not dt or not email:
+            continue
+        current = earliest_by_email.get(email)
+        if current is None or dt < current[0]:
+            earliest_by_email[email] = (dt, merged["source"], merged["order_id"])
+
+    in_range = [
+        (merged, raw) for merged, raw in all_entries
+        if (dt := _analytics_order_datetime(merged)) is not None and start <= dt < end_exclusive
+    ]
+
+    # revenue_over_time
+    buckets: Dict[str, dict] = {}
+    for merged, _raw in in_range:
+        key = _analytics_bucket_key(_analytics_order_datetime(merged), granularity)
+        bucket = buckets.setdefault(key, {"date": key, "revenue": 0.0, "order_count": 0})
+        bucket["revenue"] += float(merged.get("total") or 0)
+        bucket["order_count"] += 1
+    revenue_over_time = [buckets[key] for key in sorted(buckets.keys())]
+    for bucket in revenue_over_time:
+        bucket["revenue"] = round(bucket["revenue"], 2)
+
+    # orders_by_status
+    orders_by_status: Dict[str, int] = {}
+    for merged, _raw in in_range:
+        status = merged.get("financial_status") or "unknown"
+        orders_by_status[status] = orders_by_status.get(status, 0) + 1
+
+    # aov
+    order_count = len(in_range)
+    total_revenue = sum(float(merged.get("total") or 0) for merged, _raw in in_range)
+    aov = round(total_revenue / order_count, 2) if order_count else 0.0
+
+    # top_products
+    product_agg: Dict[str, dict] = {}
+    for merged, raw in in_range:
+        if merged["source"] == "native":
+            for item in raw.get("items", []) or []:
+                product_id = item.get("product_id")
+                title = item.get("product_name") or "Produs necunoscut"
+                quantity = item.get("quantity") or 0
+                price = float(item.get("price") or 0)
+                key = product_id or f"title::{title}"
+                agg = product_agg.setdefault(
+                    key, {"product_id": product_id, "title": title, "quantity": 0, "revenue": 0.0}
+                )
+                agg["quantity"] += quantity
+                agg["revenue"] += price * quantity
+        else:
+            for item in raw.get("line_items", []) or []:
+                title = item.get("title") or "Produs necunoscut"
+                quantity = item.get("quantity") or 0
+                price = float(item.get("price") or 0)
+                key = f"title::{title}"
+                agg = product_agg.setdefault(
+                    key, {"product_id": None, "title": title, "quantity": 0, "revenue": 0.0}
+                )
+                agg["quantity"] += quantity
+                agg["revenue"] += price * quantity
+    top_products = sorted(product_agg.values(), key=lambda a: a["revenue"], reverse=True)[:10]
+    for product in top_products:
+        product["revenue"] = round(product["revenue"], 2)
+
+    # new_vs_returning
+    new_count = 0
+    returning_count = 0
+    for merged, _raw in in_range:
+        email = (merged.get("customer_email") or "").strip().lower()
+        if not email:
+            continue
+        earliest = earliest_by_email.get(email)
+        if earliest and earliest[1] == merged["source"] and earliest[2] == merged["order_id"]:
+            new_count += 1
+        else:
+            returning_count += 1
+
+    return {
+        "revenue_over_time": revenue_over_time,
+        "top_products": top_products,
+        "aov": aov,
+        "orders_by_status": orders_by_status,
+        "new_vs_returning": {"new": new_count, "returning": returning_count},
+    }
+
+
+_ANALYTICS_FIELD_MAX_LEN = 500
+
+
+def _sanitize_analytics_field(value: Optional[str]) -> Optional[str]:
+    """Trims to _ANALYTICS_FIELD_MAX_LEN chars (abuse/storage-bloat guard on
+    an unauthenticated, publicly-writable endpoint) and normalizes a blank/
+    whitespace-only string to None - shared by every optional string field
+    on POST /analytics/pageview."""
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    return value[:_ANALYTICS_FIELD_MAX_LEN]
+
+
+class PageviewCreate(BaseModel):
+    """POST /analytics/pageview body - public/no-auth beacon fired by
+    agb-webshop on every route change. session_id/path are typed Optional
+    (not required) so a request missing either gets our own clear, fast 400
+    in the handler below instead of FastAPI's generic 422 validation-error
+    page; every other field is optional metadata that may legitimately be
+    absent (no referrer on a direct visit, no utm_* outside a campaign
+    link)."""
+    session_id: Optional[str] = None
+    path: Optional[str] = None
+    referrer: Optional[str] = None
+    utm_source: Optional[str] = None
+    utm_medium: Optional[str] = None
+    utm_campaign: Optional[str] = None
+
+
+@api_router.post("/analytics/pageview", status_code=204)
+async def track_pageview(payload: PageviewCreate):
+    """Public, unauthenticated pageview beacon. Always intended to respond
+    fast and never block/break page rendering on the caller's side:
+    session_id/path are the only two required fields (fast 400 if either is
+    missing/blank after sanitizing, not FastAPI's default 422 page) -
+    everything else is best-effort sanitized (length-capped, blank
+    normalized to None) rather than strictly validated, and a DB failure is
+    swallowed (logged, not raised) rather than ever surfacing as a 500."""
+    session_id = _sanitize_analytics_field(payload.session_id)
+    path = _sanitize_analytics_field(payload.path)
+    if not session_id or not path:
+        raise HTTPException(status_code=400, detail="session_id și path sunt obligatorii")
+
+    doc = {
+        "_id": str(uuid.uuid4()),
+        "session_id": session_id,
+        "path": path,
+        "referrer": _sanitize_analytics_field(payload.referrer),
+        "utm_source": _sanitize_analytics_field(payload.utm_source),
+        "utm_medium": _sanitize_analytics_field(payload.utm_medium),
+        "utm_campaign": _sanitize_analytics_field(payload.utm_campaign),
+        "created_at": datetime.utcnow(),
+    }
+    try:
+        await db.analytics_pageviews.insert_one(doc)
+    except Exception:
+        logger.exception("Failed to record analytics pageview")
+    return Response(status_code=204)
+
+
+@api_router.get("/admin/analytics/traffic")
+async def admin_analytics_traffic(
+    request: Request,
+    date_from: str = Query(..., alias="from"),
+    date_to: str = Query(..., alias="to"),
+    granularity: str = Query("day"),
+):
+    """Traffic/conversion analytics over [from, to] (inclusive calendar
+    dates), from db.analytics_pageviews + db.analytics_conversions (see
+    POST /analytics/pageview and create_order's analytics_session_id
+    handling). Uses real Mongo aggregation pipelines/distinct (not an
+    in-process merge like GET /admin/analytics/sales) since pageview volume
+    can grow far larger than this store's order count - see the
+    (session_id, created_at) indexes added in startup_event.
+
+    - pageviews_over_time: count bucketed by day or month per
+      `granularity`.
+    - top_pages: top 10 `path` values by pageview count.
+    - top_referrers: top 10 non-empty `referrer` values by pageview count.
+    - unique_sessions: distinct session_id with >=1 pageview in range.
+    - conversions: distinct session_id with >=1 analytics_conversions entry
+      in range.
+    - conversion_rate: conversions / unique_sessions, 0 if unique_sessions
+      is 0 (never divides by zero).
+    """
+    await _require_admin(request)
+    start, end_exclusive, granularity = _parse_analytics_date_range(date_from, date_to, granularity)
+    date_format = "%Y-%m" if granularity == "month" else "%Y-%m-%d"
+    match_range = {"created_at": {"$gte": start, "$lt": end_exclusive}}
+
+    pageviews_pipeline = [
+        {"$match": match_range},
+        {"$group": {
+            "_id": {"$dateToString": {"format": date_format, "date": "$created_at"}},
+            "count": {"$sum": 1},
+        }},
+        {"$sort": {"_id": 1}},
+    ]
+    pageviews_rows = await db.analytics_pageviews.aggregate(pageviews_pipeline).to_list(length=None)
+    pageviews_over_time = [{"date": r["_id"], "count": r["count"]} for r in pageviews_rows]
+
+    top_pages_pipeline = [
+        {"$match": match_range},
+        {"$group": {"_id": "$path", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}},
+        {"$limit": 10},
+    ]
+    top_pages_rows = await db.analytics_pageviews.aggregate(top_pages_pipeline).to_list(length=None)
+    top_pages = [{"path": r["_id"], "count": r["count"]} for r in top_pages_rows]
+
+    top_referrers_pipeline = [
+        {"$match": {**match_range, "referrer": {"$nin": [None, ""]}}},
+        {"$group": {"_id": "$referrer", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}},
+        {"$limit": 10},
+    ]
+    top_referrers_rows = await db.analytics_pageviews.aggregate(top_referrers_pipeline).to_list(length=None)
+    top_referrers = [{"referrer": r["_id"], "count": r["count"]} for r in top_referrers_rows]
+
+    unique_session_ids = await db.analytics_pageviews.distinct("session_id", match_range)
+    unique_sessions = len(unique_session_ids)
+
+    conversion_session_ids = await db.analytics_conversions.distinct("session_id", match_range)
+    conversions = len(conversion_session_ids)
+
+    conversion_rate = round(conversions / unique_sessions, 4) if unique_sessions else 0
+
+    return {
+        "pageviews_over_time": pageviews_over_time,
+        "top_pages": top_pages,
+        "top_referrers": top_referrers,
+        "unique_sessions": unique_sessions,
+        "conversions": conversions,
+        "conversion_rate": conversion_rate,
+    }
 
 
 @api_router.get("/admin/clients/{client_id}")
@@ -8062,6 +8445,31 @@ async def startup_event():
         await db.bff_revoked_sessions.create_index("expires_at", expireAfterSeconds=0)
     except Exception:
         logger.exception("Failed to create TTL index on bff_revoked_sessions.expires_at")
+
+    # POST /analytics/pageview (unauthenticated, high write volume) and its
+    # admin aggregation counterpart GET /admin/analytics/traffic both filter
+    # by created_at (date-range) and/or group by session_id - without these,
+    # each admin query scans the whole (unboundedly-growing) collection.
+    try:
+        await db.analytics_pageviews.create_index([("session_id", 1), ("created_at", 1)])
+    except Exception:
+        logger.exception("Failed to create index on analytics_pageviews.(session_id, created_at)")
+    try:
+        await db.analytics_pageviews.create_index("created_at")
+    except Exception:
+        logger.exception("Failed to create index on analytics_pageviews.created_at")
+
+    # Conversion links written by create_order's analytics_session_id
+    # handling and read by GET /admin/analytics/traffic's conversions/
+    # conversion_rate - same reasoning as analytics_pageviews above.
+    try:
+        await db.analytics_conversions.create_index([("session_id", 1), ("created_at", 1)])
+    except Exception:
+        logger.exception("Failed to create index on analytics_conversions.(session_id, created_at)")
+    try:
+        await db.analytics_conversions.create_index("created_at")
+    except Exception:
+        logger.exception("Failed to create index on analytics_conversions.created_at")
 
     # Must run before the app starts accepting traffic under the new
     # tokens[] auth scheme - see docstring.
