@@ -5652,6 +5652,34 @@ async def admin_get_client_detail(client_id: str, request: Request):
         "native_orders_count": len(native_orders),
     }
 
+
+@api_router.get("/admin/customer-account")
+async def admin_get_customer_account(email: str, request: Request):
+    """Look up a webshop ACCOUNT (db.users - NOT db.clients, see
+    admin_get_client_detail above for that separate collection) by exact
+    email. Backs CRM's "Conectează cont web" feature: staff previews a
+    webshop account before linking it to a CRM client. "Linking" itself
+    happens entirely on the CRM side (setting that client's email to this
+    account's email) - agb-crm's _resolve_or_create_client already matches
+    an existing client by email on every webshop/mobile order or equipment
+    sync, so once linked, future syncs from this account land on the right
+    client with no extra mechanism needed here.
+
+    Exact match only, same normalization as login/register - deliberately
+    no fuzzy name/company search across accounts (that was considered and
+    rejected: a wrong auto-match here would misroute a customer's real
+    orders to someone else's CRM record)."""
+    admin = await _require_admin(request)
+    _enforce_rate_limit(
+        f"admin:customer-account-lookup:{admin['id']}", ADMIN_ACTION_LIMIT, ADMIN_ACTION_WINDOW_SECONDS,
+        "Prea multe căutări de cont recent. Încearcă din nou mai târziu.",
+    )
+    normalized_email = email.lower().strip()
+    user = await db.users.find_one({"email": normalized_email})
+    if not user:
+        raise HTTPException(status_code=404, detail="Niciun cont web găsit cu acest email.")
+    return _serialize_user(user)
+
 # ==================== EQUIPMENT/UTILAJE ENDPOINTS ====================
 
 def _equipment_match_key(model: str, chassis_serial: str) -> tuple:
