@@ -2742,6 +2742,99 @@ async def _send_order_confirmation_email(order: Order) -> bool:
         return False
 
 
+# Fixed staff inbox for new-order alerts - so whoever's on duty knows a new
+# order came in without needing to be logged into the CRM. Same address the
+# Brevo account itself is registered under (agbagroparts.solution@yahoo.com).
+STAFF_ORDER_NOTIFICATION_EMAIL = "agbagroparts.solution@yahoo.com"
+
+
+async def _send_new_order_staff_notification(order: Order) -> bool:
+    """Alerts AGB staff (STAFF_ORDER_NOTIFICATION_EMAIL) that a new order came
+    in - same provider/call pattern as _send_order_confirmation_email above,
+    just a different recipient/content: this one leads with the customer's
+    own contact details (name/phone/email) since staff need to know WHO to
+    reach, not just what was ordered. Fire-and-forget, same as the customer
+    email - the ONLY caller (create_order) never awaits this directly."""
+    try:
+        if not BREVO_API_KEY:
+            logger.warning("BREVO_API_KEY not set - skipping new-order staff notification for order %s", order.id)
+            return False
+
+        import sib_api_v3_sdk
+
+        configuration = sib_api_v3_sdk.Configuration()
+        configuration.api_key['api-key'] = BREVO_API_KEY
+        api_instance = sib_api_v3_sdk.TransactionalEmailsApi(sib_api_v3_sdk.ApiClient(configuration))
+
+        items_rows = "".join(
+            f"""
+                <tr>
+                    <td style="padding: 8px; border-bottom: 1px solid #eee;">{html.escape(str(item.get('product_name', '')))}</td>
+                    <td style="padding: 8px; border-bottom: 1px solid #eee; text-align: center;">{html.escape(str(item.get('quantity', 1)))}</td>
+                    <td style="padding: 8px; border-bottom: 1px solid #eee; text-align: right;">{item.get('price', 0):.2f} RON</td>
+                </tr>
+            """
+            for item in order.items
+        )
+        payment_method_label = _PAYMENT_METHOD_LABELS.get(order.payment_method, order.payment_method)
+        customer = order.customer
+
+        html_content = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif; background-color: #f5f5f5; padding: 20px;">
+            <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 10px; overflow: hidden;">
+                <div style="background-color: #367c2b; padding: 20px; text-align: center;">
+                    <h1 style="color: #ffffff; margin: 0;">🔔 Comandă nouă</h1>
+                </div>
+                <div style="padding: 30px;">
+                    <h2 style="color: #333;">Comanda #{html.escape(order.id)}</h2>
+                    <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
+                        <tr><td style="padding: 4px 0; color: #666;">Client:</td><td style="padding: 4px 0; color: #333;"><strong>{html.escape(customer.name)}</strong></td></tr>
+                        <tr><td style="padding: 4px 0; color: #666;">Telefon:</td><td style="padding: 4px 0; color: #333;">{html.escape(customer.phone)}</td></tr>
+                        <tr><td style="padding: 4px 0; color: #666;">Email:</td><td style="padding: 4px 0; color: #333;">{html.escape(customer.email)}</td></tr>
+                        <tr><td style="padding: 4px 0; color: #666;">Adresă:</td><td style="padding: 4px 0; color: #333;">{html.escape(customer.address)}, {html.escape(customer.city)}, {html.escape(customer.county)} {html.escape(customer.postal_code)}</td></tr>
+                    </table>
+                    <table style="width: 100%; border-collapse: collapse;">
+                        <thead>
+                            <tr>
+                                <th style="text-align: left; padding: 8px; border-bottom: 2px solid #367c2b; color: #333;">Produs</th>
+                                <th style="text-align: center; padding: 8px; border-bottom: 2px solid #367c2b; color: #333;">Cant.</th>
+                                <th style="text-align: right; padding: 8px; border-bottom: 2px solid #367c2b; color: #333;">Preț</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {items_rows}
+                        </tbody>
+                    </table>
+                    <div style="margin-top: 20px; text-align: right; color: #333;">
+                        <p style="margin: 4px 0;">Subtotal: {order.subtotal:.2f} RON</p>
+                        <p style="margin: 4px 0;">Transport: {order.shipping:.2f} RON</p>
+                        <p style="margin: 4px 0; font-size: 18px; font-weight: bold;">Total: {order.total:.2f} RON</p>
+                    </div>
+                    <p style="color: #666; line-height: 1.6; margin-top: 20px;">Metodă de plată: <strong>{html.escape(payment_method_label)}</strong></p>
+                    {f'<p style="color: #666; line-height: 1.6;">Note: {html.escape(customer.notes)}</p>' if customer.notes else ''}
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+
+        send_smtp_email = sib_api_v3_sdk.SendSmtpEmail(
+            to=[{"email": STAFF_ORDER_NOTIFICATION_EMAIL}],
+            sender={"email": "noreply@agb-agroparts.ro", "name": "AGB Agroparts"},
+            subject=f"🔔 Comandă nouă #{order.id} - {customer.name}",
+            html_content=html_content
+        )
+
+        api_instance.send_transac_email(send_smtp_email)
+        logger.info(f"New-order staff notification sent to {STAFF_ORDER_NOTIFICATION_EMAIL} for order {order.id}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Error sending new-order staff notification for order {order.id}: {e}")
+        return False
+
+
 @api_router.post("/orders", response_model=Order)
 async def create_order(order_data: OrderCreate, background_tasks: BackgroundTasks):
     """Create a new order"""
@@ -2785,6 +2878,7 @@ async def create_order(order_data: OrderCreate, background_tasks: BackgroundTask
 
     background_tasks.add_task(sync_order_to_crm, order)
     background_tasks.add_task(_send_order_confirmation_email, order)
+    background_tasks.add_task(_send_new_order_staff_notification, order)
     return order
 
 # NOTE: must stay registered *before* GET /orders/{session_id} below - same
