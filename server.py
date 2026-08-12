@@ -4695,7 +4695,7 @@ async def admin_create_product(request: Request, product_data: ProductCreate):
         "price": product_data.price,
         "currency": product_data.currency,
         "image_url": product_data.image_url,
-        "images": product_data.images,
+        "images": _filter_valid_image_urls(product_data.images),
         "tags": product_data.tags,
         "product_type": product_data.product_type,
         "vendor": product_data.vendor,
@@ -4745,6 +4745,22 @@ def _extract_cloudflare_image_id(url: Optional[str]) -> Optional[str]:
     return match.group(1) if match else None
 
 
+def _filter_valid_image_urls(images: List[str]) -> List[str]:
+    """Server-side defense in depth against a real recurring bug: the CRM's
+    admin form used to (and, on a stale cached bundle, still could) join the
+    "extra images" field on commas - and Cloudinary URLs embed commas in
+    their own transformation path (".../upload/ar_1:1,c_crop,g_center/..."),
+    so a single pasted URL could get shredded into 2-3 broken fragments that
+    aren't URLs at all (confirmed live on 8 real products, on two separate
+    occasions - the second one a day after the frontend fix shipped, on a
+    browser tab that had been open since before the deploy). A non-URL
+    fragment can never be a valid image regardless of which client sent it,
+    so it's dropped here rather than stored - this protects every caller
+    (including any admin browser tab still running old JS from before a
+    frontend fix), not just the currently-deployed frontend build."""
+    return [u for u in images if isinstance(u, str) and u.startswith(("http://", "https://"))]
+
+
 async def _apply_product_update(product_id: str, product_data: ProductUpdate) -> Optional[dict]:
     """Applies a partial ProductUpdate to a single product by id - shared by
     the single-product and bulk update endpoints so the two code paths can't
@@ -4756,6 +4772,8 @@ async def _apply_product_update(product_id: str, product_data: ProductUpdate) ->
 
     update_dict = {k: v for k, v in product_data.dict().items() if v is not None}
     category = update_dict.pop("category", None)
+    if "images" in update_dict:
+        update_dict["images"] = _filter_valid_image_urls(update_dict["images"])
 
     # Keep cf_image_id/cf_image_url in sync whenever this update actually
     # changes image_url. This endpoint is the ONLY way the admin webshop's

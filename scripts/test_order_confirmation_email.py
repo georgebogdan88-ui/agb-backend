@@ -155,9 +155,9 @@ async def scenario_a_order_succeeds_even_if_email_send_raises():
 
 
 async def scenario_b_confirmation_email_task_is_queued_alongside_crm_sync():
-    """(b) create_order() queues BOTH sync_order_to_crm AND
-    _send_order_confirmation_email as background tasks - the new email task
-    doesn't replace or crowd out the existing CRM sync trigger."""
+    """(b) create_order() queues sync_order_to_crm, _send_order_confirmation_email,
+    AND _send_new_order_staff_notification as background tasks - none of the
+    three replaces or crowds out the others."""
     db = await fresh_db()
     await seed_product(db, "p1", stock=10, price=50.0)
     order_data = make_order_data("p1", quantity=1)
@@ -167,7 +167,8 @@ async def scenario_b_confirmation_email_task_is_queued_alongside_crm_sync():
     queued_funcs = [task.func for task in bt.tasks]
     check("b) sync_order_to_crm queued", server.sync_order_to_crm in queued_funcs, queued_funcs)
     check("b) _send_order_confirmation_email queued", server._send_order_confirmation_email in queued_funcs, queued_funcs)
-    check("b) exactly two background tasks queued", len(bt.tasks) == 2, len(bt.tasks))
+    check("b) _send_new_order_staff_notification queued", server._send_new_order_staff_notification in queued_funcs, queued_funcs)
+    check("b) exactly three background tasks queued", len(bt.tasks) == 3, len(bt.tasks))
 
 
 async def scenario_c_send_function_isolated_behaviors():
