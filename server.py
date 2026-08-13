@@ -1516,11 +1516,20 @@ def build_products_query(
     search: Optional[str],
     product_type: Optional[str],
     collection: Optional[str],
+    vendor: Optional[str] = None,
 ) -> dict:
     """Builds the MongoDB filter dict for the storefront catalog/search -
-    shared by GET /products (paginated results) and GET /products/count
-    (total match count for the "N produse găsite" indicator), so the two
-    always agree on what counts as a match."""
+    shared by GET /products (paginated results), GET /products/search-count
+    (total match count for the "N produse găsite" indicator), and
+    GET /products/vendors (the "Producător" filter bar's option list), so
+    all three always agree on what counts as a match.
+
+    `vendor` powers the storefront's "Producător" filter bar: when set, it's
+    ANDed in like product_type/collection above. GET /products/vendors
+    deliberately calls this WITHOUT vendor even when a vendor is selected -
+    the filter bar's OWN option list must keep showing every producător
+    present in the current search/category results, not collapse down to
+    just the one already selected."""
     query = {}
 
     if product_type:
@@ -1530,6 +1539,9 @@ def build_products_query(
         # `collections` is a list field per product; querying it with a
         # scalar matches documents where the array contains that value.
         query["collections"] = collection
+
+    if vendor:
+        query["vendor"] = vendor
 
     if search:
         # Normalize search terms and handle "Premium" variations
@@ -1724,6 +1736,7 @@ async def get_products_search_count(
     search: Optional[str] = None,
     product_type: Optional[str] = None,
     collection: Optional[str] = None,
+    vendor: Optional[str] = None,
 ):
     """Total count of products matching the same filters as GET /products -
     powers the "N produse găsite" indicator on the storefront catalog/search
@@ -1731,7 +1744,7 @@ async def get_products_search_count(
     it has no way to know the true total on its own). Named distinctly from
     the pre-existing unfiltered GET /products/count (used elsewhere for the
     Shopify-sync total) rather than overloading it."""
-    query = build_products_query(search, product_type, collection)
+    query = build_products_query(search, product_type, collection, vendor)
     total = await db.shopify_products.count_documents(query)
     return {"total": total}
 
@@ -1741,6 +1754,7 @@ async def get_products(
     search: Optional[str] = None,
     product_type: Optional[str] = None,
     collection: Optional[str] = None,
+    vendor: Optional[str] = None,
     sort: Optional[str] = None,
     limit: int = 1000,
     skip: int = 0
@@ -1757,7 +1771,7 @@ async def get_products(
             # Fallback to Shopify API if no local products
             return await get_products_from_shopify(search, limit)
 
-        query = build_products_query(search, product_type, collection)
+        query = build_products_query(search, product_type, collection, vendor)
 
         # Execute query
         cursor = db.shopify_products.find(query)
@@ -1895,10 +1909,26 @@ async def get_product_types():
         }
 
 @api_router.get("/products/vendors")
-async def get_product_vendors():
-    """Get distinct vendor/brand names from the database, for the admin
-    product form's Marcă field."""
-    vendors = await db.shopify_products.distinct("vendor")
+async def get_product_vendors(
+    search: Optional[str] = None,
+    product_type: Optional[str] = None,
+    collection: Optional[str] = None,
+):
+    """Get distinct vendor/brand names from the database.
+
+    With no params (the admin product form's Marcă field, and the CRM's own
+    caller) this is the full catalog's vendor list - unchanged from before.
+    With search/product_type/collection (the storefront's "Producător"
+    filter bar), reuses build_products_query - the exact same filter
+    GET /products and GET /products/search-count already use - so the
+    returned vendors are exactly the ones actually present among current
+    search/category results, never an option that would filter to zero
+    products. Deliberately does NOT also filter by `vendor` itself (that's
+    for the caller to pass separately if needed) - the vendor OPTIONS list
+    must ignore any already-selected vendor, or picking one would leave it
+    as the only remaining choice."""
+    query = build_products_query(search, product_type, collection)
+    vendors = await db.shopify_products.distinct("vendor", query)
     vendors = sorted(v for v in vendors if v)
     return {"vendors": vendors}
 
