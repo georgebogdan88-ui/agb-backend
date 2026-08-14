@@ -33,6 +33,8 @@ import io
 from PIL import Image
 import bleach
 
+import courier_fan
+
 ROOT_DIR = Path(__file__).parent
 # Load .env but don't override existing environment variables (important for Render deployment)
 load_dotenv(ROOT_DIR / '.env', override=False)
@@ -271,6 +273,14 @@ class Order(BaseModel):
     crm_items_dirty: bool = False
     crm_items_sync_error: Optional[str] = None
     crm_items_sync_attempts: int = 0
+    # Set by PATCH /admin/orders/{order_id}/courier, pushed fire-and-forget
+    # from agb-crm's generate_awb once staff creates a FAN Courier AWB for
+    # this order - lets the customer see their AWB number and live delivery
+    # status on their own account page (GET /auth/orders/{order_id}/
+    # courier-tracking). None/absent until an AWB has actually been
+    # generated for this order.
+    courier_awb_number: Optional[str] = None
+    courier_service: Optional[str] = None
 
 class OrderCreate(BaseModel):
     session_id: str
@@ -5634,6 +5644,94 @@ async def admin_update_order_items(
         background_tasks.add_task(sync_order_update_to_crm, Order(**updated))
 
     return updated
+
+
+class OrderCourierUpdate(BaseModel):
+    courier_awb_number: str
+    courier_service: Optional[str] = None
+
+
+@api_router.patch("/admin/orders/{order_id}/courier")
+async def admin_update_order_courier(
+    request: Request,
+    order_id: str,
+    payload: OrderCourierUpdate,
+):
+    """Receives the FAN Courier AWB number for an order once staff generates
+    it in agb-crm (fire-and-forget push from CRM's generate_awb - see
+    routes_courier.py there). Sets courier_awb_number/courier_service on the
+    order so the customer can see their AWB and live tracking status on
+    their own account page (GET /auth/orders/{order_id}/courier-tracking
+    below). Same admin-auth pattern as the neighboring PUT
+    /admin/orders/{order_id}/items above - no separate mechanism for this
+    one endpoint."""
+    admin = await _require_admin(request)
+
+    order_doc = await db.orders.find_one({"id": order_id})
+    if not order_doc:
+        raise HTTPException(status_code=404, detail="Comanda nu a fost găsită")
+
+    update_dict = {
+        "courier_awb_number": payload.courier_awb_number,
+        "courier_service": payload.courier_service,
+    }
+    await db.orders.update_one({"id": order_id}, {"$set": update_dict})
+
+    await _write_audit_log(
+        request, admin, action="order.courier_update", resource_type="order",
+        resource_id=order_id,
+        before={
+            "courier_awb_number": order_doc.get("courier_awb_number"),
+            "courier_service": order_doc.get("courier_service"),
+        },
+        after=update_dict,
+    )
+
+    updated = await db.orders.find_one({"id": order_id})
+    updated.pop("_id", None)
+    return updated
+
+
+@api_router.get("/auth/orders/{order_id}/courier-tracking")
+async def get_order_courier_tracking(order_id: str, request: Request):
+    """Live FAN Courier delivery status for one of the logged-in customer's
+    own orders - powers the AWB/tracking link shown on their account page
+    (sent to them separately via WhatsApp/email). Same auth pattern as GET
+    /auth/orders above, plus an explicit ownership check (order must belong
+    to this customer's email) so one customer can never see another's
+    tracking by guessing an order_id.
+
+    Returns the same shape agb-crm already uses for AWB tracking (see
+    courier_fan.track_awb / routes_courier.py there):
+    {"events": [{"name", "location", "date"}, ...], "confirmation":
+    {"name", "date"} | None}.
+    """
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Token lipsă sau invalid")
+
+    token = auth_header.replace("Bearer ", "")
+    user = await _find_user_by_token(token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Token invalid sau expirat")
+
+    order = await db.orders.find_one({"id": order_id, "customer.email": user["email"]})
+    if not order:
+        raise HTTPException(status_code=404, detail="Comandă negăsită")
+
+    awb = order.get("courier_awb_number")
+    if not awb:
+        raise HTTPException(status_code=404, detail="Comanda nu are AWB generat")
+
+    try:
+        result = await courier_fan.track_awb(awb)
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    return {
+        "events": result.get("events") or [],
+        "confirmation": result.get("confirmation"),
+    }
 
 # ==================== CLIENTS (Shopify customer import) ====================
 # One-time bulk import of every existing Shopify customer + their full order
