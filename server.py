@@ -3324,6 +3324,31 @@ async def send_password_reset_email(recipient_email: str, recipient_name: str, r
         return False
 
 
+async def _find_shopify_customer_by_email(email: str) -> Optional[dict]:
+    """Look up a customer in Shopify by email via the Admin REST API (same
+    endpoint/pattern as get_shopify_customer_notes above) - used by
+    /auth/forgot-password to recognize customers who exist in Shopify
+    (imported order/customer history, see _run_clients_import) but have
+    never logged in on the new webshop, so have no local `users` document
+    yet. Unlike _legacy_shopify_login_and_migrate, this is read-only and
+    does NOT require the customer's Shopify password."""
+    admin_token = os.environ.get('SHOPIFY_ADMIN_TOKEN', '') or SHOPIFY_ADMIN_TOKEN
+    if not admin_token:
+        logger.warning("SHOPIFY_ADMIN_TOKEN not set - cannot look up legacy Shopify customer for forgot-password")
+        return None
+    store = os.environ.get('SHOPIFY_STORE', '43ca3c-3.myshopify.com')
+    headers = {"Content-Type": "application/json", "X-Shopify-Access-Token": admin_token}
+    search_url = f"https://{store}/admin/api/{SHOPIFY_ADMIN_API_VERSION}/customers/search.json?query=email:{email}"
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(search_url, headers=headers, timeout=15.0)
+        customers = response.json().get("customers", [])
+        return customers[0] if customers else None
+    except Exception as e:
+        logger.error(f"Error looking up Shopify customer for forgot-password ({email}): {e}")
+        return None
+
+
 @api_router.post("/auth/forgot-password")
 async def forgot_password(request: ForgotPasswordRequest, http_request: Request):
     """Send a local password reset email. Always returns a generic success
@@ -3335,6 +3360,39 @@ async def forgot_password(request: ForgotPasswordRequest, http_request: Request)
     )
     email = request.email.lower().strip()
     user = await db.users.find_one({"email": email})
+
+    if not user:
+        # No local account - before giving up, check whether this is a
+        # legacy Shopify customer (imported order/customer history) who's
+        # simply never logged in on the new webshop yet, so never hit the
+        # silent migration in _legacy_shopify_login_and_migrate. Provision a
+        # local account from their Shopify profile, with no password set,
+        # so the reset link below can be used to set one - same trust bar as
+        # any forgot-password flow either way: whoever can read the email
+        # this gets sent to is who ends up controlling the account.
+        shopify_customer = await _find_shopify_customer_by_email(email)
+        if shopify_customer:
+            default_address = shopify_customer.get("default_address") or {}
+            name = " ".join(
+                part for part in [shopify_customer.get("first_name"), shopify_customer.get("last_name")] if part
+            ).strip() or email.split("@")[0]
+            user = {
+                "id": str(uuid.uuid4()),
+                "email": email,
+                "name": name,
+                "phone": shopify_customer.get("phone") or default_address.get("phone") or "",
+                "address": default_address.get("address1") or "",
+                "city": default_address.get("city") or "",
+                "county": default_address.get("province") or "",
+                "postal_code": default_address.get("zip") or "",
+                "is_company": bool(default_address.get("company")),
+                "company_name": default_address.get("company") or None,
+                "is_shopify_customer": True,
+                "shopify_customer_id": str(shopify_customer["id"]) if shopify_customer.get("id") else None,
+                "tokens": [],
+                "created_at": datetime.utcnow(),
+            }
+            await db.users.insert_one(user)
 
     if user:
         reset_token = secrets.token_urlsafe(32)
