@@ -3832,30 +3832,31 @@ async def shopify_customer_login(credentials: ShopifyCustomerLogin, request: Req
     the same login rate limiting - see _authenticate_user)."""
     return await _authenticate_user(credentials.email, credentials.password, request)
 
-@api_router.put("/auth/me")
-async def update_current_user(request: Request, update_data: UserUpdate, background_tasks: BackgroundTasks):
-    """Update current user profile"""
-    auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Token lipsă sau invalid")
-    
-    token = auth_header.replace("Bearer ", "")
-    user = await _find_user_by_token(token)
-    
-    if not user:
-        raise HTTPException(status_code=401, detail="Token invalid sau expirat")
-    
-    # Build update dict with only non-None values
+def _build_user_profile_update_dict(user: dict, update_data: UserUpdate) -> dict:
+    """Build the Mongo $set dict for a partial user-profile update: only
+    fields actually present (non-None) in `update_data`, plus recomputing
+    the derived address/company_address combined strings whenever their
+    split fields are among the changed ones.
+
+    Shared by PUT /auth/me (self-service, the customer editing their own
+    account) and PATCH /admin/customer-account/{email} (staff correcting a
+    customer's standing account, e.g. after a checkout typo) so this
+    ~50-line combination logic lives in exactly one place instead of
+    drifting between the two call sites.
+
+    `user` must be the CURRENT (pre-update) user doc - needed to fall back
+    to the existing value of any split field that ISN'T itself part of this
+    particular update, when recomputing the combined address/company_address
+    string. address/company_address stay in sync as a derived combo whenever
+    the split fields are sent - a handful of older call sites (checkout
+    prefill, admin order display, the CRM order sync payload) still read the
+    single combined field, so it can't just go stale the moment someone
+    starts using the new split fields instead."""
     update_dict = {}
     for field, value in update_data.dict().items():
         if value is not None:
             update_dict[field] = value
 
-    # address/company_address stay in sync as a derived combo whenever the
-    # split fields are sent - a handful of older call sites (checkout
-    # prefill, admin order display, the CRM order sync payload) still read
-    # the single combined field, so it can't just go stale the moment
-    # someone starts using the new split fields instead.
     def _combine_address(strada: str, numar: str, bloc: str, scara: str, ap: str) -> str:
         parts = [" ".join(filter(None, [strada, numar])).strip()]
         if bloc:
@@ -3887,6 +3888,24 @@ async def update_current_user(request: Request, update_data: UserUpdate, backgro
             update_dict.get("company_address_scara", user.get("company_address_scara")) or "",
             update_dict.get("company_address_ap", user.get("company_address_ap")) or "",
         )
+
+    return update_dict
+
+
+@api_router.put("/auth/me")
+async def update_current_user(request: Request, update_data: UserUpdate, background_tasks: BackgroundTasks):
+    """Update current user profile"""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Token lipsă sau invalid")
+
+    token = auth_header.replace("Bearer ", "")
+    user = await _find_user_by_token(token)
+
+    if not user:
+        raise HTTPException(status_code=401, detail="Token invalid sau expirat")
+
+    update_dict = _build_user_profile_update_dict(user, update_data)
 
     if update_dict:
         await db.users.update_one(
@@ -5692,6 +5711,86 @@ async def admin_update_order_courier(
     return updated
 
 
+class OrderCustomerUpdate(BaseModel):
+    """Partial update to an order's frozen `customer` snapshot (CustomerInfo)
+    - every field is optional, only fields actually present (non-None) in
+    the request body get changed. Deliberately omits `email` (the
+    account-identifying/lookup field on CustomerInfo, not something a
+    checkout typo lands in) and `notes` (free-text order note, unrelated to
+    contact/address/invoice correctness)."""
+    name: Optional[str] = None
+    phone: Optional[str] = None
+    address: Optional[str] = None
+    city: Optional[str] = None
+    county: Optional[str] = None
+    postal_code: Optional[str] = None
+    is_company: Optional[bool] = None
+    company_name: Optional[str] = None
+    cui: Optional[str] = None
+    reg_com: Optional[str] = None
+    administrator: Optional[str] = None
+    company_address_strada: Optional[str] = None
+    company_address_numar: Optional[str] = None
+    company_address_bloc: Optional[str] = None
+    company_address_scara: Optional[str] = None
+    company_address_ap: Optional[str] = None
+    company_address_oras: Optional[str] = None
+    company_address_judet: Optional[str] = None
+    company_address_cod_postal: Optional[str] = None
+
+
+@api_router.patch("/admin/orders/{order_id}/customer")
+async def admin_update_order_customer(
+    request: Request,
+    order_id: str,
+    payload: OrderCustomerUpdate,
+):
+    """Corrects a typo the customer made in their contact/address/invoice
+    details at checkout (e.g. a wrong phone digit, a misspelled street) -
+    edits the frozen `customer` snapshot on this ONE order only. Does NOT
+    touch the customer's standing account (db.users) - see PATCH
+    /admin/customer-account/{email} for fixing that so future orders and
+    the account page reflect the correction too.
+
+    Only updates fields actually present (non-None) in the request body -
+    a partial update, same spirit as PUT /auth/me - not a full overwrite of
+    the customer sub-object. Same admin-auth pattern as the neighboring PUT
+    /admin/orders/{order_id}/items and PATCH /admin/orders/{order_id}/
+    courier above.
+
+    Note: this does NOT re-push the corrected details to CRM for orders
+    that already synced there (unlike the items endpoint's crm_items_dirty
+    mechanism) - out of scope for this fix; CRM-side correction is handled
+    separately if/when needed."""
+    admin = await _require_admin(request)
+
+    order_doc = await db.orders.find_one({"id": order_id})
+    if not order_doc:
+        raise HTTPException(status_code=404, detail="Comanda nu a fost găsită")
+
+    changed_fields = {k: v for k, v in payload.dict().items() if v is not None}
+    if not changed_fields:
+        order_doc.pop("_id", None)
+        return order_doc
+
+    old_customer = order_doc.get("customer") or {}
+    before = {k: old_customer.get(k) for k in changed_fields}
+
+    update_dict = {f"customer.{k}": v for k, v in changed_fields.items()}
+    await db.orders.update_one({"id": order_id}, {"$set": update_dict})
+
+    await _write_audit_log(
+        request, admin, action="order.customer_update", resource_type="order",
+        resource_id=order_id,
+        before=before,
+        after=changed_fields,
+    )
+
+    updated = await db.orders.find_one({"id": order_id})
+    updated.pop("_id", None)
+    return updated
+
+
 @api_router.get("/auth/orders/{order_id}/courier-tracking")
 async def get_order_courier_tracking(order_id: str, request: Request):
     """Live FAN Courier delivery status for one of the logged-in customer's
@@ -6699,6 +6798,56 @@ async def admin_get_customer_account(email: str, request: Request):
     if not user:
         raise HTTPException(status_code=404, detail="Niciun cont web găsit cu acest email.")
     return _serialize_user(user)
+
+
+@api_router.patch("/admin/customer-account/{email}")
+async def admin_update_customer_account(
+    email: str,
+    update_data: UserUpdate,
+    request: Request,
+    background_tasks: BackgroundTasks,
+):
+    """Corrects a customer's STANDING ACCOUNT profile (db.users) - e.g. staff
+    fixing a typo'd phone/address so it's right on every FUTURE order and on
+    the customer's own account page from now on, not just retroactively on
+    one already-placed order (see PATCH /admin/orders/{order_id}/customer
+    for that order-scoped fix).
+
+    Reuses the exact same partial-update + address/company_address
+    recombination logic as the customer's own PUT /auth/me, via the shared
+    _build_user_profile_update_dict helper, so the two call sites can't
+    silently drift apart.
+
+    Looked up by exact email (path param, same normalization as login/
+    register and the neighboring GET /admin/customer-account above) - 404
+    if no account exists with that email."""
+    admin = await _require_admin(request)
+
+    normalized_email = email.lower().strip()
+    user = await db.users.find_one({"email": normalized_email})
+    if not user:
+        raise HTTPException(status_code=404, detail="Niciun cont web găsit cu acest email.")
+
+    update_dict = _build_user_profile_update_dict(user, update_data)
+
+    if update_dict:
+        await db.users.update_one({"id": user["id"]}, {"$set": update_dict})
+
+    updated_user = await db.users.find_one({"id": user["id"]})
+
+    await _write_audit_log(
+        request, admin, action="customer_account.update", resource_type="user",
+        resource_id=user["id"],
+        before={k: user.get(k) for k in update_dict},
+        after=update_dict,
+    )
+
+    # Sync to CRM (fire-and-forget, never blocks/fails the response above) -
+    # same call as PUT /auth/me makes on a self-service update, so a staff
+    # correction reaches CRM exactly the same way a customer's own edit does.
+    background_tasks.add_task(sync_account_to_crm, updated_user)
+
+    return _serialize_user(updated_user)
 
 # ==================== EQUIPMENT/UTILAJE ENDPOINTS ====================
 
