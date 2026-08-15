@@ -1976,6 +1976,7 @@ async def get_complementary_products(product_id: str):
                 "currency": ref_product.get("currency", "RON"),
                 "image_url": ref_product.get("image_url"),
                 "stock": ref_product.get("stock", 0),
+                "stock_status": ref_product.get("stock_status"),
                 "sku": ref_product.get("sku"),
                 "recommended_quantity": 1,
             })
@@ -2147,6 +2148,7 @@ async def get_equivalent_products(product_id: str):
             "currency": ref_product.get("currency", "RON"),
             "image_url": ref_product.get("image_url"),
             "stock": ref_product.get("stock", 0),
+            "stock_status": ref_product.get("stock_status"),
             "sku": ref_product.get("sku"),
             "vendor": ref_product.get("vendor"),
             "recommended_quantity": 1,
