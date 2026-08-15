@@ -355,6 +355,7 @@ class UserUpdate(BaseModel):
     company_address_oras: Optional[str] = None
     company_address_judet: Optional[str] = None
     company_address_cod_postal: Optional[str] = None
+    notify_news_email: Optional[bool] = None
 
 # ==================== EQUIPMENT MODELS ====================
 
@@ -3221,6 +3222,7 @@ async def register_user(user_data: UserRegister, background_tasks: BackgroundTas
         "company_address_cod_postal": None,
         "tokens": [token_doc],
         "is_shopify_customer": False,
+        "notify_news_email": True,
         "created_at": created_at,
         # GDPR consent to Terms + Privacy Policy, recorded at registration
         # time only - see CURRENT_TERMS_VERSION above. Only ever set here,
@@ -3671,6 +3673,11 @@ def _serialize_user(user: dict) -> dict:
         "is_shopify_customer": user.get("is_shopify_customer", False),
         "created_at": user["created_at"],
         "role": user.get("role", "customer"),
+        # Defaults True for accounts predating this field, matching the
+        # unconditional-send behavior send_blog_notification_to_matching_users
+        # had before this opt-out existed - adding the field never silently
+        # unsubscribes anyone already receiving these emails.
+        "notify_news_email": user.get("notify_news_email", True),
         # GDPR consent - absent/None for accounts created before this field
         # existed (never backfilled), populated for accounts registered
         # from now on. See CURRENT_TERMS_VERSION near UserRegister.
@@ -10468,13 +10475,15 @@ async def send_blog_notification_to_matching_users(
         # Get all users with equipment
         users_with_equipment = await db.users.find(
             {"equipment": {"$exists": True, "$ne": []}},
-            {"email": 1, "name": 1, "equipment": 1}
+            {"email": 1, "name": 1, "equipment": 1, "notify_news_email": 1}
         ).to_list(1000)
-        
+
         sent_count = 0
         matched_users = []
-        
+
         for user in users_with_equipment:
+            if user.get("notify_news_email", True) is False:
+                continue
             user_email = user.get("email", "")
             user_name = user.get("name", "Client")
             user_equipment = user.get("equipment", [])
