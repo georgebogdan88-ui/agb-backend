@@ -11,7 +11,7 @@ import logging
 import html
 from pathlib import Path
 from pydantic import BaseModel, Field
-from typing import List, Optional, Literal, Dict, Deque
+from typing import List, Optional, Literal, Dict, Deque, Set
 import uuid
 from datetime import datetime, timedelta, timezone
 import httpx
@@ -4434,6 +4434,16 @@ class ProductBulkSaveItem(BaseModel):
 class ProductBulkSave(BaseModel):
     updates: List[ProductBulkSaveItem]
 
+class ProductEquivalentsPreviewRequest(BaseModel):
+    product_ids: List[str]
+
+class ProductEquivalentLinkItem(BaseModel):
+    product_id: str
+    equivalent_ids: List[str]
+
+class ProductEquivalentsApplyRequest(BaseModel):
+    links: List[ProductEquivalentLinkItem]
+
 def slugify(text: str) -> str:
     slug = normalize_text(text)
     slug = re.sub(r'[^a-z0-9]+', '-', slug).strip('-')
@@ -4469,6 +4479,94 @@ def build_collections(product_type: Optional[str], category: Optional[str], exis
             derived.append(f"{DEZMEMBRARE_CATEGORY_PREFIX}{category}")
 
     return preserved + derived
+
+# ==================== OEM/part code extraction (equivalent matching) ====================
+# Backs "Adaugă echivalente" (POST /admin/products/equivalents/preview +
+# /apply below) - there's no structured OEM-code field on Product, the code
+# is embedded as free text inside `title` (e.g. "Carcasa Termostate John
+# Deere R522776"). This is a best-effort heuristic only: it feeds a
+# human-reviewed preview step, never a direct write, so false positives/
+# negatives here are not destructive - they just mean a proposed match is
+# missing, or a bit noisy for staff to eyeball out.
+
+# Chars stripped from a token's boundaries before testing it as a code -
+# purely stray punctuation that can end up attached to a word by title
+# formatting (parens, quotes, list punctuation), NOT '.' or '/' since those
+# can be part of a real code itself (e.g. "644724.1", "72/384-21") and
+# stripping them here would corrupt the code.
+_OEM_CODE_BOUNDARY_STRIP = '()[]{}"\';:'
+
+# A "code-like" token: optionally up to 4 leading letters, then at least one
+# digit, then 2+ more letters/digits/./-  characters. Deliberately permissive
+# (also matches spec-like tokens such as "25Cm3" or short values) - the
+# preview/confirm step is the real safety net, not this regex; the only
+# extra guard here is the minimum overall length below, which filters out
+# the shortest/noisiest false positives (e.g. "10A") without needing to
+# understand which tokens are units vs. codes.
+_OEM_CODE_TOKEN_RE = re.compile(r'^[A-Za-z]{0,4}\d[A-Za-z0-9./-]{2,}$')
+_OEM_CODE_MIN_LEN = 4
+
+def _clean_oem_token(token: str) -> str:
+    return token.strip(_OEM_CODE_BOUNDARY_STRIP)
+
+def _is_oem_code_token(token: str) -> bool:
+    token = _clean_oem_token(token)
+    if len(token) < _OEM_CODE_MIN_LEN:
+        return False
+    return bool(_OEM_CODE_TOKEN_RE.match(token))
+
+def _tokenize_title_for_oem_code(title: str) -> List[str]:
+    # Split on whitespace AND commas - some titles list cross-reference
+    # codes for multiple brands comma-separated rather than just
+    # space-separated (e.g. "... AL79782, AL175855, AL175835, AL201127").
+    return [t for t in re.split(r'[\s,]+', (title or '').strip()) if t]
+
+def extract_oem_code(title: str) -> Optional[str]:
+    """Best-effort extraction of the PRIMARY OEM/manufacturer part code
+    embedded in a product title. Handles the patterns seen across the
+    catalog:
+      - trailing single code: "Carcasa Termostate John Deere R522776"
+        -> "R522776"
+      - trailing cross-reference LIST of codes for different brands of the
+        same part, space- or comma-separated: "... AL79782, AL175855,
+        AL175835, AL201127" -> "AL79782" (the FIRST/leftmost of the trailing
+        block is the primary code, the rest are alternate manufacturer
+        codes for that same part - not returned here, but they'll surface
+        naturally as their own products' primary codes when THEY are looked
+        up, so no information is lost by only returning one).
+      - leading code instead of trailing: "R169152 Inel etanșare
+        transmisie" -> "R169152", "L111005 Garnitura" -> "L111005".
+      - codes containing '.' or '/' punctuation: "644724.1", "72/384-21".
+
+    Trailing is checked before leading (the dominant pattern in the
+    catalog); if a trailing code-like run exists, a leading one is never
+    considered even if it's also present. Returns None if neither end of
+    the title has a code-like token.
+    """
+    tokens = _tokenize_title_for_oem_code(title)
+    if not tokens:
+        return None
+
+    trailing_run: List[str] = []
+    for tok in reversed(tokens):
+        if _is_oem_code_token(tok):
+            trailing_run.append(_clean_oem_token(tok))
+        else:
+            break
+    if trailing_run:
+        trailing_run.reverse()
+        return trailing_run[0]
+
+    leading_run: List[str] = []
+    for tok in tokens:
+        if _is_oem_code_token(tok):
+            leading_run.append(_clean_oem_token(tok))
+        else:
+            break
+    if leading_run:
+        return leading_run[0]
+
+    return None
 
 # ==================== BFF ADMIN JWT (CRM-signed, verify-only) ====================
 # CRM signs short-lived (5-15 min) Ed25519 JWTs for a staff member's admin
@@ -5062,6 +5160,231 @@ async def admin_bulk_add_equivalent_products(request: Request, bulk_data: Produc
     )
 
     return {"updated": len(found_ids), "not_found": not_found}
+
+# Projection used by the preview endpoint below - only the fields needed to
+# extract a code, compare vendors, and show a staff member enough to eyeball
+# a candidate match, over what can be the WHOLE catalog (~15k products) in
+# one query.
+_PRODUCT_EQUIVALENTS_PREVIEW_PROJECTION = {
+    "id": 1, "title": 1, "vendor": 1, "price": 1, "currency": 1,
+    "sku": 1, "image_url": 1, "stock": 1, "equivalent_product_ids": 1,
+}
+
+@api_router.post("/admin/products/equivalents/preview")
+async def admin_preview_product_equivalents(request: Request, payload: ProductEquivalentsPreviewRequest):
+    """Read-only first step of "Adaugă echivalente": for each of the
+    staff-selected `product_ids` (e.g. a freshly-created batch), extracts
+    its OEM/part code from `title` (see extract_oem_code above) and looks
+    for OTHER products anywhere in the catalog sharing that exact code
+    (case-insensitive) but with a DIFFERENT `vendor` - the "same part,
+    different brand" signal the storefront's GET /products/{id}/equivalents
+    already reads from `equivalent_product_ids`. Already-linked pairs (ids
+    already present in a product's own `equivalent_product_ids`) are
+    excluded from `matches` since there'd be no point proposing them again.
+
+    Makes NO database writes - this only returns proposed matches for a
+    human to confirm/deselect via POST /admin/products/equivalents/apply
+    below, which is the only endpoint of this pair that actually writes.
+
+    Extraction + matching runs once over the whole catalog and is indexed
+    in memory, rather than re-scanning the full collection once per
+    selected product (which would be `len(product_ids)` separate full
+    scans) - this is a single query either way.
+    """
+    await _require_admin(request)
+
+    if not payload.product_ids:
+        raise HTTPException(status_code=400, detail="product_ids nu poate fi o listă goală")
+
+    if len(payload.product_ids) > 500:
+        raise HTTPException(
+            status_code=400,
+            detail="Poți previzualiza cel mult 500 de produse într-o singură cerere",
+        )
+
+    all_docs = await db.shopify_products.find({}, _PRODUCT_EQUIVALENTS_PREVIEW_PROJECTION).to_list(None)
+
+    docs_by_id: Dict[str, dict] = {}
+    code_by_id: Dict[str, Optional[str]] = {}
+    code_index: Dict[str, List[str]] = {}
+    for doc in all_docs:
+        product_id = doc.get("id")
+        if not product_id:
+            continue
+        docs_by_id[product_id] = doc
+        code = extract_oem_code(doc.get("title", ""))
+        code_by_id[product_id] = code
+        if code:
+            code_index.setdefault(code.lower(), []).append(product_id)
+
+    results = []
+    for product_id in payload.product_ids:
+        doc = docs_by_id.get(product_id)
+        if not doc:
+            results.append({
+                "product_id": product_id,
+                "title": None,
+                "extracted_code": None,
+                "matches": [],
+                "not_found": True,
+            })
+            continue
+
+        code = code_by_id.get(product_id)
+        matches = []
+        if code:
+            existing_equivalents = set(doc.get("equivalent_product_ids") or [])
+            product_vendor = (doc.get("vendor") or "").strip().lower()
+            for candidate_id in code_index.get(code.lower(), []):
+                if candidate_id == product_id or candidate_id in existing_equivalents:
+                    continue
+                candidate = docs_by_id[candidate_id]
+                candidate_vendor = (candidate.get("vendor") or "").strip().lower()
+                if candidate_vendor == product_vendor:
+                    continue
+                matches.append({
+                    "id": candidate.get("id"),
+                    "title": candidate.get("title"),
+                    "vendor": candidate.get("vendor"),
+                    "price": candidate.get("price"),
+                    "currency": candidate.get("currency"),
+                    "sku": candidate.get("sku"),
+                    "image_url": candidate.get("image_url"),
+                    "stock": candidate.get("stock"),
+                })
+
+        results.append({
+            "product_id": product_id,
+            "title": doc.get("title"),
+            "extracted_code": code,
+            "matches": matches,
+            "not_found": False,
+        })
+
+    return {"results": results}
+
+@api_router.post("/admin/products/equivalents/apply")
+async def admin_apply_product_equivalents(request: Request, payload: ProductEquivalentsApplyRequest):
+    """Writes the equivalent-product links a staff member confirmed from
+    POST /admin/products/equivalents/preview's proposed `matches` - this is
+    explicitly whatever subset they kept after deselecting any they didn't
+    want, NOT a re-run of the matching itself; it only writes exactly the
+    `links` it's given and never queries by title/code.
+
+    Shape is deliberately different from /admin/products/bulk/equivalent-add
+    (which applies the SAME `add` ids to every product in `ids` - one set of
+    ids fanned out to many products): here each `links` item carries its OWN
+    distinct `equivalent_ids` for that one `product_id` (product A matches X
+    and Y, product B matches Z), since that's what a real preview-confirm
+    batch looks like.
+
+    Bidirectional by design (unlike /admin/products/bulk/complementary-add,
+    which is intentionally one-directional): for every {product_id,
+    equivalent_ids} pair, `equivalent_ids` is $addToSet'd onto product_id's
+    own equivalent_product_ids, AND product_id is $addToSet'd onto EACH of
+    those equivalent products' own equivalent_product_ids - "same part,
+    different brand" is inherently a symmetric relationship, so a link from
+    A to B must always imply the reverse link from B to A. $addToSet makes
+    re-applying the same links (or overlapping ones) idempotent either
+    direction.
+
+    Ids that don't match any existing product (on either side of a pair)
+    are reported back in `not_found` rather than failing the whole request,
+    same convention as the other bulk endpoints above.
+    """
+    admin = await _require_admin(request)
+
+    if not payload.links:
+        raise HTTPException(status_code=400, detail="links nu poate fi o listă goală")
+
+    if len(payload.links) > 500:
+        raise HTTPException(
+            status_code=400,
+            detail="Poți lega cel mult 500 de produse într-o singură cerere",
+        )
+
+    for link in payload.links:
+        if len(link.equivalent_ids) > 500:
+            raise HTTPException(
+                status_code=400,
+                detail="Poți lega cel mult 500 de produse echivalente pentru un singur produs",
+            )
+
+    # Every id this request touches, in either role (product_id or one of
+    # its equivalent_ids - the bidirectional write below touches both sides)
+    # - collected up front so existence can be checked with a single query
+    # instead of one per link/id.
+    all_ids: Set[str] = set()
+    for link in payload.links:
+        if not link.equivalent_ids:
+            continue
+        all_ids.add(link.product_id)
+        all_ids.update(link.equivalent_ids)
+
+    found_ids: Set[str] = set()
+    if all_ids:
+        cursor = db.shopify_products.find({"id": {"$in": list(all_ids)}}, {"id": 1})
+        found_docs = await cursor.to_list(len(all_ids))
+        found_ids = {doc["id"] for doc in found_docs}
+
+    not_found: Set[str] = set()
+    updated_pairs = 0
+    now = datetime.utcnow()
+
+    for link in payload.links:
+        if not link.equivalent_ids:
+            continue
+
+        if link.product_id not in found_ids:
+            not_found.add(link.product_id)
+            continue
+
+        valid_equivalent_ids = [eid for eid in link.equivalent_ids if eid in found_ids]
+        for eid in link.equivalent_ids:
+            if eid not in found_ids:
+                not_found.add(eid)
+
+        if not valid_equivalent_ids:
+            continue
+
+        await db.shopify_products.update_one(
+            {"id": link.product_id},
+            {
+                "$addToSet": {"equivalent_product_ids": {"$each": valid_equivalent_ids}},
+                "$set": {"updated_at": now},
+            },
+        )
+        # Reverse direction - one $addToSet per equivalent id, since each
+        # one only ever gets this single link.product_id added (unlike the
+        # forward write above, there's no shared "$each" value across many
+        # docs here).
+        for eid in valid_equivalent_ids:
+            await db.shopify_products.update_one(
+                {"id": eid},
+                {
+                    "$addToSet": {"equivalent_product_ids": link.product_id},
+                    "$set": {"updated_at": now},
+                },
+            )
+        updated_pairs += len(valid_equivalent_ids)
+
+    # Single audit entry for the whole confirmed batch - each link's own
+    # requested equivalent_ids (what staff actually confirmed), not a
+    # per-product before/after diff, same reasoning as the other bulk
+    # endpoints above.
+    await _write_audit_log(
+        request, admin, action="product.equivalents_apply", resource_type="product",
+        after={
+            "links": [
+                {"product_id": link.product_id, "equivalent_ids": link.equivalent_ids}
+                for link in payload.links
+            ],
+            "updated_pairs": updated_pairs,
+            "not_found": sorted(not_found),
+        },
+    )
+
+    return {"updated_pairs": updated_pairs, "not_found": sorted(not_found)}
 
 # NOTE: same reasoning as /admin/products/bulk above - "bulk-save" and
 # "by-ids" must stay registered before PUT/DELETE /admin/products/{product_id}
