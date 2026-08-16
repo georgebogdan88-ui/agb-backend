@@ -2995,6 +2995,44 @@ async def _send_order_confirmation_email(order: Order) -> bool:
         return False
 
 
+async def _create_user_notification(
+    to_email: str,
+    notif_type: str,
+    title: str,
+    body: str,
+    product_name: Optional[str] = None,
+    product_image_url: Optional[str] = None,
+    product_url: Optional[str] = None,
+) -> None:
+    """Mirrors a staff-sent email (marketing recommendation or stock/price
+    alert fulfillment) into an in-app notification, IF the recipient has a
+    real web/app account - never-raise, best-effort: a client with no
+    account (most B2B/CRM-only contacts) simply gets no in-app row, same
+    as the email itself doesn't require an account to receive. Feeds the
+    app's "Noutăți" bell/feed (see AppHeader.tsx's comment on the mobile
+    side - it previously had no real per-user notification source, only
+    the blog article count)."""
+    try:
+        user = await db.users.find_one({"email": to_email}, {"id": 1})
+        if not user:
+            return
+        now = datetime.now(timezone.utc)
+        await db.notifications.insert_one({
+            "_id": str(uuid.uuid4()),
+            "user_id": user["id"],
+            "type": notif_type,
+            "title": title,
+            "body": body,
+            "product_name": product_name,
+            "product_image_url": product_image_url,
+            "product_url": product_url,
+            "created_at": now,
+            "read_at": None,
+        })
+    except Exception as e:  # noqa: BLE001 - never blocks the email send itself
+        logger.warning("Nu s-a putut crea notificarea in-app pentru %s: %s", to_email, e)
+
+
 async def _send_marketing_email(to_email: str, to_name: Optional[str], product: dict) -> bool:
     """Staff-triggered (not fire-and-forget) - the ONLY caller is
     POST /admin/marketing/send-email, an explicit admin action from CRM's
@@ -3063,6 +3101,12 @@ async def _send_marketing_email(to_email: str, to_name: Optional[str], product: 
 
         api_instance.send_transac_email(send_smtp_email)
         logger.info(f"Marketing email sent to {to_email} for product {product.get('id')}")
+        await _create_user_notification(
+            to_email, "marketing",
+            "Recomandare pentru utilajul tău",
+            f"{title} - {price:.2f} {currency}",
+            product_name=title, product_image_url=image_url, product_url=product_url,
+        )
         return True
 
     except Exception as e:
@@ -3172,6 +3216,12 @@ async def _send_stock_notification_email(
 
         api_instance.send_transac_email(send_smtp_email)
         logger.info(f"Stock notification email sent to {to_email} for '{product_name}'")
+        await _create_user_notification(
+            to_email, "stock_alert",
+            "Articolul căutat este acum disponibil",
+            product_name,
+            product_name=product_name, product_image_url=image_url, product_url=product_url,
+        )
         return True
 
     except Exception as e:
@@ -4260,6 +4310,58 @@ async def get_current_user(request: Request):
         raise HTTPException(status_code=401, detail="Token invalid sau expirat")
 
     return _serialize_user(user)
+
+
+def _serialize_notification(doc: dict) -> dict:
+    return {
+        "id": doc["_id"],
+        "type": doc.get("type"),
+        "title": doc.get("title"),
+        "body": doc.get("body"),
+        "product_name": doc.get("product_name"),
+        "product_image_url": doc.get("product_image_url"),
+        "product_url": doc.get("product_url"),
+        "created_at": doc.get("created_at"),
+        "read_at": doc.get("read_at"),
+    }
+
+
+@api_router.get("/notifications")
+async def list_notifications(request: Request):
+    """Contul curent - "Noutăți" din app: notificările create de
+    _create_user_notification ori de câte ori i se trimite un email de
+    marketing/alertă stoc (vezi acolo). `unread_count` e inclus direct în
+    răspuns, ca bell-ul din app să nu mai aibă nevoie de un al doilea apel
+    doar pentru insignă."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Token lipsă sau invalid")
+    token = auth_header.replace("Bearer ", "")
+    user = await _find_user_by_token(token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Token invalid sau expirat")
+
+    docs = await db.notifications.find({"user_id": user["id"]}).sort("created_at", -1).to_list(100)
+    unread_count = sum(1 for d in docs if not d.get("read_at"))
+    return {"items": [_serialize_notification(d) for d in docs], "unread_count": unread_count}
+
+
+@api_router.post("/notifications/{notification_id}/read")
+async def mark_notification_read(notification_id: str, request: Request):
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Token lipsă sau invalid")
+    token = auth_header.replace("Bearer ", "")
+    user = await _find_user_by_token(token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Token invalid sau expirat")
+
+    doc = await db.notifications.find_one({"_id": notification_id, "user_id": user["id"]})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Notificare inexistentă")
+    now = datetime.now(timezone.utc)
+    await db.notifications.update_one({"_id": notification_id}, {"$set": {"read_at": now}})
+    return {"status": "marked", "read_at": now}
 
 
 @api_router.get("/auth/me/export")
@@ -10034,6 +10136,13 @@ async def startup_event():
         )
     except Exception:
         logger.exception("Failed to create unique index on customer_interests")
+
+    try:
+        # GET /notifications sorts each user's own feed by created_at desc -
+        # same shape as customer_interests's own per-user query pattern.
+        await db.notifications.create_index([("user_id", 1), ("created_at", -1)])
+    except Exception:
+        logger.exception("Failed to create index on notifications")
 
     # Perf fix (250-concurrent-user staging latency investigation,
     # 2026-08-02): `id` is looked up via find_one({"id": ...}) all over the
