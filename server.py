@@ -32,6 +32,7 @@ import cloudinary.uploader
 import io
 from PIL import Image
 import bleach
+import sentry_sdk
 
 import courier_fan
 
@@ -118,6 +119,23 @@ CLOUDFLARE_IMAGES_UPLOAD_URL = "https://api.cloudflare.com/client/v4/accounts/{a
 # scripts/migrate_to_cloudflare_images.py - keep both in sync if it ever
 # changes).
 CLOUDFLARE_IMAGE_VARIANT = "square"
+
+# Error tracking (Sentry) - skipped entirely if SENTRY_DSN isn't set, same
+# fail-safe pattern as every other optional integration in this file. Must
+# run before FastAPI() is constructed so its auto-instrumentation attaches
+# from the start. send_default_pii is explicitly off - this app handles real
+# customer PII (email/phone/address), so request/user data isn't sent to
+# Sentry beyond what's explicitly captured in error messages.
+SENTRY_DSN = os.environ.get('SENTRY_DSN', '')
+if SENTRY_DSN:
+    sentry_sdk.init(
+        dsn=SENTRY_DSN,
+        environment=os.environ.get('SENTRY_ENVIRONMENT', 'production'),
+        traces_sample_rate=0.1,
+        send_default_pii=False,
+    )
+else:
+    logging.getLogger(__name__).warning("SENTRY_DSN not set - error tracking disabled")
 
 # Create the main app without a prefix
 app = FastAPI()

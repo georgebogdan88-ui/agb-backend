@@ -16,3 +16,4 @@ firebase_admin==7.3.0
 cloudinary==1.44.1
 Pillow==12.3.0
 bleach==6.4.0
+sentry-sdk[fastapi]==2.19.0
