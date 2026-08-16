@@ -1966,6 +1966,18 @@ async def get_liquidation_products(limit: int = 100, skip: int = 0):
     ).skip(skip).limit(limit).to_list(limit)
     return [Product(**apply_cloudflare_rollout(p)) for p in products]
 
+def _normalize_model_code(s: Optional[str]) -> str:
+    """Uppercase, whitespace-stripped comparison key for model/engine/
+    transmission codes - real tractor/equipment records and compatible_
+    models entries are inconsistently spaced/cased in practice (e.g.
+    "6230Premium", "6230 Premium", "6230PREMIUM" all occur for what's the
+    same trim), so an exact-string match silently misses real matches.
+    Used everywhere a tractor's own model/engine/transmission gets matched
+    against a product's compatible_models/compatible_engines/compatible_
+    transmissions arrays."""
+    return re.sub(r"\s+", "", (s or "")).strip().upper()
+
+
 @api_router.get("/products/bundles/compatible", response_model=List[Product])
 async def get_compatible_bundles(
     model: Optional[str] = None,
@@ -1979,22 +1991,35 @@ async def get_compatible_bundles(
     tractor with this engine" regardless of chassis model). Backs both the
     CRM client-equipment "pachete compatibile" suggestion and any future
     storefront use. At least one of model/engine/transmission is required -
-    with none given this would otherwise match every bundle in the catalog."""
+    with none given this would otherwise match every bundle in the catalog.
+
+    Matching is normalized (see _normalize_model_code) rather than exact-
+    string - the number of Pachet products is tiny (a handful, curated by
+    staff), so fetching them all and comparing in Python is cheap and far
+    simpler than a per-array-element regex in Mongo."""
     if not model and not engine and not transmission:
         raise HTTPException(status_code=400, detail="Trebuie specificat cel puțin unul din: model, engine, transmission")
 
-    or_clauses = []
-    if model:
-        or_clauses.append({"compatible_models": model})
-    if engine:
-        or_clauses.append({"compatible_engines": engine})
-    if transmission:
-        or_clauses.append({"compatible_transmissions": transmission})
+    target_model = _normalize_model_code(model) if model else None
+    target_engine = _normalize_model_code(engine) if engine else None
+    target_transmission = _normalize_model_code(transmission) if transmission else None
 
-    products = await db.shopify_products.find(
-        {"product_type": "Pachet", "$or": or_clauses}
-    ).limit(limit).to_list(limit)
-    return [Product(**apply_cloudflare_rollout(p)) for p in products]
+    candidates = await db.shopify_products.find({"product_type": "Pachet"}).to_list(None)
+    matched = []
+    for p in candidates:
+        p_models = {_normalize_model_code(m) for m in (p.get("compatible_models") or [])}
+        p_engines = {_normalize_model_code(m) for m in (p.get("compatible_engines") or [])}
+        p_transmissions = {_normalize_model_code(m) for m in (p.get("compatible_transmissions") or [])}
+        if (
+            (target_model and target_model in p_models)
+            or (target_engine and target_engine in p_engines)
+            or (target_transmission and target_transmission in p_transmissions)
+        ):
+            matched.append(p)
+            if len(matched) >= limit:
+                break
+
+    return [Product(**apply_cloudflare_rollout(p)) for p in matched]
 
 @api_router.get("/products/count")
 async def get_products_count():
