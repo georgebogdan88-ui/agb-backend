@@ -440,7 +440,7 @@ async def scenario_order_with_analytics_session_id_creates_conversion():
     await seed_product(db, "p1", stock=10, price=100.0)
     order_data = make_order_data(analytics_session_id="visitor-session-123")
     bt = BackgroundTasks()
-    order = await server.create_order(order_data, bt)
+    order = await server.create_order(order_data, make_request(), bt)
 
     conversion = await db.analytics_conversions.find_one({"session_id": "visitor-session-123"})
     check("order+analytics_session_id: conversion doc created", conversion is not None)
@@ -457,7 +457,7 @@ async def scenario_order_without_analytics_session_id_no_conversion_no_error():
     await seed_product(db, "p1", stock=10, price=100.0)
     order_data = make_order_data(analytics_session_id=None)
     bt = BackgroundTasks()
-    order = await server.create_order(order_data, bt)
+    order = await server.create_order(order_data, make_request(), bt)
 
     check("order without analytics_session_id: order created normally", order is not None)
     check("order without analytics_session_id: no conversion doc", await db.analytics_conversions.count_documents({}) == 0)

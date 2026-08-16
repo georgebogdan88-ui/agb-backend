@@ -11,7 +11,7 @@ import logging
 import html
 from pathlib import Path
 from pydantic import BaseModel, Field
-from typing import List, Optional, Literal, Dict, Deque, Set
+from typing import List, Optional, Literal, Dict, Deque, Set, Any
 import uuid
 from datetime import datetime, timedelta, timezone
 import httpx
@@ -189,6 +189,36 @@ class Product(BaseModel):
     complementary_product_ids: List[str] = []
     equivalent_product_ids: List[str] = []
     is_featured: bool = False
+    # product_type == "Pachet" only. bundle_items is {product_id, quantity}
+    # pairs (see BundleItem below) - the component products, at their own
+    # normal `price` each. `price` on the Pachet product itself is the fixed
+    # bundle total (set by staff, suggested via
+    # POST /admin/products/bundle-price-suggestion but always staff's final
+    # call) - charged as-is through the EXACT same
+    # add_to_cart/_get_authoritative_price/create_order path as any other
+    # product, since a Pachet is a real product with its own id/price. No
+    # special cart/checkout code needed: keeping the bundle whole means
+    # adding this product's own id; customizing (removing a component)
+    # means the storefront adds the remaining component ids individually
+    # instead, at THEIR own prices - a frontend decision, not a backend one.
+    # compatible_engines/compatible_transmissions mirror compatible_models
+    # above, for matching a bundle to a specific piece of equipment (CRM's
+    # Equipment.engine_type/transmission_type) - see
+    # GET /products/bundles/compatible.
+    bundle_items: List[Dict[str, Any]] = []
+    compatible_engines: List[str] = []
+    compatible_transmissions: List[str] = []
+    # Set only via PATCH /admin/products/{id}/sale-price (never through the
+    # general ProductUpdate/_apply_product_update path - see that endpoint's
+    # own docstring for why this needed a dedicated one). sale_price, when
+    # present, is THE authoritative price for everyone (see
+    # _get_authoritative_price) - takes priority over a B2B discount, since
+    # it's already typically a below-market clearance/promo price. "discount"
+    # is a general promotional sale shown on the product itself; "liquidation"
+    # is the same mechanic but additionally lists the product on the
+    # storefront's /lichidare-stoc page.
+    sale_price: Optional[float] = None
+    sale_type: Optional[Literal["discount", "liquidation"]] = None
     # When this product doc was first created (manual admin create, or first
     # picked up by sync_all_products()) / last had a real content change
     # (admin edit, or a Shopify resync that actually picked up different
@@ -228,6 +258,15 @@ class CartItem(BaseModel):
     price: float
     quantity: int = 1
     created_at: datetime = Field(default_factory=datetime.utcnow)
+    # Both only ever set server-side (see add_to_cart/update_cart_item),
+    # never accepted from the client. user_email is populated only when the
+    # add-to-cart request carries a valid session token - a guest cart just
+    # has None, and is therefore unreachable by the abandoned-cart email job
+    # (no address to send to). updated_at drives that same job's "how long
+    # has this cart actually been idle" check - bumped on every add/quantity
+    # change, not just at creation.
+    user_email: Optional[str] = None
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
 
 class CartItemCreate(BaseModel):
     session_id: str
@@ -1910,6 +1949,48 @@ async def get_featured_products(limit: int = 10):
         logger.error(f"Error fetching featured products: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@api_router.get("/products/liquidation", response_model=List[Product])
+async def get_liquidation_products(limit: int = 100, skip: int = 0):
+    """Products staff marked sale_type="liquidation" (see
+    PATCH /admin/products/{id}/sale-price) - backs the storefront's
+    dedicated /lichidare-stoc page. sale_type="discount" products are
+    intentionally excluded here - a general promo doesn't belong on the
+    liquidation page, only shows the reduced price on the product itself."""
+    products = await db.shopify_products.find(
+        {"sale_type": "liquidation"}
+    ).skip(skip).limit(limit).to_list(limit)
+    return [Product(**apply_cloudflare_rollout(p)) for p in products]
+
+@api_router.get("/products/bundles/compatible", response_model=List[Product])
+async def get_compatible_bundles(
+    model: Optional[str] = None,
+    engine: Optional[str] = None,
+    transmission: Optional[str] = None,
+    limit: int = 50,
+):
+    """Pachet products (product_type == "Pachet") whose compatible_models/
+    compatible_engines/compatible_transmissions match ANY of the given
+    criteria (not all - a bundle might only target one axis, e.g. "any
+    tractor with this engine" regardless of chassis model). Backs both the
+    CRM client-equipment "pachete compatibile" suggestion and any future
+    storefront use. At least one of model/engine/transmission is required -
+    with none given this would otherwise match every bundle in the catalog."""
+    if not model and not engine and not transmission:
+        raise HTTPException(status_code=400, detail="Trebuie specificat cel puțin unul din: model, engine, transmission")
+
+    or_clauses = []
+    if model:
+        or_clauses.append({"compatible_models": model})
+    if engine:
+        or_clauses.append({"compatible_engines": engine})
+    if transmission:
+        or_clauses.append({"compatible_transmissions": transmission})
+
+    products = await db.shopify_products.find(
+        {"product_type": "Pachet", "$or": or_clauses}
+    ).limit(limit).to_list(limit)
+    return [Product(**apply_cloudflare_rollout(p)) for p in products]
+
 @api_router.get("/products/count")
 async def get_products_count():
     """Get total product count"""
@@ -2100,8 +2181,16 @@ async def get_complementary_products(product_id: str):
             data = response.json()
             
             logger.info(f"Complementary products response for {product_id}: {data}")
-            
-            product_data = data.get("data", {}).get("product", {})
+
+            # GraphQL returns a top-level "data": null (not a missing key) on
+            # error - e.g. for any locally-created product (including every
+            # Pachet bundle, whose id is a local uuid, never a real Shopify
+            # gid) that has no native complementary_product_ids set yet and
+            # so falls through to this legacy Shopify lookup. `.get(key, {})`
+            # only substitutes the default when the key is ABSENT, not when
+            # it's present-and-None, so the naive chain crashed here instead
+            # of falling back to the empty-result path below.
+            product_data = (data.get("data") or {}).get("product") or {}
             
             complementary = []
             related = []
@@ -2134,6 +2223,36 @@ async def get_complementary_products(product_id: str):
     except Exception as e:
         logger.error(f"Error fetching complementary products: {e}")
         return {"complementary": [], "related": []}
+
+@api_router.get("/products/{product_id}/bundle-items")
+async def get_bundle_items(product_id: str):
+    """Component products of a "Pachet" (product_type == "Pachet") - full
+    Product details for each entry in bundle_items, plus its quantity.
+    Backs the storefront's per-product bundle-customization checklist."""
+    product = await db.shopify_products.find_one({"id": product_id}, {"bundle_items": 1})
+    items = (product or {}).get("bundle_items") or []
+
+    results = []
+    for entry in items:
+        ref_id = entry.get("product_id")
+        if not ref_id:
+            continue
+        ref_product = await db.shopify_products.find_one({"id": ref_id})
+        if not ref_product:
+            continue
+        ref_product = apply_cloudflare_rollout(ref_product)
+        results.append({
+            "id": ref_product.get("id"),
+            "title": ref_product.get("title", ""),
+            "handle": ref_product.get("handle", ""),
+            "price": ref_product.get("price", 0.0),
+            "currency": ref_product.get("currency", "RON"),
+            "image_url": ref_product.get("image_url"),
+            "stock": ref_product.get("stock", 0),
+            "stock_status": ref_product.get("stock_status"),
+            "quantity": entry.get("quantity", 1),
+        })
+    return {"items": results}
 
 @api_router.get("/products/{product_id}/equivalents")
 async def get_equivalent_products(product_id: str):
@@ -2294,17 +2413,29 @@ async def get_product(product_id: str):
 
 # ==================== CART ENDPOINTS ====================
 
-async def _get_authoritative_price(product_id: str) -> float:
+async def _get_authoritative_price(product_id: str, discount_percent: Optional[float] = None) -> float:
     """Never trust a price submitted by a client (webshop or mobile) - look
     it up from the product catalog instead. Used at every point where a
     cart/order is created or priced, so a client can't add an item at an
     arbitrary price by editing the request. Raises 400 if the product_id
     doesn't exist, so a fabricated product_id can't be used to inject a
-    fake line item either."""
-    product = await db.shopify_products.find_one({"id": product_id}, {"price": 1})
+    fake line item either.
+
+    `discount_percent` is the CALLER's already-resolved, server-verified B2B
+    discount (see create_order) - never accepted directly from a client, for
+    the same reason the base price itself isn't."""
+    product = await db.shopify_products.find_one({"id": product_id}, {"price": 1, "sale_price": 1, "sale_type": 1})
     if not product or product.get("price") is None:
         raise HTTPException(status_code=400, detail=f"Produs inexistent: {product_id}")
-    return product["price"]
+    # An active discount/liquidation sale price wins outright - it's already
+    # a below-market price, so it isn't further reduced by a B2B discount on
+    # top (see the Product model's own comment on sale_price for why).
+    if product.get("sale_type") and product.get("sale_price") is not None:
+        return product["sale_price"]
+    price = product["price"]
+    if discount_percent:
+        price = round(price * (1 - discount_percent / 100), 2)
+    return price
 
 @api_router.get("/cart/{session_id}", response_model=List[CartItem])
 async def get_cart(session_id: str):
@@ -2313,24 +2444,42 @@ async def get_cart(session_id: str):
     return [CartItem(**item) for item in items]
 
 @api_router.post("/cart", response_model=CartItem)
-async def add_to_cart(item: CartItemCreate):
+async def add_to_cart(item: CartItemCreate, request: Request):
     """Add item to cart"""
-    item.price = await _get_authoritative_price(item.product_id)
+    # Resolve the logged-in user, if any, purely to stamp user_email for the
+    # abandoned-cart email job below - same tolerant pattern as create_order
+    # (missing/invalid token just means an anonymous cart, same as today).
+    user_email = None
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        current_user = await _find_user_by_token(auth_header.replace("Bearer ", ""))
+        if current_user:
+            user_email = current_user.get("email")
+            if current_user.get("is_reseller"):
+                item.price = await _get_authoritative_price(item.product_id, current_user.get("b2b_discount_percent"))
+            else:
+                item.price = await _get_authoritative_price(item.product_id)
+    if user_email is None:
+        item.price = await _get_authoritative_price(item.product_id)
+
+    now = datetime.utcnow()
     existing = await db.cart.find_one({
         "session_id": item.session_id,
         "product_id": item.product_id
     })
-    
+
     if existing:
         new_quantity = existing["quantity"] + item.quantity
         await db.cart.update_one(
             {"id": existing["id"]},
-            {"$set": {"quantity": new_quantity}}
+            {"$set": {"quantity": new_quantity, "updated_at": now, "user_email": user_email}}
         )
         existing["quantity"] = new_quantity
+        existing["updated_at"] = now
+        existing["user_email"] = user_email
         return CartItem(**existing)
-    
-    cart_item = CartItem(**item.dict())
+
+    cart_item = CartItem(**item.dict(), user_email=user_email, updated_at=now)
     await db.cart.insert_one(cart_item.dict())
     return cart_item
 
@@ -2340,16 +2489,16 @@ async def update_cart_item(item_id: str, update: CartItemUpdate):
     if update.quantity <= 0:
         await db.cart.delete_one({"id": item_id})
         raise HTTPException(status_code=200, detail="Articol eliminat din coș")
-    
+
     result = await db.cart.find_one_and_update(
         {"id": item_id},
-        {"$set": {"quantity": update.quantity}},
+        {"$set": {"quantity": update.quantity, "updated_at": datetime.utcnow()}},
         return_document=True
     )
-    
+
     if not result:
         raise HTTPException(status_code=404, detail="Articol negăsit în coș")
-    
+
     return CartItem(**result)
 
 @api_router.delete("/cart/{item_id}")
@@ -2897,12 +3046,24 @@ async def _send_new_order_staff_notification(order: Order) -> bool:
 
 
 @api_router.post("/orders", response_model=Order)
-async def create_order(order_data: OrderCreate, background_tasks: BackgroundTasks):
+async def create_order(order_data: OrderCreate, request: Request, background_tasks: BackgroundTasks):
     """Create a new order"""
     if not order_data.items:
         raise HTTPException(status_code=400, detail="Comanda trebuie să aibă cel puțin un produs.")
+
+    # B2B discount, resolved server-side from whoever's actually logged in -
+    # never from anything the client sent. Guest checkout (no/invalid
+    # Authorization header) is unaffected: _find_user_by_token returning
+    # None just means no discount applies, exactly like today.
+    discount_percent = None
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        current_user = await _find_user_by_token(auth_header.replace("Bearer ", ""))
+        if current_user and current_user.get("is_reseller"):
+            discount_percent = current_user.get("b2b_discount_percent")
+
     for item in order_data.items:
-        item["price"] = await _get_authoritative_price(item.get("product_id"))
+        item["price"] = await _get_authoritative_price(item.get("product_id"), discount_percent)
     order_data.subtotal = sum(item["price"] * item.get("quantity", 1) for item in order_data.items)
     order_data.shipping = 25.0
     order_data.total = order_data.subtotal + order_data.shipping
@@ -3754,6 +3915,12 @@ def _serialize_user(user: dict) -> dict:
         # had before this opt-out existed - adding the field never silently
         # unsubscribes anyone already receiving these emails.
         "notify_news_email": user.get("notify_news_email", True),
+        # Set only via PATCH /admin/customers/{email}/b2b-discount (never
+        # through UserUpdate/self-service) - exposed here read-only so the
+        # webshop frontend can show the discounted price without a second
+        # request.
+        "is_reseller": user.get("is_reseller", False),
+        "b2b_discount_percent": user.get("b2b_discount_percent"),
         # GDPR consent - absent/None for accounts created before this field
         # existed (never backfilled), populated for accounts registered
         # from now on. See CURRENT_TERMS_VERSION near UserRegister.
@@ -4468,6 +4635,9 @@ class ProductCreate(BaseModel):
     equipment_rear_tire: Optional[str] = None
     equipment_rear_tire_wear: Optional[str] = None
     equipment_max_speed: Optional[int] = None
+    bundle_items: List[Dict[str, Any]] = []
+    compatible_engines: List[str] = []
+    compatible_transmissions: List[str] = []
 
 class ProductUpdate(BaseModel):
     title: Optional[str] = None
@@ -4499,6 +4669,9 @@ class ProductUpdate(BaseModel):
     equipment_rear_tire: Optional[str] = None
     equipment_rear_tire_wear: Optional[str] = None
     equipment_max_speed: Optional[int] = None
+    bundle_items: Optional[List[Dict[str, Any]]] = None
+    compatible_engines: Optional[List[str]] = None
+    compatible_transmissions: Optional[List[str]] = None
 
 class ProductBulkUpdate(BaseModel):
     ids: List[str]
@@ -4536,21 +4709,30 @@ def slugify(text: str) -> str:
 
 NEW_COLLECTION = "PIESE NOI"
 DEZMEMBRARE_COLLECTION = "PIESE DIN DEZMEMBRARE"
+PACHET_COLLECTION = "PACHETE"
 NEW_CATEGORY_PREFIX = "Piese noi "
 DEZMEMBRARE_CATEGORY_PREFIX = "Piese din dezmembrare "
+PACHET_CATEGORY_PREFIX = "Pachete "
 
 def build_collections(product_type: Optional[str], category: Optional[str], existing: List[str]) -> List[str]:
     """Derives the `collections` array (used for storefront category
-    browsing) from the admin's Tip ("Nou"/"Dezmembrari") + Categorie
+    browsing) from the admin's Tip ("Nou"/"Dezmembrari"/"Pachet") + Categorie
     ("motor", "transmisie"...) picks, matching the naming convention the
     Shopify sync already uses ("PIESE NOI" + "Piese noi motor"). Anything
     else already on the product (e.g. "HOME", "Recommended products
-    (Seguno)") is preserved as-is rather than wiped."""
+    (Seguno)") is preserved as-is rather than wiped.
+
+    Pachet has its own branch (not just silently falling through to the
+    "no derived collections" case like "Utilaje" does) - without it, any
+    Categorie picked on a Pachet product was accepted by the form but never
+    actually stored anywhere, so it silently reverted to empty on the very
+    next load (real bug, caught 2026-08-16)."""
     preserved = [
         c for c in existing
-        if c not in (NEW_COLLECTION, DEZMEMBRARE_COLLECTION)
+        if c not in (NEW_COLLECTION, DEZMEMBRARE_COLLECTION, PACHET_COLLECTION)
         and not c.startswith(NEW_CATEGORY_PREFIX)
         and not c.startswith(DEZMEMBRARE_CATEGORY_PREFIX)
+        and not c.startswith(PACHET_CATEGORY_PREFIX)
     ]
 
     derived = []
@@ -4562,6 +4744,10 @@ def build_collections(product_type: Optional[str], category: Optional[str], exis
         derived.append(DEZMEMBRARE_COLLECTION)
         if category:
             derived.append(f"{DEZMEMBRARE_CATEGORY_PREFIX}{category}")
+    elif product_type == "Pachet":
+        derived.append(PACHET_COLLECTION)
+        if category:
+            derived.append(f"{PACHET_CATEGORY_PREFIX}{category}")
 
     return preserved + derived
 
@@ -4945,6 +5131,9 @@ async def admin_create_product(request: Request, product_data: ProductCreate):
         "stock_status": product_data.stock_status,
         "sku": product_data.sku,
         "compatible_models": product_data.compatible_models,
+        "compatible_engines": product_data.compatible_engines,
+        "compatible_transmissions": product_data.compatible_transmissions,
+        "bundle_items": product_data.bundle_items,
         "collections": collections,
         "collections_normalized": [normalize_text(c) for c in collections],
         "complementary_product_ids": product_data.complementary_product_ids,
@@ -5539,6 +5728,56 @@ async def admin_get_products_by_ids(request: Request, ids: str):
     products = await cursor.to_list(500)
     return [Product(**p) for p in products]
 
+
+class BundlePriceSuggestionRequest(BaseModel):
+    items: List[Dict[str, Any]]  # [{product_id, quantity}]
+
+
+def _is_consumable_product(description: str) -> bool:
+    """No dedicated "Consumabile" category/collection exists in the catalog
+    yet (checked directly - none of the 28 collections match) - description
+    text is the only signal available today. Matches "consumabil"/
+    "consumabile" as a substring, case-insensitive."""
+    return "consumabil" in (description or "").lower()
+
+
+@api_router.post("/admin/products/bundle-price-suggestion")
+async def admin_bundle_price_suggestion(payload: BundlePriceSuggestionRequest, request: Request):
+    """Suggested total for a new Pachet, given its component product_ids +
+    quantities: sum of (price * quantity) per line, with a 5% reduction on
+    any line whose product is a consumable (see _is_consumable_product).
+    Purely a suggestion - staff sets the actual bundle_price themselves (see
+    the Product model's own note on why the bundle mechanic needs a real,
+    fixed, staff-confirmed price rather than always trusting a formula)."""
+    await _require_admin(request)
+
+    breakdown = []
+    suggested_total = 0.0
+    for entry in payload.items:
+        product_id = entry.get("product_id")
+        quantity = entry.get("quantity", 1)
+        product = await db.shopify_products.find_one(
+            {"id": product_id}, {"title": 1, "price": 1, "description": 1}
+        )
+        if not product:
+            continue
+        is_consumable = _is_consumable_product(product.get("description", ""))
+        unit_price = product.get("price", 0.0)
+        if is_consumable:
+            unit_price = round(unit_price * 0.95, 2)
+        line_total = round(unit_price * quantity, 2)
+        suggested_total += line_total
+        breakdown.append({
+            "product_id": product_id,
+            "title": product.get("title", ""),
+            "quantity": quantity,
+            "unit_price": unit_price,
+            "is_consumable": is_consumable,
+            "line_total": line_total,
+        })
+
+    return {"suggested_price": round(suggested_total, 2), "breakdown": breakdown}
+
 @api_router.put("/admin/products/{product_id}")
 async def admin_update_product(product_id: str, request: Request, product_data: ProductUpdate):
     admin = await _require_admin(request)
@@ -5567,6 +5806,54 @@ async def admin_update_product(product_id: str, request: Request, product_data: 
         resource_id=product_id, before=before, after=after,
     )
 
+    return Product(**updated)
+
+
+class ProductSalePriceUpdate(BaseModel):
+    sale_type: Optional[Literal["discount", "liquidation"]] = None
+    sale_price: Optional[float] = None
+
+
+@api_router.patch("/admin/products/{product_id}/sale-price")
+async def admin_set_product_sale_price(product_id: str, payload: ProductSalePriceUpdate, request: Request):
+    """Dedicated endpoint, NOT folded into ProductUpdate/_apply_product_update
+    above - that path filters out any None value ({k: v for k, v in
+    product_data.dict().items() if v is not None}), so it can never be used
+    to CLEAR a field, only set/change one. sale_type=None here means "remove
+    the discount/liquidation price", which needs an actual $unset."""
+    admin = await _require_admin(request)
+
+    existing = await db.shopify_products.find_one({"id": product_id}, {"price": 1, "sale_type": 1, "sale_price": 1})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Produs inexistent")
+
+    if payload.sale_type is not None:
+        if payload.sale_price is None:
+            raise HTTPException(status_code=400, detail="sale_price este obligatoriu când sale_type e setat")
+        if payload.sale_price <= 0:
+            raise HTTPException(status_code=400, detail="sale_price trebuie să fie mai mare decât 0")
+        if payload.sale_price >= existing["price"]:
+            raise HTTPException(
+                status_code=400,
+                detail="Prețul de discount/lichidare trebuie să fie mai mic decât prețul curent al produsului",
+            )
+        await db.shopify_products.update_one(
+            {"id": product_id},
+            {"$set": {"sale_type": payload.sale_type, "sale_price": payload.sale_price}},
+        )
+    else:
+        await db.shopify_products.update_one(
+            {"id": product_id},
+            {"$unset": {"sale_type": "", "sale_price": ""}},
+        )
+
+    updated = await db.shopify_products.find_one({"id": product_id})
+    await _write_audit_log(
+        request, admin, action="product.sale_price", resource_type="product",
+        resource_id=product_id,
+        before={"sale_type": existing.get("sale_type"), "sale_price": existing.get("sale_price")},
+        after={"sale_type": payload.sale_type, "sale_price": payload.sale_price},
+    )
     return Product(**updated)
 
 @api_router.delete("/admin/products/{product_id}")
@@ -7256,6 +7543,290 @@ async def admin_update_customer_account(
     background_tasks.add_task(sync_account_to_crm, updated_user)
 
     return _serialize_user(updated_user)
+
+
+class B2BDiscountUpdate(BaseModel):
+    """Deliberately its own endpoint/model, NOT a field on UserUpdate - that
+    model is shared by the customer's own self-service PUT /auth/me (via
+    _build_user_profile_update_dict), and a discount percent must never be
+    something a customer can set on their own account."""
+    is_reseller: bool
+    discount_percent: Optional[float] = None
+
+
+@api_router.patch("/admin/customers/{email}/b2b-discount")
+async def admin_set_b2b_discount(
+    email: str,
+    update_data: B2BDiscountUpdate,
+    request: Request,
+):
+    """Marks/unmarks a webshop account as a B2B reseller with a discount
+    applied at every product's displayed price and enforced server-side at
+    order creation (see _get_authoritative_price/create_order) - never
+    trusts a client-supplied price. Set from the linked CRM Client's own
+    detail page (routes_clients.py), not a standalone list here."""
+    admin = await _require_admin(request)
+
+    if update_data.is_reseller:
+        if update_data.discount_percent is None:
+            raise HTTPException(status_code=400, detail="discount_percent este obligatoriu când is_reseller e true")
+        if not (0 <= update_data.discount_percent <= 100):
+            raise HTTPException(status_code=400, detail="discount_percent trebuie să fie între 0 și 100")
+
+    normalized_email = email.lower().strip()
+    user = await db.users.find_one({"email": normalized_email})
+    if not user:
+        raise HTTPException(status_code=404, detail="Niciun cont web găsit cu acest email.")
+
+    new_values = {
+        "is_reseller": update_data.is_reseller,
+        "b2b_discount_percent": update_data.discount_percent if update_data.is_reseller else None,
+    }
+    await db.users.update_one({"id": user["id"]}, {"$set": new_values})
+
+    await _write_audit_log(
+        request, admin, action="customer_account.b2b_discount", resource_type="user",
+        resource_id=user["id"],
+        before={"is_reseller": user.get("is_reseller"), "b2b_discount_percent": user.get("b2b_discount_percent")},
+        after=new_values,
+    )
+
+    updated_user = await db.users.find_one({"id": user["id"]})
+    return _serialize_user(updated_user)
+
+
+@api_router.get("/admin/customers/b2b")
+async def admin_list_b2b_customers(request: Request):
+    """All accounts currently marked as B2B resellers, most-recently-set
+    first isn't tracked (no updated_at bump here) - sorted by name instead."""
+    await _require_admin(request)
+    users = await db.users.find(
+        {"is_reseller": True},
+        {"id": 1, "email": 1, "name": 1, "phone": 1, "company_name": 1, "b2b_discount_percent": 1},
+    ).sort("name", 1).to_list(1000)
+    for u in users:
+        u.pop("_id", None)
+    return users
+
+
+# ==================== ABANDONED CART EMAILS ====================
+# Cumulative hours since a cart's last activity (see CartItem.updated_at) at
+# which the next reminder in the sequence fires - agreed schedule: first at
+# 24h, daily for two days (so +24h again = 48h), then two more every two
+# days (+48h, +48h = 96h, 144h). Checked hourly (not daily) so the schedule
+# stays accurate even if the process restarts mid-window, rather than only
+# ever evaluating once at a fixed wall-clock time.
+ABANDONED_CART_SCHEDULE_HOURS = [24, 48, 96, 144]
+ABANDONED_CART_CHECK_INTERVAL_SECONDS = 3600
+
+
+async def send_abandoned_cart_email(recipient_email: str, recipient_name: str, cart_url: str) -> bool:
+    """Send an abandoned-cart reminder via Brevo (same provider/style as
+    send_password_reset_email/send_blog_notification_email)."""
+    try:
+        if not BREVO_API_KEY:
+            logger.warning("BREVO_API_KEY not set - skipping abandoned cart email")
+            return False
+
+        import sib_api_v3_sdk
+
+        configuration = sib_api_v3_sdk.Configuration()
+        configuration.api_key['api-key'] = BREVO_API_KEY
+        api_instance = sib_api_v3_sdk.TransactionalEmailsApi(sib_api_v3_sdk.ApiClient(configuration))
+
+        html_content = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif; background-color: #f5f5f5; padding: 20px;">
+            <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 10px; overflow: hidden;">
+                <div style="background-color: #367c2b; padding: 20px; text-align: center;">
+                    <h1 style="color: #ffffff; margin: 0;">🚜 AGB Agroparts</h1>
+                </div>
+                <div style="padding: 30px;">
+                    <h2 style="color: #333;">Ai uitat ceva în coș?</h2>
+                    <p style="color: #666; line-height: 1.6;">Ai câteva produse în coșul de cumpărături care te așteaptă. Finalizează comanda înainte să se epuizeze stocul.</p>
+                    <div style="text-align: center; margin-top: 30px;">
+                        <a href="{cart_url}" style="background-color: #367c2b; color: #ffffff; padding: 15px 30px; text-decoration: none; border-radius: 5px; font-weight: bold;">
+                            Vizualizează coșul
+                        </a>
+                    </div>
+                    <p style="color: #999; font-size: 13px; margin-top: 30px;">Dacă ai finalizat deja comanda, poți ignora acest email.</p>
+                </div>
+                <div style="background-color: #f0f0f0; padding: 15px; text-align: center; font-size: 12px; color: #999;">
+                    <p>AGB Agroparts Solution S.R.L.</p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+
+        send_smtp_email = sib_api_v3_sdk.SendSmtpEmail(
+            to=[{"email": recipient_email, "name": recipient_name or recipient_email}],
+            sender={"email": "noreply@agb-agroparts.ro", "name": "AGB Agroparts"},
+            subject="🛒 Ai uitat ceva în coș - AGB Agroparts",
+            html_content=html_content
+        )
+
+        api_instance.send_transac_email(send_smtp_email)
+        logger.info(f"Abandoned cart email sent to {recipient_email}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Error sending abandoned cart email to {recipient_email}: {e}")
+        return False
+
+
+def _cart_view_url(session_id: str) -> str:
+    webshop_public_url = os.environ.get('WEBSHOP_PUBLIC_URL', 'http://localhost:3000').rstrip('/')
+    return f"{webshop_public_url}/cos?session={session_id}"
+
+
+async def _process_one_abandoned_cart(session_id: str, user_email: str, cart_last_activity: datetime):
+    """Decide whether this cart is due for the next email in
+    ABANDONED_CART_SCHEDULE_HOURS, send it, and log it. Resets the sequence
+    (drops prior tracking) if the cart's actual last-activity has moved past
+    what was last tracked - the customer came back and touched it, so this
+    is a fresh abandonment episode, not a continuation of the old one."""
+    tracking = await db.abandoned_cart_tracking.find_one({"session_id": session_id})
+    if tracking and tracking.get("cart_last_activity"):
+        # MongoDB round-trips datetimes at millisecond precision, so the
+        # value read back is never byte-identical to the Python object that
+        # was stored - comparing with != here would treat every single
+        # cart as "just changed" and reset the sequence on every pass,
+        # permanently stuck re-sending email #1. A >1s gap is a real
+        # activity change; anything smaller is just that rounding.
+        drift = abs((tracking["cart_last_activity"] - cart_last_activity).total_seconds())
+        if drift > 1:
+            await db.abandoned_cart_tracking.delete_one({"session_id": session_id})
+            tracking = None
+
+    emails_sent = tracking.get("emails_sent", []) if tracking else []
+    if len(emails_sent) >= len(ABANDONED_CART_SCHEDULE_HOURS):
+        return
+
+    hours_elapsed = (datetime.utcnow() - cart_last_activity).total_seconds() / 3600
+    next_threshold = ABANDONED_CART_SCHEDULE_HOURS[len(emails_sent)]
+    if hours_elapsed < next_threshold:
+        return
+
+    user = await db.users.find_one({"email": user_email}, {"name": 1})
+    sent = await send_abandoned_cart_email(user_email, (user or {}).get("name", ""), _cart_view_url(session_id))
+    if not sent:
+        return  # try again next pass rather than recording a send that didn't happen
+
+    now = datetime.utcnow()
+    await db.abandoned_cart_tracking.update_one(
+        {"session_id": session_id},
+        {
+            "$set": {"session_id": session_id, "user_email": user_email, "cart_last_activity": cart_last_activity},
+            "$push": {"emails_sent": now},
+        },
+        upsert=True,
+    )
+    await db.abandoned_cart_email_log.insert_one({
+        "id": str(uuid.uuid4()),
+        "session_id": session_id,
+        "user_email": user_email,
+        "sent_at": now,
+        "trigger": "auto",
+        "sequence_position": len(emails_sent) + 1,
+    })
+
+
+async def abandoned_cart_email_loop():
+    """Background loop started at startup (see crm_reconciliation_task's
+    sibling call below) - each pass groups current cart items by
+    session_id, keeping only carts with a user_email (guest carts have no
+    address to send to) and using the latest updated_at across an item as
+    that cart's last-activity. A session_id already checked out has no cart
+    items left at all (create_order's own db.cart.delete_many already ran),
+    so it naturally stops appearing here - no separate "already ordered"
+    check needed."""
+    while True:
+        try:
+            carts_with_email = await db.cart.find(
+                {"user_email": {"$ne": None}},
+                {"session_id": 1, "user_email": 1, "updated_at": 1},
+            ).to_list(10000)
+            by_session: Dict[str, dict] = {}
+            for item in carts_with_email:
+                sid = item["session_id"]
+                if sid not in by_session or item["updated_at"] > by_session[sid]["updated_at"]:
+                    by_session[sid] = item
+            for sid, item in by_session.items():
+                try:
+                    await _process_one_abandoned_cart(sid, item["user_email"], item["updated_at"])
+                except Exception:
+                    logger.exception(f"Error processing abandoned cart for session {sid}")
+        except Exception:
+            logger.exception("Error in abandoned_cart_email_loop pass")
+        await asyncio.sleep(ABANDONED_CART_CHECK_INTERVAL_SECONDS)
+
+
+@api_router.post("/admin/carts/{session_id}/send-abandoned-email")
+async def admin_send_abandoned_cart_email(session_id: str, request: Request):
+    """Manual trigger for staff - independent of the automatic sequence
+    above (doesn't consume/interfere with its position), sends immediately
+    and logs with trigger='manual'."""
+    admin = await _require_admin(request)
+    items = await db.cart.find({"session_id": session_id}).to_list(100)
+    if not items:
+        raise HTTPException(status_code=404, detail="Coșul e gol sau nu există")
+    user_email = next((i.get("user_email") for i in items if i.get("user_email")), None)
+    if not user_email:
+        raise HTTPException(status_code=400, detail="Acest coș nu are un client autentificat asociat (nu poate fi contactat prin email)")
+
+    user = await db.users.find_one({"email": user_email}, {"name": 1})
+    sent = await send_abandoned_cart_email(user_email, (user or {}).get("name", ""), _cart_view_url(session_id))
+    if not sent:
+        raise HTTPException(status_code=502, detail="Trimiterea emailului a eșuat")
+
+    now = datetime.utcnow()
+    await db.abandoned_cart_email_log.insert_one({
+        "id": str(uuid.uuid4()),
+        "session_id": session_id,
+        "user_email": user_email,
+        "sent_at": now,
+        "trigger": "manual",
+        "sent_by": admin.get("email"),
+    })
+    return {"message": "Email trimis", "sent_at": now}
+
+
+@api_router.get("/admin/carts/abandoned")
+async def admin_list_abandoned_carts(request: Request):
+    """Carts with an identified customer, not yet ordered - sorted longest-
+    idle first, so staff see the most urgent ones up top."""
+    await _require_admin(request)
+    items = await db.cart.find({"user_email": {"$ne": None}}).to_list(10000)
+    by_session: Dict[str, dict] = {}
+    for item in items:
+        sid = item["session_id"]
+        entry = by_session.setdefault(sid, {
+            "session_id": sid, "user_email": item.get("user_email"),
+            "items_count": 0, "total_value": 0.0, "updated_at": item["updated_at"],
+        })
+        entry["items_count"] += item["quantity"]
+        entry["total_value"] += item["price"] * item["quantity"]
+        entry["updated_at"] = max(entry["updated_at"], item["updated_at"])
+    results = sorted(by_session.values(), key=lambda c: c["updated_at"])
+
+    session_ids = list(by_session.keys())
+    tracking_docs = await db.abandoned_cart_tracking.find({"session_id": {"$in": session_ids}}).to_list(len(session_ids) or 1)
+    tracking_by_session = {t["session_id"]: t for t in tracking_docs}
+    for r in results:
+        t = tracking_by_session.get(r["session_id"])
+        r["emails_sent_count"] = len(t.get("emails_sent", [])) if t else 0
+    return results
+
+
+@api_router.get("/admin/carts/abandoned-email-log")
+async def admin_abandoned_cart_email_log(request: Request, limit: int = 200):
+    """Full send log, newest first - both auto and manual sends."""
+    await _require_admin(request)
+    log = await db.abandoned_cart_email_log.find().sort("sent_at", -1).limit(limit).to_list(limit)
+    for entry in log:
+        entry.pop("_id", None)
+    return log
 
 # ==================== EQUIPMENT/UTILAJE ENDPOINTS ====================
 
@@ -9280,6 +9851,7 @@ async def startup_event():
     logger.info("Auto-sync from Shopify is disabled - product catalog is now locally owned")
 
     crm_reconciliation_task = asyncio.create_task(crm_reconciliation_loop())
+    abandoned_cart_task = asyncio.create_task(abandoned_cart_email_loop())
 
     logger.info("=== WEBHOOK SETUP ===")
     logger.info("Add webhooks in Shopify Admin -> Settings -> Notifications -> Webhooks")

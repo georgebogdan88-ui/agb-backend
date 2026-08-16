@@ -47,7 +47,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import mongomock_motor  # noqa: E402
 from starlette.background import BackgroundTasks  # noqa: E402
+from fastapi import Request  # noqa: E402
 import server  # noqa: E402
+
+
+def make_request():
+    """create_order only uses this to optionally resolve a B2B discount from
+    an Authorization header (see server.py) - no header here means "guest
+    checkout", same as every scenario in this file already assumes."""
+    return Request({"type": "http", "headers": [], "method": "POST", "path": "/orders"})
+
 
 PASS = []
 FAIL = []
@@ -80,10 +89,16 @@ async def seed_product(db, product_id, stock=10, price=100.0, title="Piesă test
     })
 
 
-def make_order_data(product_id="p1", quantity=2):
+def make_order_data(product_id="p1", quantity=2, product_name="Piesă test"):
+    # product_name mirrors what the real webshop checkout always sends (see
+    # agb-webshop's cos/checkout/page.tsx - sourced from the required
+    # CartItem.product_name field, never omitted) - create_order() itself
+    # never re-derives it server-side (only price is re-derived), so an item
+    # missing it here isn't representative of a real request and was
+    # tripping sync_order_to_crm's "denumire" validation on the CRM side.
     return server.OrderCreate(
         session_id="sess-1",
-        items=[{"product_id": product_id, "quantity": quantity}],
+        items=[{"product_id": product_id, "product_name": product_name, "quantity": quantity}],
         customer=server.CustomerInfo(
             name="Ion Popescu",
             email="ion@example.com",
@@ -131,7 +146,7 @@ async def scenario_a_order_succeeds_even_if_email_send_raises():
     try:
         order_data = make_order_data("p1", quantity=2)
         bt = BackgroundTasks()
-        order = await server.create_order(order_data, bt)
+        order = await server.create_order(order_data, make_request(), bt)
 
         check("a) order response returned normally", order is not None)
         check("a) order total computed correctly", order.total == 225.0, order.total)  # 2*100 + 25 shipping
@@ -162,7 +177,7 @@ async def scenario_b_confirmation_email_task_is_queued_alongside_crm_sync():
     await seed_product(db, "p1", stock=10, price=50.0)
     order_data = make_order_data("p1", quantity=1)
     bt = BackgroundTasks()
-    await server.create_order(order_data, bt)
+    await server.create_order(order_data, make_request(), bt)
 
     queued_funcs = [task.func for task in bt.tasks]
     check("b) sync_order_to_crm queued", server.sync_order_to_crm in queued_funcs, queued_funcs)

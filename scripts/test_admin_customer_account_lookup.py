@@ -111,7 +111,7 @@ async def scenario_a_found_exact_match_returns_serialize_user_shape():
             "company_address_scara", "company_address_ap", "company_address_oras",
             "company_address_judet", "company_address_cod_postal", "is_shopify_customer",
             "created_at", "role", "consent_accepted_at", "consent_terms_version",
-            "notify_news_email",
+            "notify_news_email", "is_reseller", "b2b_discount_percent",
         }
         check("a) found: response keys exactly match _serialize_user's shape",
               set(result.keys()) == expected_keys,
