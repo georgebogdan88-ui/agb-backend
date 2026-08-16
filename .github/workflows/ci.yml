@@ -32,9 +32,38 @@ jobs:
           pip install pytest mongomock mongomock-motor
 
       - name: Run isolated test scripts (no live DB, no external services)
+        # NOT a blanket `scripts/test_*.py` glob - a handful of scripts here
+        # are deliberately real-DB checks (their own docstrings say so
+        # explicitly: "direct-call against the real configured MONGO_URL"),
+        # meant to be run by hand against a real dev MONGO_URL, never in an
+        # automated/untrusted CI trigger. Excluded here on purpose:
+        # test_b2b_and_abandoned_carts.py, test_bundle_products.py,
+        # test_equipment_bundle_assignment.py, test_product_sale_price.py.
+        # MONGO_URL/DB_NAME below are throwaway placeholders, needed only
+        # because every script here imports server.py (which requires both,
+        # no fallback) - never actually connected to by the mongomock-based
+        # scripts that remain in this list.
+        env:
+          MONGO_URL: "mongodb://localhost:27017"
+          DB_NAME: "ci_placeholder"
         run: |
           set -e
-          for f in scripts/test_*.py; do
+          for f in \
+            scripts/test_admin_customer_account_lookup.py \
+            scripts/test_admin_order_customer_and_account_update.py \
+            scripts/test_analytics.py \
+            scripts/test_blog_posts.py \
+            scripts/test_checkout_invoice_toggle.py \
+            scripts/test_courier_fan.py \
+            scripts/test_courier_tracking_endpoints.py \
+            scripts/test_gdpr_export_and_delete.py \
+            scripts/test_order_confirmation_email.py \
+            scripts/test_product_equivalent_matching.py \
+            scripts/test_product_seo_fields.py \
+            scripts/test_registration_consent.py \
+            scripts/test_require_admin_bff_only.py \
+            scripts/test_stock_checkout.py \
+          ; do
             echo "::group::$f"
             python "$f"
             echo "::endgroup::"
