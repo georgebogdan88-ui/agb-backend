@@ -2957,6 +2957,95 @@ async def _send_order_confirmation_email(order: Order) -> bool:
         return False
 
 
+async def _send_marketing_email(to_email: str, to_name: Optional[str], product: dict) -> bool:
+    """Staff-triggered (not fire-and-forget) - the ONLY caller is
+    POST /admin/marketing/send-email, an explicit admin action from CRM's
+    Marketing page, so unlike the order-flow emails above, the caller DOES
+    await this and surfaces success/failure directly to staff rather than
+    just logging it."""
+    try:
+        if not BREVO_API_KEY:
+            logger.warning("BREVO_API_KEY not set - skipping marketing email to %s", to_email)
+            return False
+
+        import sib_api_v3_sdk
+
+        configuration = sib_api_v3_sdk.Configuration()
+        configuration.api_key['api-key'] = BREVO_API_KEY
+        api_instance = sib_api_v3_sdk.TransactionalEmailsApi(sib_api_v3_sdk.ApiClient(configuration))
+
+        webshop_public_url = os.environ.get('WEBSHOP_PUBLIC_URL', 'http://localhost:3000').rstrip('/')
+        product_url = f"{webshop_public_url}/produse/{product.get('id', '')}"
+        title = product.get("title", "")
+        price = product.get("price", 0.0)
+        currency = product.get("currency", "RON")
+        image_url = product.get("image_url")
+
+        image_block = (
+            f'<img src="{html.escape(image_url)}" alt="" style="max-width: 200px; border-radius: 8px; margin: 0 auto 20px; display: block;" />'
+            if image_url else ""
+        )
+
+        html_content = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif; background-color: #f5f5f5; padding: 20px;">
+            <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 10px; overflow: hidden;">
+                <div style="background-color: #367c2b; padding: 20px; text-align: center;">
+                    <h1 style="color: #ffffff; margin: 0;">🚜 AGB Agroparts</h1>
+                </div>
+                <div style="padding: 30px; text-align: center;">
+                    <h2 style="color: #333;">Recomandare pentru utilajul tău</h2>
+                    <p style="color: #666; line-height: 1.6;">Am identificat un produs potrivit pentru unul dintre utilajele tale.</p>
+                    {image_block}
+                    <p style="color: #333; font-size: 18px; font-weight: bold; margin: 10px 0;">{html.escape(title)}</p>
+                    <p style="color: #367c2b; font-size: 20px; font-weight: bold; margin: 10px 0;">{price:.2f} {html.escape(currency)}</p>
+                    <a href="{html.escape(product_url)}" style="display: inline-block; margin-top: 20px; padding: 12px 28px; background-color: #367c2b; color: #ffffff; text-decoration: none; border-radius: 6px; font-weight: bold;">Vezi produsul</a>
+                </div>
+                <div style="background-color: #f0f0f0; padding: 15px; text-align: center; font-size: 12px; color: #999;">
+                    <p>AGB Agroparts Solution S.R.L.</p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+
+        send_smtp_email = sib_api_v3_sdk.SendSmtpEmail(
+            to=[{"email": to_email, "name": to_name or to_email}],
+            sender={"email": "noreply@agb-agroparts.ro", "name": "AGB Agroparts"},
+            subject=f"Recomandare pentru utilajul tău: {title}",
+            html_content=html_content
+        )
+
+        api_instance.send_transac_email(send_smtp_email)
+        logger.info(f"Marketing email sent to {to_email} for product {product.get('id')}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Error sending marketing email to {to_email}: {e}")
+        return False
+
+
+class MarketingEmailRequest(BaseModel):
+    to_email: str
+    to_name: Optional[str] = None
+    product_id: str
+
+
+@api_router.post("/admin/marketing/send-email")
+async def admin_send_marketing_email(payload: MarketingEmailRequest, request: Request):
+    """CRM's Marketing page, one explicit send per queued target - not a
+    campaign/bulk-send mechanism on this side, CRM calls this once per
+    client it's ready to email."""
+    await _require_admin(request)
+    product = await db.shopify_products.find_one({"id": payload.product_id})
+    if not product:
+        raise HTTPException(status_code=404, detail="Produs inexistent")
+    sent = await _send_marketing_email(payload.to_email, payload.to_name, product)
+    if not sent:
+        raise HTTPException(status_code=502, detail="Trimiterea email-ului a eșuat.")
+    return {"status": "sent"}
+
+
 # Fixed staff inbox for new-order alerts - so whoever's on duty knows a new
 # order came in without needing to be logged into the CRM. Same address the
 # Brevo account itself is registered under (agbagroparts.solution@yahoo.com).
