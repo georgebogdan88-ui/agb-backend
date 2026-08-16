@@ -427,6 +427,11 @@ class Equipment(BaseModel):
     transmission_type: Optional[str] = None  # Model cutie viteze
     front_axle_model: Optional[str] = None  # Model punte față
     features: Optional[List[str]] = None  # Echipări selectate
+    # Set only via PATCH /admin/equipment/{id}/bundles (CRM staff curated
+    # pick, from the Pachet form's "Utilaje compatibile" search) - never
+    # part of the regular CRM tractor-edit sync payload (EquipmentFromCrm),
+    # so a routine brand/model edit sync can never silently wipe it out.
+    assigned_bundle_ids: List[str] = []
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 class EquipmentCreate(BaseModel):
@@ -8105,6 +8110,7 @@ def _clean_equipment_list(local_equipment: list) -> list:
             "transmission_type": eq.get("transmission_type") or "",
             "front_axle_model": eq.get("front_axle_model") or "",
             "features": eq.get("features") or [],
+            "assigned_bundle_ids": eq.get("assigned_bundle_ids") or [],
             "created_at": eq.get("created_at", ""),
         })
     return cleaned_equipment
@@ -8573,6 +8579,47 @@ async def receive_equipment_delete_from_crm(request: Request, equipment_id: str)
     await sync_equipment_to_shopify_notes(user["email"], new_equipment_list)
 
     return {"status": "deleted"}
+
+
+class EquipmentBundlesUpdate(BaseModel):
+    bundle_ids: List[str]
+
+
+@api_router.patch("/admin/equipment/{equipment_id}/bundles")
+async def admin_set_equipment_bundles(request: Request, equipment_id: str, payload: EquipmentBundlesUpdate):
+    """Staff-curated Pachet assignments for one piece of equipment (CRM's
+    "Adaugă pachet" button on the bundle form's Utilaje compatibile search
+    results) - replaces the full assigned_bundle_ids list rather than
+    appending, so CRM can also use this to unassign (send the list minus
+    one id) without a separate endpoint. `equipment_id` is OUR equipment
+    sub-document id (same one used by DELETE /integrations/equipment/{id}
+    above), found the same way - via {"equipment.id": equipment_id}, since
+    equipment has no top-level collection/id of its own."""
+    admin = await _require_admin(request)
+
+    user = await db.users.find_one({"equipment.id": equipment_id})
+    if not user:
+        raise HTTPException(status_code=404, detail="Utilaj negăsit")
+
+    equipment_list = user.get("equipment", [])
+    existing = next((eq for eq in equipment_list if eq.get("id") == equipment_id), None)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Utilaj negăsit")
+
+    before_bundle_ids = existing.get("assigned_bundle_ids") or []
+    existing["assigned_bundle_ids"] = payload.bundle_ids
+
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {"$set": {"equipment": equipment_list}},
+    )
+    await _write_audit_log(
+        request, admin, action="equipment.bundles.set", resource_type="equipment",
+        resource_id=equipment_id,
+        before={"assigned_bundle_ids": before_bundle_ids},
+        after={"assigned_bundle_ids": payload.bundle_ids},
+    )
+    return {"status": "updated", "equipment_id": equipment_id, "assigned_bundle_ids": payload.bundle_ids}
 
 # ==================== EQUIPMENT OPTIONS (admin-managed dropdown/checkbox lists) ====================
 # Powers the transmission-type / front-axle-model / features dropdown and
