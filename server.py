@@ -5736,6 +5736,9 @@ async def admin_get_products_by_ids(request: Request, ids: str):
 
 class BundlePriceSuggestionRequest(BaseModel):
     items: List[Dict[str, Any]]  # [{product_id, quantity}]
+    # Staff-adjustable (defaults to 5, the original hardcoded value) - the
+    # % taken off any consumable-flagged line's own price before summing.
+    consumable_discount_percent: float = 5.0
 
 
 def _is_consumable_product(description: str) -> bool:
@@ -5749,13 +5752,15 @@ def _is_consumable_product(description: str) -> bool:
 @api_router.post("/admin/products/bundle-price-suggestion")
 async def admin_bundle_price_suggestion(payload: BundlePriceSuggestionRequest, request: Request):
     """Suggested total for a new Pachet, given its component product_ids +
-    quantities: sum of (price * quantity) per line, with a 5% reduction on
-    any line whose product is a consumable (see _is_consumable_product).
-    Purely a suggestion - staff sets the actual bundle_price themselves (see
-    the Product model's own note on why the bundle mechanic needs a real,
+    quantities: sum of (price * quantity) per line, with a staff-adjustable
+    % reduction (default 5, payload.consumable_discount_percent) on any line
+    whose product is a consumable (see _is_consumable_product). Purely a
+    suggestion - staff sets the actual bundle_price themselves (see the
+    Product model's own note on why the bundle mechanic needs a real,
     fixed, staff-confirmed price rather than always trusting a formula)."""
     await _require_admin(request)
 
+    discount_factor = 1 - (payload.consumable_discount_percent / 100)
     breakdown = []
     suggested_total = 0.0
     for entry in payload.items:
@@ -5769,7 +5774,7 @@ async def admin_bundle_price_suggestion(payload: BundlePriceSuggestionRequest, r
         is_consumable = _is_consumable_product(product.get("description", ""))
         unit_price = product.get("price", 0.0)
         if is_consumable:
-            unit_price = round(unit_price * 0.95, 2)
+            unit_price = round(unit_price * discount_factor, 2)
         line_total = round(unit_price * quantity, 2)
         suggested_total += line_total
         breakdown.append({
