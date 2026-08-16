@@ -3078,6 +3078,121 @@ async def admin_send_marketing_email(payload: MarketingEmailRequest, request: Re
     return {"status": "sent"}
 
 
+async def _send_stock_notification_email(
+    to_email: str,
+    to_name: Optional[str],
+    product_name: str,
+    product_code: Optional[str],
+    price: Optional[float],
+    currency: Optional[str],
+    image_url: Optional[str],
+) -> bool:
+    """Staff-triggered from CRM's "Interese clienți" page ("Înștiințează
+    client") - a client asked to be notified when an out-of-stock item
+    becomes available (or a manual request staff can now fulfill), and
+    staff confirms it's actually available before sending. Same Brevo
+    pattern as _send_marketing_email, different copy ("available now" vs
+    "recommended for you") - and no product_id/product_url, since
+    client_interests only stores denormalized product text (name/code/
+    price), never a catalog id (the client may have favorited/alerted on
+    an item that's since changed or a manual staff-noted request with no
+    catalog entry at all). The CTA links to a webshop SEARCH by code/name
+    instead of a specific product page."""
+    try:
+        if not BREVO_API_KEY:
+            logger.warning("BREVO_API_KEY not set - skipping stock notification email to %s", to_email)
+            return False
+
+        import sib_api_v3_sdk
+        from urllib.parse import quote
+
+        configuration = sib_api_v3_sdk.Configuration()
+        configuration.api_key['api-key'] = BREVO_API_KEY
+        api_instance = sib_api_v3_sdk.TransactionalEmailsApi(sib_api_v3_sdk.ApiClient(configuration))
+
+        webshop_public_url = os.environ.get('WEBSHOP_PUBLIC_URL', 'http://localhost:3000').rstrip('/')
+        search_term = product_code or product_name
+        product_url = f"{webshop_public_url}/produse?q={quote(search_term)}" if search_term else webshop_public_url
+
+        image_block = (
+            f'<img src="{html.escape(image_url)}" alt="" style="max-width: 380px; width: 100%; border-radius: 8px; margin: 0 auto 16px; display: block;" />'
+            if image_url else ""
+        )
+        price_block = (
+            f'<p style="color: #367c2b; font-size: 20px; font-weight: bold; margin: 10px 0;">{price:.2f} {html.escape(currency or "RON")}</p>'
+            if price is not None else ""
+        )
+
+        html_content = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif; background-color: #f5f5f5; padding: 20px;">
+            <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 10px; overflow: hidden;">
+                <div style="background-color: #367c2b; padding: 20px; text-align: center;">
+                    <h1 style="color: #ffffff; margin: 0;">🚜 AGB Agroparts</h1>
+                </div>
+                <div style="padding: 30px; text-align: center;">
+                    <h2 style="color: #333;">Articolul căutat este acum disponibil</h2>
+                    <p style="color: #666; line-height: 1.6;">Ne-ai cerut să te anunțăm când acest articol revine în stoc — este disponibil acum.</p>
+                    {image_block}
+                    <p style="color: #333; font-size: 20px; font-weight: bold; margin: 4px 0 10px;">{html.escape(product_name)}</p>
+                    {price_block}
+                    <a href="{html.escape(product_url)}" style="display: inline-block; margin-top: 20px; padding: 12px 28px; background-color: #367c2b; color: #ffffff; text-decoration: none; border-radius: 6px; font-weight: bold;">Vezi pe site</a>
+                </div>
+                <div style="background-color: #f0f0f0; padding: 15px; text-align: center; font-size: 12px; color: #999;">
+                    <p>AGB Agroparts Solution S.R.L.</p>
+                    <p style="margin-top: 8px;">
+                        Primești acest email pentru că ai cerut să fii anunțat când acest articol devine disponibil.
+                        Pentru întrebări, răspunde direct la acest email.
+                    </p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+
+        send_smtp_email = sib_api_v3_sdk.SendSmtpEmail(
+            to=[{"email": to_email, "name": to_name or to_email}],
+            sender={"email": "noreply@agb-agroparts.ro", "name": "AGB Agroparts"},
+            subject=f"Disponibil acum: {product_name}",
+            html_content=html_content
+        )
+
+        api_instance.send_transac_email(send_smtp_email)
+        logger.info(f"Stock notification email sent to {to_email} for '{product_name}'")
+        return True
+
+    except Exception as e:
+        logger.error(f"Error sending stock notification email to {to_email}: {e}")
+        return False
+
+
+class StockNotificationEmailRequest(BaseModel):
+    to_email: str
+    to_name: Optional[str] = None
+    product_name: str
+    product_code: Optional[str] = None
+    price: Optional[float] = None
+    currency: Optional[str] = None
+    image_url: Optional[str] = None
+
+
+@api_router.post("/admin/client-interests/notify-email")
+async def admin_notify_client_interest_email(payload: StockNotificationEmailRequest, request: Request):
+    """CRM's "Interese clienți" page, "Înștiințează client" button - staff
+    confirms an item is now available and sends the client a direct email.
+    Mirrors /admin/marketing/send-email's shape, but takes the product
+    fields directly (client_interests has no catalog product_id to look
+    up)."""
+    await _require_admin(request)
+    sent = await _send_stock_notification_email(
+        payload.to_email, payload.to_name, payload.product_name,
+        payload.product_code, payload.price, payload.currency, payload.image_url,
+    )
+    if not sent:
+        raise HTTPException(status_code=502, detail="Trimiterea email-ului a eșuat.")
+    return {"status": "sent"}
+
+
 # Fixed staff inbox for new-order alerts - so whoever's on duty knows a new
 # order came in without needing to be logged into the CRM. Same address the
 # Brevo account itself is registered under (agbagroparts.solution@yahoo.com).
