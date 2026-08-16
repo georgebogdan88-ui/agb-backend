@@ -126,16 +126,29 @@ CLOUDFLARE_IMAGE_VARIANT = "square"
 # from the start. send_default_pii is explicitly off - this app handles real
 # customer PII (email/phone/address), so request/user data isn't sent to
 # Sentry beyond what's explicitly captured in error messages.
+#
+# Also gated on RENDER (set to "true" on every Render-hosted service,
+# absent everywhere else) - this module gets imported by local pytest runs
+# and by ad-hoc `python scripts/*.py` dev/test scripts, both of which used
+# to report straight into the PRODUCTION Sentry project (same SENTRY_DSN
+# as deployed, since .env is shared locally) and were routinely confused
+# for real incidents (e.g. deliberately-injected test exceptions literally
+# named "boom", or a local Windows console's UnicodeEncodeError on
+# Romanian diacritics - neither can ever happen in a real request). RENDER
+# is the one signal common to every local invocation shape (pytest, a
+# standalone script, a REPL one-liner) without having to enumerate them.
 SENTRY_DSN = os.environ.get('SENTRY_DSN', '')
-if SENTRY_DSN:
+if SENTRY_DSN and os.environ.get('RENDER'):
     sentry_sdk.init(
         dsn=SENTRY_DSN,
         environment=os.environ.get('SENTRY_ENVIRONMENT', 'production'),
         traces_sample_rate=0.1,
         send_default_pii=False,
     )
-else:
+elif not SENTRY_DSN:
     logging.getLogger(__name__).warning("SENTRY_DSN not set - error tracking disabled")
+else:
+    logging.getLogger(__name__).info("Not running on Render - Sentry error tracking disabled for this local run")
 
 # Create the main app without a prefix
 app = FastAPI()
