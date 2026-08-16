@@ -2981,8 +2981,11 @@ async def _send_marketing_email(to_email: str, to_name: Optional[str], product: 
         currency = product.get("currency", "RON")
         image_url = product.get("image_url")
 
+        # 380px (was 200px) - staff explicitly asked for the photo to read
+        # as the dominant element paired with the title, not a small icon
+        # above it.
         image_block = (
-            f'<img src="{html.escape(image_url)}" alt="" style="max-width: 200px; border-radius: 8px; margin: 0 auto 20px; display: block;" />'
+            f'<img src="{html.escape(image_url)}" alt="" style="max-width: 380px; width: 100%; border-radius: 8px; margin: 0 auto 16px; display: block;" />'
             if image_url else ""
         )
 
@@ -2997,12 +3000,16 @@ async def _send_marketing_email(to_email: str, to_name: Optional[str], product: 
                     <h2 style="color: #333;">Recomandare pentru utilajul tău</h2>
                     <p style="color: #666; line-height: 1.6;">Am identificat un produs potrivit pentru unul dintre utilajele tale.</p>
                     {image_block}
-                    <p style="color: #333; font-size: 18px; font-weight: bold; margin: 10px 0;">{html.escape(title)}</p>
+                    <p style="color: #333; font-size: 20px; font-weight: bold; margin: 4px 0 10px;">{html.escape(title)}</p>
                     <p style="color: #367c2b; font-size: 20px; font-weight: bold; margin: 10px 0;">{price:.2f} {html.escape(currency)}</p>
                     <a href="{html.escape(product_url)}" style="display: inline-block; margin-top: 20px; padding: 12px 28px; background-color: #367c2b; color: #ffffff; text-decoration: none; border-radius: 6px; font-weight: bold;">Vezi produsul</a>
                 </div>
                 <div style="background-color: #f0f0f0; padding: 15px; text-align: center; font-size: 12px; color: #999;">
                     <p>AGB Agroparts Solution S.R.L.</p>
+                    <p style="margin-top: 8px;">
+                        Primești acest email pentru că ești client AGB Agroparts cu un utilaj înregistrat compatibil cu acest produs.
+                        Pentru a nu mai primi astfel de recomandări, răspunde la acest email cu „Renunț".
+                    </p>
                 </div>
             </div>
         </body>
