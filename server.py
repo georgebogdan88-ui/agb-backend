@@ -1,5 +1,5 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Query, BackgroundTasks, Request, UploadFile, File, Form, Body
-from fastapi.responses import HTMLResponse, FileResponse, Response
+from fastapi.responses import HTMLResponse, FileResponse, Response, RedirectResponse
 from fastapi.encoders import jsonable_encoder
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
@@ -10321,140 +10321,22 @@ async def shutdown_db_client():
     client.close()
 
 # Privacy Policy Page
-@app.get("/privacy-policy", response_class=HTMLResponse)
-@app.get("/api/privacy-policy", response_class=HTMLResponse)
+@app.get("/privacy-policy")
+@app.get("/api/privacy-policy")
 async def privacy_policy():
-    html_content = """
-    <!DOCTYPE html>
-    <html lang="ro">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Politica de Confidențialitate - AGB Agroparts</title>
-        <style>
-            body {
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
-                max-width: 800px;
-                margin: 0 auto;
-                padding: 20px;
-                line-height: 1.6;
-                color: #333;
-                background-color: #f9f9f9;
-            }
-            h1 {
-                color: #367c2b;
-                border-bottom: 3px solid #367c2b;
-                padding-bottom: 10px;
-            }
-            h2 {
-                color: #367c2b;
-                margin-top: 30px;
-            }
-            .logo {
-                text-align: center;
-                margin-bottom: 20px;
-            }
-            .logo img {
-                max-width: 150px;
-            }
-            .container {
-                background: white;
-                padding: 30px;
-                border-radius: 10px;
-                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-            }
-            .updated {
-                color: #666;
-                font-style: italic;
-            }
-            ul {
-                margin: 10px 0;
-            }
-            li {
-                margin: 8px 0;
-            }
-            .contact {
-                background: #e8f5e9;
-                padding: 15px;
-                border-radius: 5px;
-                margin-top: 20px;
-            }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <div class="logo">
-                <h1>🚜 AGB Agroparts</h1>
-            </div>
-            
-            <h1>Politica de Confidențialitate</h1>
-            <p class="updated">Ultima actualizare: Martie 2026</p>
-            
-            <h2>1. Introducere</h2>
-            <p>AGB Agroparts ("noi", "al nostru") operează aplicația mobilă AGB (denumită în continuare "Aplicația"). Această pagină vă informează despre politicile noastre privind colectarea, utilizarea și divulgarea datelor cu caracter personal atunci când utilizați Aplicația noastră.</p>
-            
-            <h2>2. Date Colectate</h2>
-            <p>Colectăm următoarele tipuri de informații:</p>
-            <ul>
-                <li><strong>Informații de contact:</strong> nume, adresă de email, număr de telefon, adresă de livrare (doar când plasați o comandă)</li>
-                <li><strong>Informații despre comenzi:</strong> produsele comandate, istoric comenzi</li>
-                <li><strong>Date tehnice:</strong> tip dispozitiv, sistem de operare, pentru a îmbunătăți funcționalitatea aplicației</li>
-            </ul>
-            
-            <h2>3. Utilizarea Datelor</h2>
-            <p>Utilizăm datele colectate pentru:</p>
-            <ul>
-                <li>Procesarea și livrarea comenzilor dumneavoastră</li>
-                <li>Comunicarea privind comenzile (confirmare, expediere, livrare)</li>
-                <li>Îmbunătățirea serviciilor și a experienței utilizatorului</li>
-                <li>Răspunsuri la întrebările dumneavoastră</li>
-            </ul>
-            
-            <h2>4. Protecția Datelor</h2>
-            <p>Implementăm măsuri de securitate pentru a proteja datele dumneavoastră personale împotriva accesului neautorizat, modificării, divulgării sau distrugerii.</p>
-            
-            <h2>5. Partajarea Datelor</h2>
-            <p>Nu vindem și nu închiriem datele dumneavoastră personale terților. Putem partaja informații doar cu:</p>
-            <ul>
-                <li>Servicii de curierat pentru livrarea comenzilor</li>
-                <li>Procesatori de plăți pentru finalizarea tranzacțiilor</li>
-                <li>Autorități, când legea o impune</li>
-            </ul>
-            
-            <h2>6. Drepturile Dumneavoastră</h2>
-            <p>Conform GDPR, aveți dreptul să:</p>
-            <ul>
-                <li>Accesați datele personale pe care le deținem despre dumneavoastră</li>
-                <li>Solicitați corectarea datelor inexacte</li>
-                <li>Solicitați ștergerea datelor</li>
-                <li>Vă opuneți prelucrării datelor</li>
-                <li>Solicitați portabilitatea datelor</li>
-            </ul>
-            
-            <h2>7. Cookies și Tehnologii Similare</h2>
-            <p>Aplicația poate utiliza tehnologii locale de stocare pentru a îmbunătăți experiența utilizatorului (de exemplu, pentru păstrarea coșului de cumpărături).</p>
-            
-            <h2>8. Modificări ale Politicii</h2>
-            <p>Ne rezervăm dreptul de a actualiza această politică de confidențialitate. Vă vom notifica despre orice modificări prin publicarea noii politici în Aplicație.</p>
-            
-            <h2>9. Contact</h2>
-            <div class="contact">
-                <p>Pentru întrebări despre această politică de confidențialitate sau despre datele dumneavoastră, ne puteți contacta:</p>
-                <ul>
-                    <li><strong>Email:</strong> contact@agb-agroparts.ro</li>
-                    <li><strong>Website:</strong> <a href="https://agb-agroparts.ro">https://agb-agroparts.ro</a></li>
-                    <li><strong>Telefon:</strong> Disponibil pe website</li>
-                </ul>
-            </div>
-            
-            <p style="margin-top: 30px; text-align: center; color: #666;">
-                © 2026 AGB Agroparts. Toate drepturile rezervate.
-            </p>
-        </div>
-    </body>
-    </html>
-    """
-    return HTMLResponse(content=html_content)
+    """Registered as the "Privacy Policy URL" in App Store Connect/Play
+    Console - used to be its own hand-maintained HTML page here, a SEPARATE
+    document from agb-webshop's real policy (src/lib/legalPages.ts,
+    /politici/confidentialitate), with no mechanism keeping the two in sync
+    (found actually diverged: different "last updated" dates, different
+    disclosed processors - e.g. this one never mentioned Brevo either).
+    Redirects to the webshop's policy instead so there is exactly one
+    document to keep accurate going forward, not two. Whichever domain the
+    business is on at any time already flows through WEBSHOP_PUBLIC_URL
+    (see _send_marketing_email etc.), so this redirect target updates
+    itself automatically on the next domain migration too."""
+    webshop_public_url = os.environ.get('WEBSHOP_PUBLIC_URL', 'http://localhost:3000').rstrip('/')
+    return RedirectResponse(url=f"{webshop_public_url}/politici/confidentialitate", status_code=302)
 
 
 
