@@ -3000,6 +3000,7 @@ async def _create_user_notification(
     notif_type: str,
     title: str,
     body: str,
+    product_id: Optional[str] = None,
     product_name: Optional[str] = None,
     product_image_url: Optional[str] = None,
     product_url: Optional[str] = None,
@@ -3011,7 +3012,15 @@ async def _create_user_notification(
     as the email itself doesn't require an account to receive. Feeds the
     app's "Noutăți" bell/feed (see AppHeader.tsx's comment on the mobile
     side - it previously had no real per-user notification source, only
-    the blog article count)."""
+    the blog article count).
+
+    `product_id` is a real catalog id when the caller has one (marketing
+    always does; stock/price-alert notifications only do once the client's
+    original interest was synced through with its product id intact - see
+    sync_interest_to_crm) - stored as its own field (not just baked into
+    product_url) so the app can navigate straight to the product without
+    parsing a URL, and can also use it to clear the matching favorite/
+    price_alert/stock_alert toggle once the client has seen the product."""
     try:
         user = await db.users.find_one({"email": to_email}, {"id": 1})
         if not user:
@@ -3023,6 +3032,7 @@ async def _create_user_notification(
             "type": notif_type,
             "title": title,
             "body": body,
+            "product_id": product_id,
             "product_name": product_name,
             "product_image_url": product_image_url,
             "product_url": product_url,
@@ -3105,7 +3115,8 @@ async def _send_marketing_email(to_email: str, to_name: Optional[str], product: 
             to_email, "marketing",
             "Recomandare pentru utilajul tău",
             f"{title} - {price:.2f} {currency}",
-            product_name=title, product_image_url=image_url, product_url=product_url,
+            product_id=product.get("id"), product_name=title,
+            product_image_url=image_url, product_url=product_url,
         )
         return True
 
@@ -3143,18 +3154,23 @@ async def _send_stock_notification_email(
     price: Optional[float],
     currency: Optional[str],
     image_url: Optional[str],
+    product_id: Optional[str] = None,
 ) -> bool:
     """Staff-triggered from CRM's "Interese clienți" page ("Înștiințează
     client") - a client asked to be notified when an out-of-stock item
     becomes available (or a manual request staff can now fulfill), and
     staff confirms it's actually available before sending. Same Brevo
     pattern as _send_marketing_email, different copy ("available now" vs
-    "recommended for you") - and no product_id/product_url, since
-    client_interests only stores denormalized product text (name/code/
-    price), never a catalog id (the client may have favorited/alerted on
-    an item that's since changed or a manual staff-noted request with no
-    catalog entry at all). The CTA links to a webshop SEARCH by code/name
-    instead of a specific product page."""
+    "recommended for you").
+
+    `product_id` is optional because client_interests only stores a real
+    catalog id when the underlying interest was synced through with one
+    intact (see sync_interest_to_crm / CRM's IntegrationInterestProduct.id)
+    - a manual staff-noted request, or an older interest synced before
+    that field existed, has none. When present, links straight to the
+    product page and lets the in-app notification carry a real id (so the
+    app can navigate to it and clear the matching alert toggle); otherwise
+    falls back to a webshop SEARCH by code/name, same as before."""
     try:
         if not BREVO_API_KEY:
             logger.warning("BREVO_API_KEY not set - skipping stock notification email to %s", to_email)
@@ -3168,8 +3184,11 @@ async def _send_stock_notification_email(
         api_instance = sib_api_v3_sdk.TransactionalEmailsApi(sib_api_v3_sdk.ApiClient(configuration))
 
         webshop_public_url = os.environ.get('WEBSHOP_PUBLIC_URL', 'http://localhost:3000').rstrip('/')
-        search_term = product_code or product_name
-        product_url = f"{webshop_public_url}/produse?q={quote(search_term)}" if search_term else webshop_public_url
+        if product_id:
+            product_url = f"{webshop_public_url}/produse/{product_id}"
+        else:
+            search_term = product_code or product_name
+            product_url = f"{webshop_public_url}/produse?q={quote(search_term)}" if search_term else webshop_public_url
 
         image_block = (
             f'<img src="{html.escape(image_url)}" alt="" style="max-width: 380px; width: 100%; border-radius: 8px; margin: 0 auto 16px; display: block;" />'
@@ -3220,7 +3239,8 @@ async def _send_stock_notification_email(
             to_email, "stock_alert",
             "Articolul căutat este acum disponibil",
             product_name,
-            product_name=product_name, product_image_url=image_url, product_url=product_url,
+            product_id=product_id, product_name=product_name,
+            product_image_url=image_url, product_url=product_url,
         )
         return True
 
@@ -3237,6 +3257,7 @@ class StockNotificationEmailRequest(BaseModel):
     price: Optional[float] = None
     currency: Optional[str] = None
     image_url: Optional[str] = None
+    product_id: Optional[str] = None
 
 
 @api_router.post("/admin/client-interests/notify-email")
@@ -3244,12 +3265,14 @@ async def admin_notify_client_interest_email(payload: StockNotificationEmailRequ
     """CRM's "Interese clienți" page, "Înștiințează client" button - staff
     confirms an item is now available and sends the client a direct email.
     Mirrors /admin/marketing/send-email's shape, but takes the product
-    fields directly (client_interests has no catalog product_id to look
-    up)."""
+    fields directly (client_interests only has a catalog product_id to
+    pass through when the original interest was synced with one - see
+    _send_stock_notification_email's own docstring)."""
     await _require_admin(request)
     sent = await _send_stock_notification_email(
         payload.to_email, payload.to_name, payload.product_name,
         payload.product_code, payload.price, payload.currency, payload.image_url,
+        product_id=payload.product_id,
     )
     if not sent:
         raise HTTPException(status_code=502, detail="Trimiterea email-ului a eșuat.")
@@ -4318,6 +4341,7 @@ def _serialize_notification(doc: dict) -> dict:
         "type": doc.get("type"),
         "title": doc.get("title"),
         "body": doc.get("body"),
+        "product_id": doc.get("product_id"),
         "product_name": doc.get("product_name"),
         "product_image_url": doc.get("product_image_url"),
         "product_url": doc.get("product_url"),
@@ -9076,6 +9100,7 @@ async def sync_interest_to_crm(interest_id: str, interest_type: str, user: dict,
             "telefon": user.get("phone"),
         },
         "product": {
+            "id": product.get("id") if product else None,
             "denumire": product.get("title") if product else None,
             "cod_prod": product.get("sku") if product else None,
             "pret": product.get("price") if product else None,
