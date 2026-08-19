@@ -5392,7 +5392,7 @@ async def admin_list_products(
         cursor = cursor.sort("title_normalized", 1)
     cursor = cursor.skip(skip).limit(limit)
     products = await cursor.to_list(limit)
-    return {"items": [Product(**p) for p in products], "total": total}
+    return {"items": [Product(**apply_cloudflare_rollout(p)) for p in products], "total": total}
 
 @api_router.get("/admin/customer-interests")
 async def admin_list_customer_interests(
@@ -5539,7 +5539,7 @@ async def admin_create_product(request: Request, product_data: ProductCreate):
         resource_id=product_id, after=_product_audit_summary(product),
     )
 
-    return Product(**product)
+    return Product(**apply_cloudflare_rollout(product))
 
 _CLOUDFLARE_DELIVERY_URL_RE = re.compile(r"^https://imagedelivery\.net/[^/]+/([^/]+)/[^/]+$")
 
@@ -6106,7 +6106,7 @@ async def admin_get_products_by_ids(request: Request, ids: str):
 
     cursor = db.shopify_products.find({"id": {"$in": id_list}})
     products = await cursor.to_list(500)
-    return [Product(**p) for p in products]
+    return [Product(**apply_cloudflare_rollout(p)) for p in products]
 
 
 class BundlePriceSuggestionRequest(BaseModel):
@@ -6191,7 +6191,7 @@ async def admin_update_product(product_id: str, request: Request, product_data: 
         resource_id=product_id, before=before, after=after,
     )
 
-    return Product(**updated)
+    return Product(**apply_cloudflare_rollout(updated))
 
 
 class ProductSalePriceUpdate(BaseModel):
@@ -6239,7 +6239,7 @@ async def admin_set_product_sale_price(product_id: str, payload: ProductSalePric
         before={"sale_type": existing.get("sale_type"), "sale_price": existing.get("sale_price")},
         after={"sale_type": payload.sale_type, "sale_price": payload.sale_price},
     )
-    return Product(**updated)
+    return Product(**apply_cloudflare_rollout(updated))
 
 @api_router.delete("/admin/products/{product_id}")
 async def admin_delete_product(product_id: str, request: Request, reason: Optional[str] = Body(default=None, embed=True)):
@@ -9261,7 +9261,7 @@ async def get_user_favorites(request: Request):
     for pid in product_ids:
         product = products_by_id.get(pid)
         if product:
-            favorites.append(Product(**product))
+            favorites.append(Product(**apply_cloudflare_rollout(product)))
 
     return favorites
 
