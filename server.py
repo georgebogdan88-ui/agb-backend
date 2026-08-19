@@ -35,6 +35,7 @@ import bleach
 import sentry_sdk
 
 import courier_fan
+from scripts.generate_seo_metadata import generate_seo_fields
 
 ROOT_DIR = Path(__file__).parent
 # Load .env but don't override existing environment variables (important for Render deployment)
@@ -1336,6 +1337,23 @@ async def sync_all_products():
                 {"id": 1, "equivalent_product_ids": 1}
             ).to_list(None)
         }
+        # Same reasoning again, for meta_title/meta_description - either
+        # manually curated by staff or auto-filled by generate_seo_fields()
+        # (see admin_create_product / update_single_product). Without this,
+        # a full resync would wipe the entire catalog's SEO metadata back to
+        # empty in one cycle (parse_shopify_node() never produces these
+        # AGB-custom fields), undoing scripts/generate_seo_metadata.py
+        # --apply's backfill.
+        preserved_seo = {
+            p["id"]: {"meta_title": p.get("meta_title"), "meta_description": p.get("meta_description")}
+            for p in await db.shopify_products.find(
+                {"source": {"$ne": "manual"}, "$or": [
+                    {"meta_title": {"$nin": [None, ""]}},
+                    {"meta_description": {"$nin": [None, ""]}},
+                ]},
+                {"id": 1, "meta_title": 1, "meta_description": 1}
+            ).to_list(None)
+        }
 
         # Preserve Cloudinary-hosted images across the delete+reinsert below.
         # Product images were migrated off Shopify's CDN onto Cloudinary in a
@@ -1428,6 +1446,22 @@ async def sync_all_products():
                     product["is_featured"] = True
                 if product["id"] in preserved_equivalent:
                     product["equivalent_product_ids"] = preserved_equivalent[product["id"]]
+                if product["id"] in preserved_seo:
+                    seo = preserved_seo[product["id"]]
+                    if seo["meta_title"]:
+                        product["meta_title"] = seo["meta_title"]
+                    if seo["meta_description"]:
+                        product["meta_description"] = seo["meta_description"]
+                # Brand-new product this resync just discovered (nothing to
+                # preserve above) - same auto-fill as admin_create_product /
+                # update_single_product, so it never joins an empty-SEO
+                # backlog either.
+                if not product.get("meta_title") or not product.get("meta_description"):
+                    gen_title, gen_desc = generate_seo_fields(product)
+                    if not product.get("meta_title"):
+                        product["meta_title"] = gen_title
+                    if not product.get("meta_description"):
+                        product["meta_description"] = gen_desc
                 if product["id"] in preserved_images:
                     preserved = preserved_images[product["id"]]
                     product["image_url"] = preserved["image_url"]
@@ -5532,6 +5566,22 @@ async def admin_create_product(request: Request, product_data: ProductCreate):
         "created_at": now,
         "updated_at": now,
     }
+
+    # Auto-fill missing SEO metadata so newly-created products never join
+    # the same "meta_title/meta_description empty" backlog that
+    # scripts/generate_seo_metadata.py --apply backfilled across the whole
+    # catalog - see generate_seo_fields' own module docstring for the
+    # template logic. Each field is filled independently and ONLY if the
+    # staff member left it blank; a value they typed in product_data is
+    # never overwritten (mirrors --apply's own default "don't touch
+    # already-set fields" behavior).
+    if not product["meta_title"] or not product["meta_description"]:
+        generated_meta_title, generated_meta_description = generate_seo_fields(product)
+        if not product["meta_title"]:
+            product["meta_title"] = generated_meta_title
+        if not product["meta_description"]:
+            product["meta_description"] = generated_meta_description
+
     await db.shopify_products.insert_one(product)
 
     await _write_audit_log(
@@ -9347,7 +9397,34 @@ async def update_single_product(shopify_product_id: str):
             
             if data.get("data", {}).get("product"):
                 product = parse_shopify_node(data["data"]["product"])
-                
+
+                # Auto-fill missing SEO metadata, same as admin_create_product
+                # - parse_shopify_node() never produces meta_title/
+                # meta_description (Shopify's GraphQL has no such AGB-custom
+                # fields), so without this every product created via this
+                # webhook (products/create) would join the same empty-SEO
+                # backlog scripts/generate_seo_metadata.py --apply backfilled.
+                # This webhook also fires on products/update though, on a
+                # product that may already have a manually-set or previously
+                # generated meta_title/meta_description - checking the
+                # EXISTING doc first and only setting a field that's
+                # currently missing (rather than unconditionally overwriting)
+                # is required so a routine price/stock update coming from
+                # Shopify can never wipe out a good value. If a field is
+                # already set, it's simply left out of `product` below so
+                # the $set doesn't touch it at all.
+                existing_seo = await db.shopify_products.find_one(
+                    {"id": shopify_product_id}, {"meta_title": 1, "meta_description": 1}
+                )
+                needs_meta_title = not (existing_seo and existing_seo.get("meta_title"))
+                needs_meta_description = not (existing_seo and existing_seo.get("meta_description"))
+                if needs_meta_title or needs_meta_description:
+                    generated_meta_title, generated_meta_description = generate_seo_fields(product)
+                    if needs_meta_title:
+                        product["meta_title"] = generated_meta_title
+                    if needs_meta_description:
+                        product["meta_description"] = generated_meta_description
+
                 # Update or insert in database
                 await db.shopify_products.update_one(
                     {"id": shopify_product_id},

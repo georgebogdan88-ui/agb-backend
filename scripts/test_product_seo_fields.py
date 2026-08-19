@@ -1,9 +1,18 @@
 """
-Focused, standalone check for the new `meta_title`/`meta_description` SEO
+Focused, standalone check for the `meta_title`/`meta_description` SEO
 fields on products (Product/ProductCreate/ProductUpdate in server.py) -
 confirms they round-trip through POST /admin/products, PUT
 /admin/products/{id}, PUT /admin/products/bulk-save, and are actually
 returned by the public GET /products/{id} fetch used by the storefront.
+Also confirms POST /admin/products auto-fills meta_title/meta_description
+via scripts.generate_seo_metadata.generate_seo_fields whenever staff leaves
+either blank (each field independently, never overwriting one that's
+already filled in) - see admin_create_product in server.py.
+
+The equivalent auto-fill behavior on the Shopify products/create and
+products/update webhook path (update_single_product in server.py) is NOT
+covered here (it needs an httpx-mocked Shopify GraphQL response, out of
+scope for this in-memory-Mongo-only harness) - verified separately.
 
 Not a pytest suite - mirrors scripts/test_stock_checkout.py's and
 scripts/test_admin_customer_account_lookup.py's approach (this repo still
@@ -92,16 +101,72 @@ async def scenario_a_create_round_trip():
         server._require_admin = original
 
 
-async def scenario_a2_create_without_seo_fields_defaults_none():
-    """(a2) creating a product without meta_title/meta_description still
-    works and leaves both as None (backward-compatible, additive-only)."""
+async def scenario_a2_create_without_seo_fields_autogenerates():
+    """(a2) creating a product without meta_title/meta_description no
+    longer leaves them None - admin_create_product now auto-fills both via
+    scripts.generate_seo_metadata.generate_seo_fields (see server.py, right
+    before the insert_one) so newly-created products don't join the same
+    empty-SEO backlog scripts/generate_seo_metadata.py --apply backfilled
+    across the pre-existing catalog. Matches generate_seo_fields' own output
+    for the same input exactly, rather than just asserting non-None."""
     await fresh_db()
     original = patch_require_admin()
     try:
         payload = server.ProductCreate(title="Curea transmisie", price=49.5)
         created = await server.admin_create_product(request=make_request(), product_data=payload)
-        check("a2) create without SEO fields: meta_title is None", created.meta_title is None, created.meta_title)
-        check("a2) create without SEO fields: meta_description is None", created.meta_description is None, created.meta_description)
+        # generate_seo_fields' meta_description picks between a few
+        # equivalent closer phrasings deterministically keyed off the
+        # product's own `id` (see _pick_variant) - so the expected value
+        # must be computed using the SAME id admin_create_product actually
+        # generated (created.id), not a hand-rolled id-less dict, or this
+        # assertion would flake/fail depending on which id uuid4() picked.
+        expected_title, expected_description = server.generate_seo_fields(
+            {"id": created.id, "title": "Curea transmisie", "vendor": None, "product_type": None, "compatible_models": None}
+        )
+        check("a2) create without SEO fields: meta_title auto-generated", created.meta_title == expected_title, created.meta_title)
+        check("a2) create without SEO fields: meta_description auto-generated", created.meta_description == expected_description, created.meta_description)
+    finally:
+        server._require_admin = original
+
+
+async def scenario_a3_create_partial_seo_fields_only_fills_the_blank_one():
+    """(a3) if staff fills in ONLY one of meta_title/meta_description, the
+    other is auto-generated but the one they typed is left exactly as-is -
+    each field is filled independently, never overwriting a value that's
+    already present (same "don't touch what's already set" rule
+    scripts/generate_seo_metadata.py --apply uses by default)."""
+    await fresh_db()
+    original = patch_require_admin()
+    try:
+        payload = server.ProductCreate(
+            title="Furtun hidraulic",
+            price=15.0,
+            meta_title="Titlu SEO scris manual de staff",
+        )
+        created = await server.admin_create_product(request=make_request(), product_data=payload)
+        check(
+            "a3) create with only meta_title set: meta_title NOT overwritten",
+            created.meta_title == "Titlu SEO scris manual de staff", created.meta_title,
+        )
+        check(
+            "a3) create with only meta_title set: meta_description auto-generated (not None)",
+            bool(created.meta_description), created.meta_description,
+        )
+
+        payload2 = server.ProductCreate(
+            title="Cuplaj rapid hidraulic",
+            price=25.0,
+            meta_description="Descriere SEO scrisa manual de staff.",
+        )
+        created2 = await server.admin_create_product(request=make_request(), product_data=payload2)
+        check(
+            "a3) create with only meta_description set: meta_description NOT overwritten",
+            created2.meta_description == "Descriere SEO scrisa manual de staff.", created2.meta_description,
+        )
+        check(
+            "a3) create with only meta_description set: meta_title auto-generated (not None)",
+            bool(created2.meta_title), created2.meta_title,
+        )
     finally:
         server._require_admin = original
 
@@ -232,7 +297,8 @@ async def scenario_d2_public_get_without_seo_fields_defaults_none():
 
 async def main():
     await scenario_a_create_round_trip()
-    await scenario_a2_create_without_seo_fields_defaults_none()
+    await scenario_a2_create_without_seo_fields_autogenerates()
+    await scenario_a3_create_partial_seo_fields_only_fills_the_blank_one()
     await scenario_b_update_round_trip()
     await scenario_c_bulk_save_round_trip()
     await scenario_d_public_get_returns_seo_fields()
