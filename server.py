@@ -2418,6 +2418,13 @@ async def get_product(product_id: str):
         # First try local DB
         product = await db.shopify_products.find_one({"id": product_id})
 
+        if not product:
+            # Public product URLs use handle, not id (SEO migration,
+            # 2026-08-20) - product_id here is whatever the URL segment was,
+            # so a plain numeric-id miss is retried as a handle lookup
+            # before falling back to Shopify.
+            product = await db.shopify_products.find_one({"handle": product_id})
+
         if product:
             return Product(**apply_cloudflare_rollout(product))
 
@@ -10258,6 +10265,23 @@ async def startup_event():
         await db.shopify_products.create_index("id")
     except Exception:
         logger.exception("Failed to create index on shopify_products.id")
+
+    # handle powers the public product URL (/produse/[handle], SEO migration
+    # 2026-08-20) - get_product now looks up by handle whenever id misses, so
+    # this needs the same index as id above. Unlike id, marked unique: every
+    # handle is auto-generated from the title via slugify() at creation time
+    # (admin_create_product) with no per-product override, so two products
+    # with an identical title collide by construction - verified once,
+    # directly against production, that this is a real (not theoretical)
+    # risk: 3 pairs of distinct products (same title, different id) shared
+    # one handle before this index was added, fixed by hand by suffixing the
+    # newer product's handle with "-2". A unique index here turns any future
+    # collision into a loud creation-time failure instead of a silent
+    # "wrong product" URL collision.
+    try:
+        await db.shopify_products.create_index("handle", unique=True)
+    except Exception:
+        logger.exception("Failed to create unique index on shopify_products.handle")
 
     # Home/featured product queries filter on is_featured (see the curated
     # picks logic) - without this, each one scans the whole catalog.
