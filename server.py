@@ -2119,6 +2119,19 @@ async def get_product_vendors(
     vendors = sorted(v for v in vendors if v)
     return {"vendors": vendors}
 
+async def find_product_by_id_or_handle(product_id: str, projection: Optional[Dict[str, int]] = None):
+    """Resolves the `{product_id}` URL segment shared by the storefront's
+    per-product endpoints (get_product, complementary, equivalents,
+    bundle-items). The webshop's own product URL is handle-based
+    (/produse/[handle], SEO migration 2026-08-20), so that's what actually
+    arrives here in practice - the `id` lookup is tried first only to stay
+    compatible with any caller still passing the internal id directly (e.g.
+    the mobile app, or not-yet-updated links)."""
+    product = await db.shopify_products.find_one({"id": product_id}, projection)
+    if not product:
+        product = await db.shopify_products.find_one({"handle": product_id}, projection)
+    return product
+
 @api_router.get("/products/{product_id}/complementary")
 async def get_complementary_products(product_id: str):
     """Get complementary and related products.
@@ -2133,7 +2146,7 @@ async def get_complementary_products(product_id: str):
     Shopify-metafield-only in both cases - that field is out of scope here,
     so a native-resolved response always returns an empty `related` list.
     """
-    local_product = await db.shopify_products.find_one({"id": product_id})
+    local_product = await find_product_by_id_or_handle(product_id)
     complementary_ids = (local_product or {}).get("complementary_product_ids") or []
 
     if complementary_ids:
@@ -2306,7 +2319,7 @@ async def get_bundle_items(product_id: str):
     """Component products of a "Pachet" (product_type == "Pachet") - full
     Product details for each entry in bundle_items, plus its quantity.
     Backs the storefront's per-product bundle-customization checklist."""
-    product = await db.shopify_products.find_one({"id": product_id}, {"bundle_items": 1})
+    product = await find_product_by_id_or_handle(product_id, {"bundle_items": 1})
     items = (product or {}).get("bundle_items") or []
 
     results = []
@@ -2344,7 +2357,7 @@ async def get_equivalent_products(product_id: str):
     concept to fall back to. If `equivalent_product_ids` is empty, this
     simply returns an empty list rather than querying Shopify.
     """
-    local_product = await db.shopify_products.find_one({"id": product_id})
+    local_product = await find_product_by_id_or_handle(product_id)
     equivalent_ids = (local_product or {}).get("equivalent_product_ids") or []
 
     equivalents = []
@@ -2415,15 +2428,9 @@ def parse_metafield_product(node: dict) -> dict:
 async def get_product(product_id: str):
     """Get a single product by ID"""
     try:
-        # First try local DB
-        product = await db.shopify_products.find_one({"id": product_id})
-
-        if not product:
-            # Public product URLs use handle, not id (SEO migration,
-            # 2026-08-20) - product_id here is whatever the URL segment was,
-            # so a plain numeric-id miss is retried as a handle lookup
-            # before falling back to Shopify.
-            product = await db.shopify_products.find_one({"handle": product_id})
+        # First try local DB (by id, then by handle - see
+        # find_product_by_id_or_handle)
+        product = await find_product_by_id_or_handle(product_id)
 
         if product:
             return Product(**apply_cloudflare_rollout(product))
