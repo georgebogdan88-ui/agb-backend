@@ -2012,7 +2012,23 @@ async def get_products(
                         ]
                     }
                 }},
-                {"$sort": {"_relevance": 1}},
+                # Tiebreaker on `id` (unique per product) is required, not
+                # cosmetic: `_relevance` only takes a handful of distinct
+                # bucketed values (0/-1/-5/-6/-10/-11/-15/-16), so huge
+                # numbers of documents tie on it. Mongo does NOT guarantee a
+                # stable relative order for ties across separate query
+                # executions - with $skip/$limit pagination split across two
+                # independent aggregate() calls (the initial SSR page fetch,
+                # then ProductGridInfinite's separate "load more" fetch for
+                # the next page), a tied document could resolve to a
+                # different relative position each time and end up
+                # re-fetched on BOTH pages - visibly duplicated in the grid,
+                # since the frontend appends pages without deduping by id
+                # (production report, 2026-08-21: George searched "6150m",
+                # saw "Ambreiaj complet cuplare..." rendered twice). Sorting
+                # ties by `id` too makes the order fully deterministic run to
+                # run, so the same document can never land on two pages.
+                {"$sort": {"_relevance": 1, "id": 1}},
                 {"$skip": skip},
                 {"$limit": limit},
             ])

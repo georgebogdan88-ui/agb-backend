@@ -136,11 +136,63 @@ async def scenario_b_search_relevance_promotes_in_stock_across_the_full_result_s
           ids[0] == "target" if ids else False, ids)
 
 
+async def scenario_c_relevance_sort_has_id_tiebreaker_for_pagination_stability():
+    """Regression guard for the "6150m" duplicate-product report (George,
+    2026-08-21): `_relevance` only takes a handful of coarse bucketed values
+    (0/-1/-5/-6/-10/-11/-15/-16), so huge numbers of real documents tie on
+    it. Mongo does NOT guarantee a stable relative order for ties across two
+    SEPARATE query executions - e.g. the initial SSR page fetch (page.tsx)
+    and ProductGridInfinite's later "load more" fetch for the next page are
+    two independent aggregate() calls. Without a unique secondary sort key,
+    the same document can resolve into both pages and render twice (the
+    frontend appends pages without deduping by id).
+
+    mongomock's in-memory $sort is itself deterministic/stable across calls
+    (Python's sort is stable; there's no real storage-engine nondeterminism
+    to reproduce here), so it can't actually surface live cross-page
+    duplication the way real MongoDB did - this instead asserts directly on
+    the pipeline the code builds, so a future regression (someone removing
+    the tiebreaker) still gets caught even though mongomock alone
+    wouldn't show any duplicates either way."""
+    db = await fresh_db()
+    await db.shopify_products.insert_one(base_product(
+        id="p1", title="Cupla rapida test", title_normalized="cupla rapida test",
+    ))
+
+    captured_pipelines = []
+    collection_cls = type(db.shopify_products)
+    original_aggregate = collection_cls.aggregate
+
+    def capturing_aggregate(self, pipeline, *args, **kwargs):
+        captured_pipelines.append(pipeline)
+        return original_aggregate(self, pipeline, *args, **kwargs)
+
+    collection_cls.aggregate = capturing_aggregate
+    try:
+        from fastapi.testclient import TestClient
+        with TestClient(server.app) as client:
+            r = client.get("/api/products", params={"search": "cupla rapida", "limit": 5})
+        check("c) request succeeds", r.status_code == 200, r.text)
+        check("c) exactly one aggregate() call made", len(captured_pipelines) == 1, captured_pipelines)
+        if captured_pipelines:
+            sort_stages = [s["$sort"] for s in captured_pipelines[0] if "$sort" in s]
+            check("c) pipeline has a $sort stage", len(sort_stages) == 1, captured_pipelines[0])
+            if sort_stages:
+                check("c) $sort includes _relevance", sort_stages[0].get("_relevance") == 1, sort_stages[0])
+                check(
+                    "c) $sort has a unique `id` tiebreaker (pagination stability across separate page fetches)",
+                    sort_stages[0].get("id") == 1, sort_stages[0],
+                )
+    finally:
+        collection_cls.aggregate = original_aggregate
+
+
 async def main():
     await scenario_a_handle_survives_title_edit()
     await scenario_a2_handle_backfilled_only_when_genuinely_missing()
     await scenario_a3_no_title_change_leaves_handle_alone()
     await scenario_b_search_relevance_promotes_in_stock_across_the_full_result_set()
+    await scenario_c_relevance_sort_has_id_tiebreaker_for_pagination_stability()
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
