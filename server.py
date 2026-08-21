@@ -8729,6 +8729,310 @@ async def admin_list_b2b_customers(request: Request):
     return users
 
 
+# ==================== SHOPIFY -> LOCAL ACCOUNT MIGRATION ====================
+# Shopify (43ca3c-3.myshopify.com) stopped receiving customer traffic
+# 2026-08-21, but customer login for anyone who has never signed in on the
+# new webshop still silently depends on it (see _legacy_shopify_login_and_
+# migrate above). This section is the admin-facing progress tracker + bulk
+# "set your password on the new site" email trigger for the ~282 imported
+# db.clients rows (see _run_clients_import above) that don't have a fully
+# migrated local account yet - built at George's explicit request so CRM can
+# show migration progress and let him decide when to nudge the remaining
+# customers, never automatic.
+#
+# "Fully migrated" here always means a db.users doc for that email WITH
+# password_hash actually set - not just a document existing. A user doc can
+# exist with no usable password yet (auto-provisioned by /auth/forgot-
+# password's legacy-Shopify-lookup fallback, or by the bulk-migrate endpoint
+# below) and that alone doesn't count as migrated: the customer still can't
+# log in locally until they've actually set a password.
+
+async def _get_shopify_customers_total_count() -> int:
+    """Live customer count straight from Shopify's Admin REST API - the
+    authoritative total for the migration-status endpoint below, since
+    db.clients only reflects the last _run_clients_import run (see that
+    function's own docstring) and can lag behind Shopify by however long
+    it's been since the last import. Same auth/store/version pattern as
+    _find_shopify_customer_by_email and _run_clients_import."""
+    admin_token = os.environ.get('SHOPIFY_ADMIN_TOKEN', '') or SHOPIFY_ADMIN_TOKEN
+    if not admin_token:
+        raise HTTPException(
+            status_code=502,
+            detail="SHOPIFY_ADMIN_TOKEN nu este configurat - nu se poate obține numărul de clienți Shopify",
+        )
+    store = os.environ.get('SHOPIFY_STORE', '43ca3c-3.myshopify.com')
+    headers = {"Content-Type": "application/json", "X-Shopify-Access-Token": admin_token}
+    url = f"https://{store}/admin/api/{SHOPIFY_ADMIN_API_VERSION}/customers/count.json"
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, headers=headers, timeout=15.0)
+        if response.status_code != 200:
+            raise RuntimeError(f"Shopify customers/count.json a răspuns cu {response.status_code}: {response.text}")
+        return int(response.json().get("count", 0))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching Shopify customers count: {e}")
+        raise HTTPException(status_code=502, detail="Nu s-a putut obține numărul de clienți din Shopify") from e
+
+
+@api_router.get("/admin/customers/shopify-migration-status")
+async def admin_shopify_migration_status(request: Request):
+    """Live migration-progress snapshot for CRM - recomputed from scratch on
+    every call (no cache, no scheduled job), same as every other statistic
+    in this ecosystem.
+
+    - total_shopify_customers: live count from Shopify itself (see
+      _get_shopify_customers_total_count) - the authoritative total, not
+      db.clients.count_documents (which can lag behind the last import).
+    - migrated_count: how many of the customers we know about (db.clients,
+      matched by normalized email) have a db.users account with
+      password_hash actually set - i.e. can already log in locally, fully
+      independent of Shopify.
+    - pending_count: total_shopify_customers - migrated_count (floored at 0)
+      - deliberately measured against the live Shopify total rather than
+        just "db.clients minus migrated", so a stale/not-yet-imported
+        customer still counts as pending instead of silently vanishing from
+        the number.
+    """
+    await _require_admin(request)
+
+    total_shopify_customers = await _get_shopify_customers_total_count()
+
+    client_emails = [e for e in await db.clients.distinct("email_normalized") if e]
+    migrated_count = 0
+    if client_emails:
+        migrated_count = await db.users.count_documents({
+            "email": {"$in": client_emails},
+            "password_hash": {"$exists": True, "$nin": [None, ""]},
+        })
+    pending_count = max(total_shopify_customers - migrated_count, 0)
+
+    return {
+        "total_shopify_customers": total_shopify_customers,
+        "migrated_count": migrated_count,
+        "pending_count": pending_count,
+    }
+
+
+async def send_shopify_migration_email(recipient_email: str, recipient_name: str, reset_url: str) -> bool:
+    """Same Brevo provider/call pattern and reset-token mechanism as
+    send_password_reset_email above (never-raise contract: any failure here
+    is caught and returns False, exactly like every other Brevo sender in
+    this file) - but different copy, since these recipients never asked for
+    a password reset. They're legacy Shopify customers being told a new site
+    exists and invited to claim/activate their account on it, so the email
+    has to read as an announcement, not a "did you request this?" security
+    notice that'd look suspicious to someone who never asked for anything."""
+    try:
+        if not BREVO_API_KEY:
+            logger.warning("BREVO_API_KEY not set - skipping Shopify migration email")
+            return False
+
+        import sib_api_v3_sdk
+
+        configuration = sib_api_v3_sdk.Configuration()
+        configuration.api_key['api-key'] = BREVO_API_KEY
+        api_instance = sib_api_v3_sdk.TransactionalEmailsApi(sib_api_v3_sdk.ApiClient(configuration))
+
+        html_content = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif; background-color: #f5f5f5; padding: 20px;">
+            <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 10px; overflow: hidden;">
+                <div style="background-color: #367c2b; padding: 20px; text-align: center;">
+                    <h1 style="color: #ffffff; margin: 0;">🚜 AGB Agroparts</h1>
+                </div>
+                <div style="padding: 30px;">
+                    <h2 style="color: #333;">Am lansat noul site AGB Agroparts!</h2>
+                    <p style="color: #666; line-height: 1.6;">
+                        Contul tău de client, cu istoricul comenzilor tale, te așteaptă și pe
+                        <strong>noul nostru site</strong>. Ca să îl activezi, tot ce trebuie să
+                        faci e să îți setezi o parolă nouă - durează mai puțin de un minut.
+                    </p>
+                    <div style="text-align: center; margin-top: 30px;">
+                        <a href="{reset_url}" style="background-color: #367c2b; color: #ffffff; padding: 15px 30px; text-decoration: none; border-radius: 5px; font-weight: bold;">
+                            Activează-ți contul
+                        </a>
+                    </div>
+                    <p style="color: #999; font-size: 13px; margin-top: 30px;">
+                        Dacă nu mai dorești să folosești acest cont, poți ignora acest email - nu se
+                        întâmplă nimic dacă nu faci nimic.
+                    </p>
+                </div>
+                <div style="background-color: #f0f0f0; padding: 15px; text-align: center; font-size: 12px; color: #999;">
+                    <p>AGB Agroparts Solution S.R.L.</p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+
+        send_smtp_email = sib_api_v3_sdk.SendSmtpEmail(
+            to=[{"email": recipient_email, "name": recipient_name or recipient_email}],
+            sender={"email": "noreply@agb-agroparts.ro", "name": "AGB Agroparts"},
+            subject="🚜 Contul tău te așteaptă pe noul site AGB Agroparts - activează-l acum",
+            html_content=html_content
+        )
+
+        api_instance.send_transac_email(send_smtp_email)
+        logger.info(f"Shopify migration email sent to {recipient_email}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Error sending Shopify migration email to {recipient_email}: {e}")
+        return False
+
+
+async def _run_shopify_migration_bulk_send(candidates: list) -> None:
+    """Background task (queued via BackgroundTasks.add_task, never awaited
+    inline) that does the actual work behind POST
+    /admin/customers/migrate-shopify-bulk: for each candidate (already
+    filtered for eligibility by the endpoint itself, see its docstring),
+    create the local account if it doesn't exist yet, mint a reset token,
+    and send the migration email.
+
+    Eligibility (no-usable-password AND not already emailed) was decided
+    once by the endpoint right before handing off this exact list, so the
+    "queued": N it already returned to staff matches what's attempted here -
+    this function does not re-scan db.clients itself. It DOES re-check each
+    user doc's password_hash/migration_email_sent_at immediately before
+    sending (defense in depth against a customer logging in or a second
+    bulk-migrate click racing this background task), so nothing is ever
+    double-emailed even under a race.
+
+    Each candidate is wrapped in its own try/except - one bad row (missing
+    email, a Brevo hiccup, whatever) must never stop the rest of the batch,
+    same never-raise-out-of-the-loop contract as _notify_restocked_customers
+    above. A small delay between sends throttles the burst against Brevo,
+    mirroring the delay _run_clients_import already uses between its own
+    outbound Shopify calls.
+
+    Reset tokens minted here get a 30-day expiry (not the usual 1 hour from
+    /auth/forgot-password) - this is an unsolicited announcement a customer
+    may not read for days or weeks, not a "I'm resetting my password right
+    now" flow, so the link needs to survive that."""
+    MIGRATION_RESET_TOKEN_TTL = timedelta(days=30)
+    webshop_public_url = os.environ.get('WEBSHOP_PUBLIC_URL', 'http://localhost:3000').rstrip('/')
+
+    sent_count = 0
+    for candidate in candidates:
+        email = candidate.get("email")
+        if not email:
+            continue
+        try:
+            user = await db.users.find_one({"email": email})
+            if not user:
+                user = {
+                    "id": str(uuid.uuid4()),
+                    "email": email,
+                    "name": candidate.get("name") or email.split("@")[0],
+                    "phone": candidate.get("phone") or "",
+                    "address": candidate.get("address") or "",
+                    "city": candidate.get("city") or "",
+                    "county": candidate.get("county") or "",
+                    "postal_code": candidate.get("postal_code") or "",
+                    "is_company": False,
+                    "is_shopify_customer": True,
+                    "shopify_customer_id": candidate.get("shopify_customer_id"),
+                    "tokens": [],
+                    "created_at": datetime.utcnow(),
+                }
+                await db.users.insert_one(user)
+            elif user.get("password_hash") or user.get("migration_email_sent_at"):
+                # Already fully migrated, or already emailed once - never
+                # resend (re-checked here, not just by the caller, in case
+                # this raced a login/reset or another bulk-migrate click).
+                continue
+
+            reset_token = secrets.token_urlsafe(32)
+            await db.users.update_one(
+                {"id": user["id"]},
+                {"$set": {
+                    "reset_token": reset_token,
+                    "reset_token_expires": datetime.utcnow() + MIGRATION_RESET_TOKEN_TTL,
+                }},
+            )
+            reset_url = f"{webshop_public_url}/cont/reseteaza-parola?token={reset_token}"
+            ok = await send_shopify_migration_email(email, user.get("name") or "", reset_url)
+            if ok:
+                await db.users.update_one(
+                    {"id": user["id"]},
+                    {"$set": {"migration_email_sent_at": datetime.utcnow()}},
+                )
+                sent_count += 1
+        except Exception as e:  # noqa: BLE001 - one recipient's failure must
+            # never stop the rest of the batch.
+            logger.warning(f"Shopify migration bulk send: eșec pentru {email}: {e}")
+        await asyncio.sleep(0.1)
+
+    logger.info(
+        "Shopify migration bulk send: %d/%d emailuri trimise cu succes",
+        sent_count, len(candidates),
+    )
+
+
+@api_router.post("/admin/customers/migrate-shopify-bulk")
+async def admin_migrate_shopify_bulk(request: Request, background_tasks: BackgroundTasks):
+    """Bulk-trigger the "set your password on the new site" migration email
+    for every db.clients row that doesn't have a fully migrated local
+    account yet - NEVER run automatically or on a schedule; this only ever
+    fires when a staff member explicitly hits the button in CRM (which is
+    expected to show its own confirmation dialog before calling this).
+
+    Eligibility is decided here, synchronously, from a fast in-memory pass
+    over db.clients + a per-client db.users lookup: a client is a candidate
+    only if there's no db.users account with password_hash set for that
+    email (not migrated), AND that account (if one exists) doesn't already
+    have migration_email_sent_at set (never re-send to someone already
+    emailed - safe to click this button repeatedly with no spam risk).
+
+    Responds immediately with {"queued": N} - account creation and the
+    actual Brevo sends happen afterwards in _run_shopify_migration_bulk_send,
+    handed off via BackgroundTasks so this request never blocks on ~hundreds
+    of outbound emails."""
+    admin = await _require_admin(request)
+    _enforce_rate_limit(
+        f"admin:migrate-shopify-bulk:{admin['id']}", ADMIN_ACTION_LIMIT, ADMIN_ACTION_WINDOW_SECONDS,
+        "Prea multe porniri de migrare în bloc recent. Încearcă din nou mai târziu.",
+    )
+
+    clients = await db.clients.find({}).to_list(None)
+    candidates = []
+    seen_emails = set()
+    for client in clients:
+        email = client.get("email_normalized") or (client.get("email") or "").strip().lower()
+        if not email or email in seen_emails:
+            continue
+        existing_user = await db.users.find_one({"email": email})
+        if existing_user:
+            if existing_user.get("password_hash"):
+                continue  # already fully migrated
+            if existing_user.get("migration_email_sent_at"):
+                continue  # already emailed once - never auto-resend
+        seen_emails.add(email)
+        address = client.get("address") or {}
+        candidates.append({
+            "email": email,
+            "name": client.get("name") or "",
+            "phone": client.get("phone") or "",
+            "address": address.get("address") or "",
+            "city": address.get("city") or "",
+            "county": address.get("county") or "",
+            "postal_code": address.get("postal_code") or "",
+            "shopify_customer_id": client.get("shopify_customer_id"),
+        })
+
+    if candidates:
+        background_tasks.add_task(_run_shopify_migration_bulk_send, candidates)
+
+    await _write_audit_log(
+        request, admin, action="customers.migrate_shopify_bulk_trigger", resource_type="user",
+        after={"queued": len(candidates)},
+    )
+
+    return {"queued": len(candidates)}
+
+
 # ==================== ABANDONED CART EMAILS ====================
 # Cumulative hours since a cart's last activity (see CartItem.updated_at) at
 # which the next reminder in the sequence fires - agreed schedule: first at

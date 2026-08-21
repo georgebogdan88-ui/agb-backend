@@ -63,6 +63,7 @@ jobs:
             scripts/test_product_seo_fields.py \
             scripts/test_registration_consent.py \
             scripts/test_require_admin_bff_only.py \
+            scripts/test_shopify_migration_status_and_bulk.py \
             scripts/test_stock_checkout.py \
           ; do
             echo "::group::$f"
