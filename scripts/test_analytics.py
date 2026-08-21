@@ -1,10 +1,14 @@
 """
-Focused, standalone check for the new webshop analytics feature in
-server.py:
+Focused, standalone check for the webshop analytics feature in server.py:
 
-  - POST /analytics/pageview (track_pageview) - public, no auth.
+  - POST /analytics/pageview (track_pageview) - public, no auth. Also
+    covers the CF-IPCountry/CF-IPCity Cloudflare edge-header geolocation
+    capture added alongside GET /admin/analytics/live.
   - GET /admin/analytics/sales (admin_analytics_sales) - admin-gated.
   - GET /admin/analytics/traffic (admin_analytics_traffic) - admin-gated.
+  - GET /admin/analytics/live (admin_analytics_live) - admin-gated. "Who's
+    on the site right now" - sessions with >=1 pageview inside
+    LIVE_SESSION_WINDOW_SECONDS, most recent pageview per session only.
   - OrderCreate.analytics_session_id / create_order's best-effort
     db.analytics_conversions insert.
 
@@ -15,15 +19,17 @@ has no test framework, tests/ dir, or pytest in requirements.txt). Uses
 mongomock + mongomock-motor to swap in an in-memory Mongo double for
 server.client/db, calls the real endpoint functions directly (no HTTP
 layer/TestClient), and monkeypatches server._require_admin to a fixed-admin
-stub for the two admin-gated endpoints (auth itself is already covered
-end-to-end by test_require_admin_bff_only.py).
+stub for the admin-gated endpoints (auth itself is already covered
+end-to-end by test_require_admin_bff_only.py) - except for
+scenario_live_requires_admin, which deliberately leaves _require_admin
+un-stubbed to confirm the endpoint really is gated.
 
 Run (from repo root): python scripts/test_analytics.py
 """
 import asyncio
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 os.environ.setdefault("MONGO_URL", "mongodb://fake-for-import-only/")
@@ -57,11 +63,19 @@ async def fresh_db():
     return mock_db
 
 
-def make_request():
+def make_request(headers=None):
     """The admin endpoints under test only ever pass `request` through to
     _require_admin (monkeypatched below to ignore it entirely) and never
-    read it directly themselves - an empty scope is enough."""
-    return Request({"type": "http", "headers": [], "method": "GET", "path": "/admin/analytics"})
+    read it directly themselves - an empty scope is enough for those.
+    track_pageview is the one exception (reads Cloudflare's CF-IPCountry/
+    CF-IPCity headers directly) - `headers` lets callers set those.
+    Starlette's ASGI scope wants headers as a list of (lowercase-bytes,
+    bytes) tuples; `request.headers.get(...)` itself is still
+    case-insensitive on the READ side regardless of how they're cased
+    here, but ASGI itself requires lowercase on the wire, matching real
+    HTTP/2 and most real HTTP/1.1 client behavior."""
+    header_list = [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
+    return Request({"type": "http", "headers": header_list, "method": "GET", "path": "/admin/analytics"})
 
 
 def patch_require_admin(admin_id="admin-1", admin_email="staff@example.com"):
@@ -102,7 +116,7 @@ async def scenario_pageview_accepts_valid_input():
         utm_medium="cpc",
         utm_campaign="summer-sale",
     )
-    response = await server.track_pageview(payload)
+    response = await server.track_pageview(payload, make_request())
     check("pageview valid: returns 204", response.status_code == 204, response.status_code)
 
     doc = await db.analytics_pageviews.find_one({"session_id": "sess-abc"})
@@ -120,7 +134,7 @@ async def scenario_pageview_missing_optional_fields_ok():
     - all the optional fields are genuinely optional, stored as None."""
     db = await fresh_db()
     payload = server.PageviewCreate(session_id="sess-minimal", path="/")
-    response = await server.track_pageview(payload)
+    response = await server.track_pageview(payload, make_request())
     check("pageview minimal: returns 204", response.status_code == 204, response.status_code)
     doc = await db.analytics_pageviews.find_one({"session_id": "sess-minimal"})
     check("pageview minimal: persisted", doc is not None)
@@ -133,7 +147,7 @@ async def scenario_pageview_rejects_missing_session_id():
     db = await fresh_db()
     payload = server.PageviewCreate(session_id=None, path="/produse")
     try:
-        await server.track_pageview(payload)
+        await server.track_pageview(payload, make_request())
         check("pageview missing session_id -> rejected", False, "no exception raised")
     except server.HTTPException as e:
         check("pageview missing session_id -> 400", e.status_code == 400, e.status_code)
@@ -145,7 +159,7 @@ async def scenario_pageview_rejects_missing_path():
     db = await fresh_db()
     payload = server.PageviewCreate(session_id="sess-xyz", path=None)
     try:
-        await server.track_pageview(payload)
+        await server.track_pageview(payload, make_request())
         check("pageview missing path -> rejected", False, "no exception raised")
     except server.HTTPException as e:
         check("pageview missing path -> 400", e.status_code == 400, e.status_code)
@@ -158,10 +172,39 @@ async def scenario_pageview_rejects_blank_session_id():
     await fresh_db()
     payload = server.PageviewCreate(session_id="   ", path="/x")
     try:
-        await server.track_pageview(payload)
+        await server.track_pageview(payload, make_request())
         check("pageview blank session_id -> rejected", False, "no exception raised")
     except server.HTTPException as e:
         check("pageview blank session_id -> 400", e.status_code == 400, e.status_code)
+
+
+async def scenario_pageview_captures_country_and_city_from_cf_headers():
+    """Cloudflare's edge geolocation headers (CF-IPCountry / CF-IPCity),
+    sent in a non-canonical case to prove the read is case-insensitive
+    (same as _client_ip's X-Forwarded-For read) - captured into the
+    stored doc's new country/city fields."""
+    db = await fresh_db()
+    payload = server.PageviewCreate(session_id="sess-geo", path="/produse")
+    request = make_request(headers={"Cf-IpCountry": "RO", "CF-IPCITY": "Cluj-Napoca"})
+    await server.track_pageview(payload, request)
+    doc = await db.analytics_pageviews.find_one({"session_id": "sess-geo"})
+    check("pageview geo: country captured", doc["country"] == "RO", doc)
+    check("pageview geo: city captured", doc["city"] == "Cluj-Napoca", doc)
+
+
+async def scenario_pageview_missing_cf_headers_country_none_no_crash():
+    """No CF-IPCountry/CF-IPCity headers at all (e.g. local dev, or if
+    Cloudflare turns out not to forward them here - NOT yet empirically
+    confirmed on real traffic) -> country/city stored as None, no
+    exception, still 204 - geolocation capture must never block/break the
+    pageview write."""
+    db = await fresh_db()
+    payload = server.PageviewCreate(session_id="sess-no-geo", path="/produse")
+    response = await server.track_pageview(payload, make_request())
+    check("pageview no geo: still returns 204", response.status_code == 204, response.status_code)
+    doc = await db.analytics_pageviews.find_one({"session_id": "sess-no-geo"})
+    check("pageview no geo: country is None", doc["country"] is None, doc)
+    check("pageview no geo: city is None", doc["city"] is None, doc)
 
 
 # ==================== Part 1: GET /admin/analytics/sales ====================
@@ -417,6 +460,142 @@ async def scenario_traffic_analytics_zero_sessions_no_division_error():
         server._require_admin = original_admin
 
 
+# ==================== Part 2b-live: GET /admin/analytics/live ====================
+
+async def scenario_live_recent_session_shows_most_recent_pageview():
+    """A session with its LAST pageview inside the live window appears,
+    showing that most recent pageview's path/country/city (not an earlier
+    one from the same session) plus a sane last_seen/seconds_ago."""
+    db = await fresh_db()
+    original_admin = patch_require_admin()
+    try:
+        now = datetime.utcnow()
+        await db.analytics_pageviews.insert_many([
+            {"_id": "pv1", "session_id": "s1", "path": "/produse/x", "country": "RO", "city": "Cluj-Napoca",
+             "referrer": None, "utm_source": None, "utm_medium": None, "utm_campaign": None,
+             "created_at": now - timedelta(minutes=3)},
+            # s1's most recent pageview - this is the one that should win.
+            {"_id": "pv2", "session_id": "s1", "path": "/produse/y", "country": "RO", "city": "Cluj-Napoca",
+             "referrer": None, "utm_source": None, "utm_medium": None, "utm_campaign": None,
+             "created_at": now - timedelta(minutes=1)},
+        ])
+        result = await server.admin_analytics_live(request=make_request())
+        check("live: count == 1", result["count"] == 1, result)
+        check("live: exactly one session in list", len(result["sessions"]) == 1, result)
+        check(
+            "live: window_seconds matches LIVE_SESSION_WINDOW_SECONDS",
+            result["window_seconds"] == server.LIVE_SESSION_WINDOW_SECONDS, result,
+        )
+        session = result["sessions"][0]
+        check("live: session_id correct", session["session_id"] == "s1", session)
+        check("live: shows MOST RECENT path, not the first", session["path"] == "/produse/y", session)
+        check("live: country present", session["country"] == "RO", session)
+        check("live: city present", session["city"] == "Cluj-Napoca", session)
+        check("live: last_seen is a datetime", isinstance(session["last_seen"], datetime), session)
+        check(
+            "live: seconds_ago is a small non-negative int (~60s)",
+            isinstance(session["seconds_ago"], int) and 0 <= session["seconds_ago"] < 120, session,
+        )
+    finally:
+        server._require_admin = original_admin
+
+
+async def scenario_live_stale_session_excluded():
+    """A session whose only pageview is older than LIVE_SESSION_WINDOW_SECONDS
+    does NOT appear - it's not "live" per the agreed 5-minute-since-last-
+    pageview definition."""
+    db = await fresh_db()
+    original_admin = patch_require_admin()
+    try:
+        now = datetime.utcnow()
+        await db.analytics_pageviews.insert_one({
+            "_id": "pv-stale", "session_id": "s-stale", "path": "/produse/old", "country": None, "city": None,
+            "referrer": None, "utm_source": None, "utm_medium": None, "utm_campaign": None,
+            "created_at": now - timedelta(seconds=server.LIVE_SESSION_WINDOW_SECONDS + 60),
+        })
+        result = await server.admin_analytics_live(request=make_request())
+        check("live: stale session excluded -> count == 0", result["count"] == 0, result)
+        check("live: stale session -> empty sessions list", result["sessions"] == [], result)
+    finally:
+        server._require_admin = original_admin
+
+
+async def scenario_live_country_city_none_when_never_captured():
+    """A pageview recorded without country/city (e.g. Cloudflare headers
+    were absent when it was written - see scenario_pageview_missing_cf_
+    headers_country_none_no_crash) still shows up live, just with
+    country/city as None rather than raising/crashing the aggregation."""
+    db = await fresh_db()
+    original_admin = patch_require_admin()
+    try:
+        now = datetime.utcnow()
+        await db.analytics_pageviews.insert_one({
+            "_id": "pv-nogeo", "session_id": "s-nogeo", "path": "/", "country": None, "city": None,
+            "referrer": None, "utm_source": None, "utm_medium": None, "utm_campaign": None,
+            "created_at": now - timedelta(seconds=30),
+        })
+        result = await server.admin_analytics_live(request=make_request())
+        check("live: no-geo session still appears", result["count"] == 1, result)
+        check("live: no-geo session country is None", result["sessions"][0]["country"] is None, result)
+        check("live: no-geo session city is None", result["sessions"][0]["city"] is None, result)
+    finally:
+        server._require_admin = original_admin
+
+
+async def scenario_live_multiple_sessions_sorted_newest_first():
+    """Multiple distinct live sessions -> one row each (not one row per
+    pageview), sorted by last_seen descending (most recently active
+    first)."""
+    db = await fresh_db()
+    original_admin = patch_require_admin()
+    try:
+        now = datetime.utcnow()
+        await db.analytics_pageviews.insert_many([
+            {"_id": "pv-a", "session_id": "s-a", "path": "/a", "country": None, "city": None,
+             "referrer": None, "utm_source": None, "utm_medium": None, "utm_campaign": None,
+             "created_at": now - timedelta(minutes=4)},
+            {"_id": "pv-b", "session_id": "s-b", "path": "/b", "country": None, "city": None,
+             "referrer": None, "utm_source": None, "utm_medium": None, "utm_campaign": None,
+             "created_at": now - timedelta(minutes=1)},
+        ])
+        result = await server.admin_analytics_live(request=make_request())
+        check("live: two distinct sessions -> count == 2", result["count"] == 2, result)
+        ids_in_order = [s["session_id"] for s in result["sessions"]]
+        check("live: sorted newest-activity-first", ids_in_order == ["s-b", "s-a"], ids_in_order)
+    finally:
+        server._require_admin = original_admin
+
+
+async def scenario_live_no_sessions_empty_list():
+    """No pageviews at all in the window -> count 0, empty sessions list,
+    no error."""
+    await fresh_db()
+    original_admin = patch_require_admin()
+    try:
+        result = await server.admin_analytics_live(request=make_request())
+        check("live: empty state count == 0", result["count"] == 0, result)
+        check("live: empty state sessions == []", result["sessions"] == [], result)
+    finally:
+        server._require_admin = original_admin
+
+
+async def scenario_live_requires_admin():
+    """No Authorization header at all -> _require_admin's own 401 (same
+    gate, same message, as every other /admin/* route) - _require_admin is
+    deliberately left UN-stubbed here (unlike every other scenario in this
+    file) to confirm GET /admin/analytics/live actually calls it, rather
+    than just trusting the source read. Full auth-logic coverage (JWT
+    verification, fail-closed 503 when unconfigured, etc.) lives in
+    test_require_admin_bff_only.py, not duplicated here."""
+    await fresh_db()
+    request = Request({"type": "http", "headers": [], "method": "GET", "path": "/admin/analytics/live"})
+    try:
+        await server.admin_analytics_live(request=request)
+        check("live: missing auth rejected", False, "no exception raised")
+    except server.HTTPException as e:
+        check("live: missing auth -> 401", e.status_code == 401, e.status_code)
+
+
 # ==================== Part 2c: create_order + analytics_session_id ====================
 
 def make_order_data(analytics_session_id=None, session_id="sess-checkout"):
@@ -469,10 +648,18 @@ async def main():
     await scenario_pageview_rejects_missing_session_id()
     await scenario_pageview_rejects_missing_path()
     await scenario_pageview_rejects_blank_session_id()
+    await scenario_pageview_captures_country_and_city_from_cf_headers()
+    await scenario_pageview_missing_cf_headers_country_none_no_crash()
     await scenario_sales_analytics_aggregates_correctly()
     await scenario_sales_analytics_invalid_params()
     await scenario_traffic_analytics_aggregates_correctly()
     await scenario_traffic_analytics_zero_sessions_no_division_error()
+    await scenario_live_recent_session_shows_most_recent_pageview()
+    await scenario_live_stale_session_excluded()
+    await scenario_live_country_city_none_when_never_captured()
+    await scenario_live_multiple_sessions_sorted_newest_first()
+    await scenario_live_no_sessions_empty_list()
+    await scenario_live_requires_admin()
     await scenario_order_with_analytics_session_id_creates_conversion()
     await scenario_order_without_analytics_session_id_no_conversion_no_error()
 
