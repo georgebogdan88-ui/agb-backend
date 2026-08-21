@@ -1879,7 +1879,7 @@ def build_products_query(
                     # `compatible_models` just as well as the glued form -
                     # see that helper's docstring for details.
                     has_digit = bool(re.search(r'\d', term))
-                    term_pattern = _term_to_spaced_regex(term) if has_digit else term
+                    term_pattern = _term_to_spaced_regex(term)
                     if has_digit or len(term) < 5:
                         term_regex = f"\\b{term_pattern}\\b"
                     else:
@@ -4309,13 +4309,20 @@ async def _legacy_shopify_login_and_migrate(email: str, password: str, existing_
 
     # Extract Shopify orders (only available on this legacy/Shopify-verified path)
     shopify_orders = []
-    orders_edges = customer.get("orders", {}).get("edges", [])
+    # `or {}` guards against Shopify returning an explicit `null` for a
+    # nullable field (e.g. a partial GraphQL error on just that field) -
+    # dict.get(key, default) only falls back to `default` when the key is
+    # ABSENT, not when it's present with value None, so a bare
+    # `.get("orders", {})` still crashes with AttributeError in that case
+    # (production incident, 2026-08-21 - see /auth/login Sentry report).
+    orders_edges = (customer.get("orders") or {}).get("edges", [])
     for edge in orders_edges:
         order = edge.get("node", {})
+        total_price = order.get("totalPrice") or {}
         shopify_orders.append({
             "order_number": order.get("orderNumber"),
-            "total": float(order.get("totalPrice", {}).get("amount", 0)),
-            "currency": order.get("totalPrice", {}).get("currencyCode", "RON"),
+            "total": float(total_price.get("amount", 0)),
+            "currency": total_price.get("currencyCode", "RON"),
             "date": order.get("processedAt"),
             "status": order.get("fulfillmentStatus") or "UNFULFILLED"
         })
@@ -7573,7 +7580,7 @@ async def admin_list_clients(request: Request, search: Optional[str] = None, lim
 
     query = {}
     if search:
-        term = normalize_text(search)
+        term = re.escape(normalize_text(search))
         query["$or"] = [
             {"name_normalized": {"$regex": term, "$options": "i"}},
             {"email_normalized": {"$regex": term, "$options": "i"}},
