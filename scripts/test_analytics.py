@@ -422,7 +422,7 @@ async def scenario_traffic_analytics_zero_sessions_no_division_error():
 def make_order_data(analytics_session_id=None, session_id="sess-checkout"):
     return server.OrderCreate(
         session_id=session_id,
-        items=[{"product_id": "p1", "quantity": 1}],
+        items=[{"product_id": "p1", "product_name": "Piesa", "quantity": 1, "price": 0.0}],
         customer=server.CustomerInfo(
             name="Ion Popescu", email="ion@example.com", phone="0700000000",
             address="Str. Exemplu 1", city="Cluj-Napoca", county="Cluj", postal_code="400000",
