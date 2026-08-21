@@ -3402,6 +3402,48 @@ async def admin_send_marketing_email(payload: MarketingEmailRequest, request: Re
     return {"status": "sent"}
 
 
+async def _clear_fulfilled_interest_alerts(to_email: str, product_id: str) -> None:
+    """Deactivates the client's own price/stock alert toggle(s) for this
+    product once they've actually received the "available now" email -
+    before this existed, a toggle set via POST /auth/interests stayed
+    active forever (the client's product/account page kept showing it as
+    on) even after staff had already notified them, since nothing but the
+    client's own DELETE /auth/interests ever touched db.customer_interests.
+
+    Only the two actual "alert" types (price_alert/stock_alert) are
+    cleared, never "favorite" - that one's a plain bookmark, not a
+    notification subscription, so an unrelated email being sent has no
+    business touching it. Both alert types are cleared together (rather
+    than trying to guess which one the staff member meant to fulfill)
+    because the caller only ever has a product_id, never the original
+    interest's `type` - CRM's "Înștiințează client" action doesn't pass
+    that through (see StockNotificationEmailRequest).
+
+    Best-effort / never-raise (same pattern as _create_user_notification)
+    so a DB hiccup here can never turn an email that was already sent
+    successfully into a reported failure to staff - see the try/except
+    around this call in _send_stock_notification_email."""
+    try:
+        user = await db.users.find_one({"email": to_email}, {"id": 1})
+        if not user:
+            return
+        result = await db.customer_interests.delete_many({
+            "user_id": user["id"],
+            "product_id": product_id,
+            "type": {"$in": ["price_alert", "stock_alert"]},
+        })
+        if result.deleted_count:
+            logger.info(
+                "Cleared %d fulfilled interest alert(s) for %s / product %s after notification email",
+                result.deleted_count, to_email, product_id,
+            )
+    except Exception as e:  # noqa: BLE001 - never undoes/fails the email that was already sent
+        logger.warning(
+            "Nu s-a putut dezactiva alerta de interes pentru %s / produs %s: %s",
+            to_email, product_id, e,
+        )
+
+
 async def _send_stock_notification_email(
     to_email: str,
     to_name: Optional[str],
@@ -3425,8 +3467,12 @@ async def _send_stock_notification_email(
     - a manual staff-noted request, or an older interest synced before
     that field existed, has none. When present, links straight to the
     product page and lets the in-app notification carry a real id (so the
-    app can navigate to it and clear the matching alert toggle); otherwise
-    falls back to a webshop SEARCH by code/name, same as before."""
+    app can navigate to it and clear the matching alert toggle - see
+    _clear_fulfilled_interest_alerts, called below on a successful send);
+    otherwise falls back to a webshop SEARCH by code/name, same as before.
+    Without a product_id there's no safe way to match this back to the
+    client's original customer_interests row, so that clearing step is
+    skipped entirely (logged, not guessed) in that case."""
     try:
         if not BREVO_API_KEY:
             logger.warning("BREVO_API_KEY not set - skipping stock notification email to %s", to_email)
@@ -3498,6 +3544,14 @@ async def _send_stock_notification_email(
             product_id=product_id, product_name=product_name,
             product_image_url=image_url, product_url=product_url,
         )
+        if product_id:
+            await _clear_fulfilled_interest_alerts(to_email, product_id)
+        else:
+            logger.info(
+                "Nu se poate dezactiva automat alerta pentru %s: interesul nu are product_id "
+                "(probabil introdus manual de staff, fără id de catalog)",
+                to_email,
+            )
         return True
 
     except Exception as e:
