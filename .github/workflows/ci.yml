@@ -59,6 +59,7 @@ jobs:
             scripts/test_gdpr_export_and_delete.py \
             scripts/test_order_confirmation_email.py \
             scripts/test_product_equivalent_matching.py \
+            scripts/test_product_handle_stability_and_search_relevance.py \
             scripts/test_product_seo_fields.py \
             scripts/test_registration_consent.py \
             scripts/test_require_admin_bff_only.py \
