@@ -35,6 +35,7 @@ os.environ.setdefault("DB_NAME", "fake_db_for_import_only")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import mongomock_motor  # noqa: E402
+from starlette.background import BackgroundTasks  # noqa: E402
 from starlette.requests import Request  # noqa: E402
 import server  # noqa: E402
 
@@ -195,7 +196,9 @@ async def scenario_b_update_round_trip():
             "is_featured": False,
         })
         patch = server.ProductUpdate(meta_title="Rulment - piesă originală", meta_description="Rulment de calitate.")
-        updated = await server.admin_update_product("p-update-1", request=make_request(), product_data=patch)
+        updated = await server.admin_update_product(
+            "p-update-1", request=make_request(), product_data=patch, background_tasks=BackgroundTasks(),
+        )
         check("b) update: response has meta_title", updated.meta_title == "Rulment - piesă originală", updated.meta_title)
         check("b) update: response has meta_description", updated.meta_description == "Rulment de calitate.", updated.meta_description)
         check("b) update: unrelated field (price) untouched", updated.price == 10.0, updated.price)
@@ -226,7 +229,7 @@ async def scenario_c_bulk_save_round_trip():
             server.ProductBulkSaveItem(id="p-bulk-1", patch=server.ProductUpdate(meta_title="Piesa A SEO title")),
             server.ProductBulkSaveItem(id="p-bulk-2", patch=server.ProductUpdate(meta_description="Piesa B SEO description")),
         ])
-        result = await server.admin_bulk_save_products(request=make_request(), bulk_data=bulk_data)
+        result = await server.admin_bulk_save_products(request=make_request(), bulk_data=bulk_data, background_tasks=BackgroundTasks())
         check("c) bulk-save: both updated", result["updated"] == 2, result)
         check("c) bulk-save: none not_found", result["not_found"] == [], result)
 

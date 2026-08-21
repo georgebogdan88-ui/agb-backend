@@ -3559,6 +3559,90 @@ async def _send_stock_notification_email(
         return False
 
 
+async def _notify_restocked_customers(product_id: str, product_doc: dict) -> None:
+    """Automatic "back in stock" email fan-out - fires the moment a
+    product's stock crosses 0/None -> >=1 (see the two call sites: the
+    _apply_product_update hook, shared by the single-product PUT and both
+    bulk-edit flavors, and update_single_product's Shopify webhook upsert),
+    with zero manual staff action required. Before this existed, the only
+    way a client with an active stock_alert got emailed was staff manually
+    clicking "Înștiințează client" in CRM's Interese clienți page per
+    client per product (admin_notify_client_interest_email) - this covers
+    the ordinary "we just got more stock in" case automatically instead.
+
+    Looks up every db.customer_interests row of type "stock_alert" for
+    this product_id, resolves each one's user_id -> email/name via
+    db.users, and reuses _send_stock_notification_email per recipient
+    as-is (same Brevo send + in-app notification + auto-clear of the
+    fulfilled interest row - see that function's own docstring) rather
+    than duplicating any of that logic. `product_doc` is the ALREADY-
+    updated product document the caller has at hand (post-write) - no
+    extra re-fetch here.
+
+    Always called via background_tasks.add_task / asyncio.create_task by
+    every caller, never awaited inline - this must never add latency to
+    (or be able to fail) the staff/webhook write that triggered it. Every
+    step is wrapped so one bad row (missing user, bad email, a single
+    Brevo hiccup) can never stop the rest of the batch - same never-raise
+    contract as _clear_fulfilled_interest_alerts."""
+    try:
+        cursor = db.customer_interests.find({"product_id": product_id, "type": "stock_alert"})
+        interests = await cursor.to_list(5000)
+    except Exception as e:  # noqa: BLE001 - best-effort, must never propagate
+        logger.warning(
+            "Restock notify: nu s-au putut citi alertele de stoc pentru produsul %s: %s",
+            product_id, e,
+        )
+        return
+
+    if not interests:
+        return
+
+    product_name = product_doc.get("title") or ""
+    product_code = product_doc.get("sku")
+    price = product_doc.get("price")
+    currency = product_doc.get("currency", "RON")
+    image_url = product_doc.get("image_url")
+
+    sent_count = 0
+    for interest in interests:
+        user_id = interest.get("user_id")
+        if not user_id:
+            continue
+        try:
+            user = await db.users.find_one({"id": user_id}, {"email": 1, "name": 1})
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "Restock notify: nu s-a putut incarca userul %s pentru produsul %s: %s",
+                user_id, product_id, e,
+            )
+            continue
+        if not user or not user.get("email"):
+            continue
+        try:
+            ok = await _send_stock_notification_email(
+                user["email"], user.get("name"), product_name, product_code,
+                price, currency, image_url, product_id=product_id,
+            )
+            if ok:
+                sent_count += 1
+        except Exception as e:  # noqa: BLE001 - one recipient's failure must
+            # never stop the rest of the batch (_send_stock_notification_email
+            # already catches its own errors and returns False, this is a
+            # second layer of defense in case something upstream of it
+            # doesn't).
+            logger.warning(
+                "Restock notify: esec la trimiterea catre %s pentru produsul %s: %s",
+                user.get("email"), product_id, e,
+            )
+            continue
+
+    logger.info(
+        "Restock notify: %d/%d clienti notificati automat pentru produsul %s (%s)",
+        sent_count, len(interests), product_id, product_name,
+    )
+
+
 class StockNotificationEmailRequest(BaseModel):
     to_email: str
     to_name: Optional[str] = None
@@ -5907,11 +5991,24 @@ def _filter_valid_image_urls(images: List[str]) -> List[str]:
     return [u for u in images if isinstance(u, str) and u.startswith(("http://", "https://"))]
 
 
-async def _apply_product_update(product_id: str, product_data: ProductUpdate) -> Optional[dict]:
+async def _apply_product_update(
+    product_id: str,
+    product_data: ProductUpdate,
+    background_tasks: Optional[BackgroundTasks] = None,
+) -> Optional[dict]:
     """Applies a partial ProductUpdate to a single product by id - shared by
     the single-product and bulk update endpoints so the two code paths can't
     silently diverge. Returns the updated document, or None if no product
-    with that id exists (caller decides how to report that)."""
+    with that id exists (caller decides how to report that).
+
+    `background_tasks` is optional (defaults to None) purely so this stays
+    callable from anywhere without forcing every caller to have a
+    request-scoped BackgroundTasks handy - when provided (all three current
+    HTTP callers pass their own), it's used to fire an automatic "back in
+    stock" notification (_notify_restocked_customers) the moment this
+    product's stock crosses 0/None -> >=1 (see the check right before the
+    return below). When absent, the same notification still fires, just via
+    asyncio.create_task instead - never skipped, never awaited inline."""
     existing = await db.shopify_products.find_one({"id": product_id})
     if not existing:
         return None
@@ -5989,13 +6086,31 @@ async def _apply_product_update(product_id: str, product_data: ProductUpdate) ->
     if update_dict:
         await db.shopify_products.update_one({"id": product_id}, {"$set": update_dict})
 
-    return await db.shopify_products.find_one({"id": product_id})
+    updated_doc = await db.shopify_products.find_one({"id": product_id})
+
+    # Automatic "back in stock" notification - fires strictly on the
+    # 0/None -> >=1 transition, never on an ordinary stock increase (e.g.
+    # 5 -> 8 must NOT retrigger). `old_stock` was read from `existing`
+    # BEFORE the write above ran, and `new_stock` comes straight from this
+    # same update_dict (not re-derived from updated_doc), so a request that
+    # doesn't touch `stock` at all can never misfire this.
+    new_stock = update_dict.get("stock")
+    old_stock = existing.get("stock")
+    if updated_doc is not None and new_stock is not None and new_stock >= 1 and (
+        old_stock is None or old_stock <= 0
+    ):
+        if background_tasks is not None:
+            background_tasks.add_task(_notify_restocked_customers, product_id, updated_doc)
+        else:
+            asyncio.create_task(_notify_restocked_customers(product_id, updated_doc))
+
+    return updated_doc
 
 # NOTE: this must stay registered *before* PUT /admin/products/{product_id}
 # below - otherwise Starlette's routing would match "bulk" against the
 # {product_id} path parameter first, since it's a plain string segment.
 @api_router.put("/admin/products/bulk")
-async def admin_bulk_update_products(request: Request, bulk_data: ProductBulkUpdate):
+async def admin_bulk_update_products(request: Request, bulk_data: ProductBulkUpdate, background_tasks: BackgroundTasks):
     """Applies the same partial update to many products at once (e.g. the
     admin product list's Shopify-style bulk-edit), instead of the frontend
     issuing one PUT per product. Ids that don't match any product are
@@ -6011,7 +6126,7 @@ async def admin_bulk_update_products(request: Request, bulk_data: ProductBulkUpd
     updated_count = 0
     not_found: List[str] = []
     for product_id in bulk_data.ids:
-        updated = await _apply_product_update(product_id, bulk_data.patch)
+        updated = await _apply_product_update(product_id, bulk_data.patch, background_tasks)
         if updated is None:
             not_found.append(product_id)
         else:
@@ -6394,7 +6509,7 @@ async def admin_apply_product_equivalents(request: Request, payload: ProductEqui
 # below, otherwise Starlette would match them against the {product_id} path
 # parameter first.
 @api_router.put("/admin/products/bulk-save")
-async def admin_bulk_save_products(request: Request, bulk_data: ProductBulkSave):
+async def admin_bulk_save_products(request: Request, bulk_data: ProductBulkSave, background_tasks: BackgroundTasks):
     """Shopify-style inline grid editor: each selected product carries its
     own distinct patch (product A's price changes to X, product B's to Y,
     etc), unlike /admin/products/bulk which applies one shared patch to many
@@ -6413,7 +6528,7 @@ async def admin_bulk_save_products(request: Request, bulk_data: ProductBulkSave)
     updated_count = 0
     not_found: List[str] = []
     for item in bulk_data.updates:
-        updated = await _apply_product_update(item.id, item.patch)
+        updated = await _apply_product_update(item.id, item.patch, background_tasks)
         if updated is None:
             not_found.append(item.id)
         else:
@@ -6513,7 +6628,7 @@ async def admin_bundle_price_suggestion(payload: BundlePriceSuggestionRequest, r
     return {"suggested_price": round(suggested_total, 2), "breakdown": breakdown}
 
 @api_router.put("/admin/products/{product_id}")
-async def admin_update_product(product_id: str, request: Request, product_data: ProductUpdate):
+async def admin_update_product(product_id: str, request: Request, product_data: ProductUpdate, background_tasks: BackgroundTasks):
     admin = await _require_admin(request)
 
     # Fetched separately (on top of _apply_product_update()'s own internal
@@ -6523,7 +6638,7 @@ async def admin_update_product(product_id: str, request: Request, product_data: 
     if not existing:
         raise HTTPException(status_code=404, detail="Produs inexistent")
 
-    updated = await _apply_product_update(product_id, product_data)
+    updated = await _apply_product_update(product_id, product_data, background_tasks)
     if updated is None:
         raise HTTPException(status_code=404, detail="Produs inexistent")
 
@@ -9812,7 +9927,7 @@ async def update_single_product(shopify_product_id: str):
                 # already set, it's simply left out of `product` below so
                 # the $set doesn't touch it at all.
                 existing_seo = await db.shopify_products.find_one(
-                    {"id": shopify_product_id}, {"meta_title": 1, "meta_description": 1}
+                    {"id": shopify_product_id}, {"meta_title": 1, "meta_description": 1, "stock": 1}
                 )
                 needs_meta_title = not (existing_seo and existing_seo.get("meta_title"))
                 needs_meta_description = not (existing_seo and existing_seo.get("meta_description"))
@@ -9823,13 +9938,28 @@ async def update_single_product(shopify_product_id: str):
                     if needs_meta_description:
                         product["meta_description"] = generated_meta_description
 
+                # Read BEFORE the write below - same 0/None -> >=1 transition
+                # check as _apply_product_update's own hook, for this second,
+                # independent write path into `stock` (this webhook bypasses
+                # _apply_product_update entirely, see its own module notes).
+                old_stock = existing_seo.get("stock") if existing_seo else None
+
                 # Update or insert in database
                 await db.shopify_products.update_one(
                     {"id": shopify_product_id},
                     {"$set": product},
                     upsert=True
                 )
-                
+
+                new_stock = product.get("stock")
+                if new_stock is not None and new_stock >= 1 and (old_stock is None or old_stock <= 0):
+                    # update_single_product itself always runs detached
+                    # (background_tasks.add_task from the webhook endpoint,
+                    # or the sync loop below) - never any HTTP response to
+                    # block - so a plain create_task here is enough to keep
+                    # this fire-and-forget without adding another layer.
+                    asyncio.create_task(_notify_restocked_customers(shopify_product_id, product))
+
                 logger.info(f"Product updated via webhook: {product['title'][:50]}...")
                 return True
             
