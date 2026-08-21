@@ -3402,6 +3402,173 @@ async def admin_send_marketing_email(payload: MarketingEmailRequest, request: Re
     return {"status": "sent"}
 
 
+# ==================== SITE BANNER (webshop homepage announcement) ====================
+# Single-document "singleton" config in db.site_banner, matched by the
+# always-empty filter `{}` (there is deliberately only ever one document in
+# this collection, written exclusively through admin_update_site_banner's
+# upsert below - nothing else ever inserts into it, so there's no id to key
+# on and none is needed). Edited from CRM's Marketing section; read by
+# agb-webshop's homepage on every load via the public GET /banner. Supports
+# both a manual on/off toggle (`active`) AND an optional scheduled window
+# (`starts_at`/`ends_at`) so a "suntem în concediu 1-15 septembrie" banner
+# doesn't require anyone to remember to switch it off by hand - see
+# _banner_is_effectively_active, which is the ONLY place that logic lives;
+# neither the webshop nor CRM should ever re-derive it from the raw dates.
+
+_BANNER_STYLES = {"info", "atentie", "promo"}
+
+
+class BannerUpdate(BaseModel):
+    text: str
+    active: bool
+    starts_at: Optional[datetime] = None
+    ends_at: Optional[datetime] = None
+    style: Optional[str] = "info"
+
+
+def _naive_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    """Normalizes an incoming datetime to naive UTC, matching every other
+    datetime stored in this file (same pattern already used for Shopify's
+    customerAccessToken expiresAt - see its own comment further up). JSON
+    bodies commonly arrive as e.g. JS `Date.toISOString()`, which pydantic
+    parses as timezone-aware UTC; a value with no offset is assumed to
+    already be UTC and is returned unchanged, so naive/aware comparisons
+    elsewhere in this file (all naive) never raise."""
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _banner_is_effectively_active(doc: Optional[dict], now: Optional[datetime] = None) -> bool:
+    """True only when `active` is set AND `now` falls inside the optional
+    [starts_at, ends_at] scheduling window (either bound may be absent,
+    meaning unbounded on that side). Computed fresh on every call - the
+    public GET /banner and the webshop consuming it must never do their own
+    date-window arithmetic, only trust this server-computed result."""
+    if not doc or not doc.get("active"):
+        return False
+    now = now or datetime.utcnow()
+    starts_at = doc.get("starts_at")
+    ends_at = doc.get("ends_at")
+    if starts_at and now < starts_at:
+        return False
+    if ends_at and now > ends_at:
+        return False
+    return True
+
+
+@api_router.get("/banner")
+async def get_site_banner():
+    """Public, unauthenticated - polled by agb-webshop's homepage on every
+    load. Returns {"active": false} whenever there's nothing to show
+    (toggled off, not yet started, or already ended) so the frontend never
+    has to reason about dates itself; when live, also returns `text` and
+    `style`."""
+    doc = await db.site_banner.find_one({})
+    if not _banner_is_effectively_active(doc):
+        return {"active": False}
+    return {
+        "active": True,
+        "text": doc.get("text", ""),
+        "style": doc.get("style") or "info",
+    }
+
+
+@api_router.get("/admin/banner")
+async def admin_get_site_banner(request: Request):
+    """CRM Marketing edit form - always returns the FULL stored state
+    (including while inactive/scheduled/expired), unlike the public GET
+    /banner above which only ever reveals whether it's currently live.
+    `effective_active` is computed the same way as the public endpoint and
+    included purely as a convenience so the CRM UI can show e.g. "Programat"
+    vs "Live acum" without re-implementing the date-window logic itself -
+    it is not a stored field."""
+    await _require_admin(request)
+    doc = await db.site_banner.find_one({})
+    if not doc:
+        return {
+            "text": "",
+            "active": False,
+            "starts_at": None,
+            "ends_at": None,
+            "style": "info",
+            "updated_at": None,
+            "updated_by": None,
+            "effective_active": False,
+        }
+    return {
+        "text": doc.get("text", ""),
+        "active": doc.get("active", False),
+        "starts_at": doc.get("starts_at"),
+        "ends_at": doc.get("ends_at"),
+        "style": doc.get("style") or "info",
+        "updated_at": doc.get("updated_at"),
+        "updated_by": doc.get("updated_by"),
+        "effective_active": _banner_is_effectively_active(doc),
+    }
+
+
+@api_router.put("/admin/banner")
+async def admin_update_site_banner(payload: BannerUpdate, request: Request):
+    """Full-replace update of the single db.site_banner document (upsert on
+    the always-empty `{}` filter - see the section comment above for why
+    that's safe here). The CRM edit form always sends every field together,
+    so this is a full overwrite rather than a partial patch (unlike e.g.
+    ProductUpdate's PATCH-style semantics)."""
+    admin = await _require_admin(request)
+
+    text = (payload.text or "").strip()
+    if len(text) > 500:
+        raise HTTPException(status_code=400, detail="Textul bannerului nu poate depăși 500 de caractere")
+
+    style = payload.style or "info"
+    if style not in _BANNER_STYLES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"style trebuie să fie unul din: {', '.join(sorted(_BANNER_STYLES))}",
+        )
+
+    starts_at = _naive_utc(payload.starts_at)
+    ends_at = _naive_utc(payload.ends_at)
+    if starts_at and ends_at and ends_at < starts_at:
+        raise HTTPException(status_code=400, detail="ends_at nu poate fi înainte de starts_at")
+
+    before_doc = await db.site_banner.find_one({})
+    before = None
+    if before_doc:
+        before = {
+            "text": before_doc.get("text"),
+            "active": before_doc.get("active"),
+            "starts_at": before_doc.get("starts_at"),
+            "ends_at": before_doc.get("ends_at"),
+            "style": before_doc.get("style"),
+        }
+
+    now = datetime.utcnow()
+    update_fields = {
+        "text": text,
+        "active": payload.active,
+        "starts_at": starts_at,
+        "ends_at": ends_at,
+        "style": style,
+        "updated_at": now,
+        "updated_by": admin.get("email"),
+    }
+    await db.site_banner.update_one({}, {"$set": update_fields}, upsert=True)
+
+    await _write_audit_log(
+        request, admin, action="update", resource_type="site_banner", resource_id="site_banner",
+        before=before, after=update_fields,
+    )
+
+    return {
+        **update_fields,
+        "effective_active": _banner_is_effectively_active(update_fields, now),
+    }
+
+
 async def _clear_fulfilled_interest_alerts(to_email: str, product_id: str) -> None:
     """Deactivates the client's own price/stock alert toggle(s) for this
     product once they've actually received the "available now" email -
