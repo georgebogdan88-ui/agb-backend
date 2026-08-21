@@ -103,25 +103,21 @@ async def scenario_a3_no_title_change_leaves_handle_alone():
           updated.get("handle") == "produs-neschimbat", updated.get("handle"))
 
 
-async def scenario_b_search_relevance_promotes_in_stock_across_the_full_result_set():
+async def scenario_b_in_stock_promoted_across_the_full_result_set():
     db = await fresh_db()
-    # 20 supplier_stock, non-matching-title "filler" docs that would occupy
-    # an entire find().skip(0).limit(5) page on their own under the OLD
-    # (sort-after-paginate) behavior, deliberately inserted BEFORE the real
-    # in-stock match so natural/insertion order puts them first.
+    # 20 supplier_stock "filler" docs that would occupy an entire
+    # find().skip(0).limit(5) page on their own under the OLD (sort-after-
+    # paginate) behavior, deliberately inserted BEFORE the real in-stock
+    # match so natural/insertion order puts them first.
     for i in range(20):
         await db.shopify_products.insert_one(base_product(
-            id=f"filler{i}", title=f"Piesa oarecare {i}", title_normalized=f"piesa oarecare {i}",
-            stock=0, stock_status="supplier_stock",
+            id=f"filler{i}", title=f"Cupla rapida oarecare {i}", title_normalized=f"cupla rapida oarecare {i}",
+            stock=0, stock_status="supplier_stock", price=50.0,
         ))
     await db.shopify_products.insert_one(base_product(
         id="target", title="Cupla rapida distribuitor SCV John Deere FASTER",
         title_normalized="cupla rapida distribuitor scv john deere faster",
-        stock=4, stock_status="in_stock",
-    ))
-    await db.shopify_products.insert_one(base_product(
-        id="nomatch-instock", title="Alt produs oarecare in stoc",
-        title_normalized="alt produs oarecare in stoc", stock=9, stock_status="in_stock",
+        stock=4, stock_status="in_stock", price=10.0,
     ))
 
     from fastapi.testclient import TestClient
@@ -130,17 +126,59 @@ async def scenario_b_search_relevance_promotes_in_stock_across_the_full_result_s
     check("b) request succeeds", r.status_code == 200, r.text)
     results = r.json()
     ids = [p["id"] for p in results]
-    check("b) the in-stock title-matching product is on page 1 (limit=5), not buried past 20 fillers",
+    check("b) the in-stock product is on page 1 (limit=5), not buried past 20 supplier_stock fillers",
           "target" in ids, ids)
-    check("b) it's ranked first (title match + in-stock beats the non-matching in-stock product)",
+    check("b) it's ranked first (in_stock tier beats supplier_stock regardless of price)",
           ids[0] == "target" if ids else False, ids)
 
 
-async def scenario_c_relevance_sort_has_id_tiebreaker_for_pagination_stability():
+async def scenario_b2_stock_tier_order_and_price_descending():
+    """George's explicit ordering (2026-08-22): within the search-matched
+    set, group by stock tier first - in_stock, THEN out_of_stock, THEN
+    supplier_stock (deliberately in that order: a supplier-stock order
+    needs an extra special-order step, so a flatly unavailable listing is
+    still more useful to see first than one that just requires more
+    waiting) - and within a tier, higher price first. The price-descending
+    choice is deliberate: OEM/John Deere parts tend to cost more than
+    aftermarket equivalents (Elring, Vapormatic, etc.) for the same code,
+    so this naturally surfaces the OEM listing first on a tie without
+    hardcoding any vendor name (the original report: searching
+    "6068hz480", an Elring seal outranked the John Deere one purely by
+    raw catalog id order under the old text-relevance scheme)."""
+    db = await fresh_db()
+    await db.shopify_products.insert_one(base_product(
+        id="supplier-cheap", title="Piesa test cod", title_normalized="piesa test cod",
+        stock=0, stock_status="supplier_stock", price=500.0,
+    ))
+    await db.shopify_products.insert_one(base_product(
+        id="oos-mid", title="Piesa test cod", title_normalized="piesa test cod",
+        stock=0, stock_status="out_of_stock", price=200.0,
+    ))
+    await db.shopify_products.insert_one(base_product(
+        id="instock-cheap", title="Piesa test cod", title_normalized="piesa test cod",
+        stock=3, stock_status="in_stock", price=80.0,
+    ))
+    await db.shopify_products.insert_one(base_product(
+        id="instock-expensive-oem", title="Piesa test cod John Deere", title_normalized="piesa test cod john deere",
+        stock=1, stock_status="in_stock", price=150.0,
+    ))
+
+    from fastapi.testclient import TestClient
+    with TestClient(server.app) as client:
+        r = client.get("/api/products", params={"search": "test cod", "limit": 10})
+    check("b2) request succeeds", r.status_code == 200, r.text)
+    ids = [p["id"] for p in r.json()]
+    check(
+        "b2) order is: in_stock (price desc) -> out_of_stock -> supplier_stock, regardless of price outliers",
+        ids == ["instock-expensive-oem", "instock-cheap", "oos-mid", "supplier-cheap"],
+        ids,
+    )
+
+
+async def scenario_c_sort_has_id_tiebreaker_for_pagination_stability():
     """Regression guard for the "6150m" duplicate-product report (George,
-    2026-08-21): `_relevance` only takes a handful of coarse bucketed values
-    (0/-1/-5/-6/-10/-11/-15/-16), so huge numbers of real documents tie on
-    it. Mongo does NOT guarantee a stable relative order for ties across two
+    2026-08-21): many real documents can share the same stock tier + price,
+    and Mongo does NOT guarantee a stable relative order for ties across two
     SEPARATE query executions - e.g. the initial SSR page fetch (page.tsx)
     and ProductGridInfinite's later "load more" fetch for the next page are
     two independent aggregate() calls. Without a unique secondary sort key,
@@ -178,7 +216,8 @@ async def scenario_c_relevance_sort_has_id_tiebreaker_for_pagination_stability()
             sort_stages = [s["$sort"] for s in captured_pipelines[0] if "$sort" in s]
             check("c) pipeline has a $sort stage", len(sort_stages) == 1, captured_pipelines[0])
             if sort_stages:
-                check("c) $sort includes _relevance", sort_stages[0].get("_relevance") == 1, sort_stages[0])
+                check("c) $sort orders by _stock_tier first", sort_stages[0].get("_stock_tier") == 1, sort_stages[0])
+                check("c) $sort orders by price descending second", sort_stages[0].get("price") == -1, sort_stages[0])
                 check(
                     "c) $sort has a unique `id` tiebreaker (pagination stability across separate page fetches)",
                     sort_stages[0].get("id") == 1, sort_stages[0],
@@ -191,8 +230,9 @@ async def main():
     await scenario_a_handle_survives_title_edit()
     await scenario_a2_handle_backfilled_only_when_genuinely_missing()
     await scenario_a3_no_title_change_leaves_handle_alone()
-    await scenario_b_search_relevance_promotes_in_stock_across_the_full_result_set()
-    await scenario_c_relevance_sort_has_id_tiebreaker_for_pagination_stability()
+    await scenario_b_in_stock_promoted_across_the_full_result_set()
+    await scenario_b2_stock_tier_order_and_price_descending()
+    await scenario_c_sort_has_id_tiebreaker_for_pagination_stability()
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:

@@ -1981,54 +1981,62 @@ async def get_products(
         query = build_products_query(search, product_type, collection, vendor)
 
         if search and not sort:
-            # Relevance ranking (title match / description match / in-stock)
-            # done via aggregation, BEFORE $skip/$limit - fixed 2026-08-21
-            # (George: searched "cupla rapida", a genuinely in-stock match
-            # showed buried among supplier_stock ones instead of near the
-            # top). The previous version fetched one already-paginated page
-            # with .find().skip().limit() and only re-sorted THAT page in
-            # Python afterward - relevance could never promote a product
-            # across a page boundary, only reshuffle within whichever
-            # arbitrary page Mongo's natural order happened to put it on.
-            # Same weights/semantics as before (title -10, description -5,
-            # in-stock -1, ascending sort = most-relevant first), just
-            # computed in the database before paging instead of after.
+            # Ranking done via aggregation, BEFORE $skip/$limit (so it can
+            # promote/demote a match across a page boundary, not just
+            # reshuffle within whichever arbitrary page Mongo's natural
+            # order happened to put it on).
+            #
+            # Ordering (George, 2026-08-22 - replaces the earlier text-match
+            # "_relevance" scheme from 2026-08-21): every result here already
+            # matched the search term via `query`'s $match below, so within
+            # that matching set, group strictly by stock availability first
+            # (_stock_tier: in_stock=0, out_of_stock=1, supplier_stock=2,
+            # anything else=3 - deliberately out_of_stock BEFORE
+            # supplier_stock, per George's explicit call: a supplier-stock
+            # order takes an extra special-order step, so a truly
+            # unavailable listing is still more useful to see first than
+            # one that just requires more waiting), then by price
+            # descending within each tier. The price-descending choice has
+            # a useful side effect noted at the time: OEM/John Deere parts
+            # tend to cost more than aftermarket equivalents (Elring,
+            # Vapormatic, etc.) for the same code, so this naturally
+            # surfaces the OEM listing first on a tie without hardcoding
+            # any vendor name - this was the original complaint (searched
+            # "6068hz480", an Elring seal outranked the John Deere one for
+            # no reason other than raw catalog id order under the old
+            # scheme).
             search_normalized = normalize_text(search)
             pattern = re.escape(search_normalized)
             cursor = db.shopify_products.aggregate([
                 {"$match": query},
                 {"$addFields": {
-                    "_relevance": {
-                        "$add": [
-                            {"$cond": [
-                                {"$regexMatch": {"input": {"$ifNull": ["$title_normalized", ""]}, "regex": pattern}},
-                                -10, 0,
-                            ]},
-                            {"$cond": [
-                                {"$regexMatch": {"input": {"$ifNull": ["$description_normalized", ""]}, "regex": pattern}},
-                                -5, 0,
-                            ]},
-                            {"$cond": [{"$gt": [{"$ifNull": ["$stock", 0]}, 0]}, -1, 0]},
-                        ]
-                    }
+                    "_stock_tier": {
+                        "$switch": {
+                            "branches": [
+                                {"case": {"$eq": ["$stock_status", "in_stock"]}, "then": 0},
+                                {"case": {"$eq": ["$stock_status", "out_of_stock"]}, "then": 1},
+                                {"case": {"$eq": ["$stock_status", "supplier_stock"]}, "then": 2},
+                            ],
+                            "default": 3,
+                        }
+                    },
                 }},
-                # Tiebreaker on `id` (unique per product) is required, not
-                # cosmetic: `_relevance` only takes a handful of distinct
-                # bucketed values (0/-1/-5/-6/-10/-11/-15/-16), so huge
-                # numbers of documents tie on it. Mongo does NOT guarantee a
-                # stable relative order for ties across separate query
-                # executions - with $skip/$limit pagination split across two
-                # independent aggregate() calls (the initial SSR page fetch,
-                # then ProductGridInfinite's separate "load more" fetch for
-                # the next page), a tied document could resolve to a
-                # different relative position each time and end up
-                # re-fetched on BOTH pages - visibly duplicated in the grid,
-                # since the frontend appends pages without deduping by id
-                # (production report, 2026-08-21: George searched "6150m",
-                # saw "Ambreiaj complet cuplare..." rendered twice). Sorting
-                # ties by `id` too makes the order fully deterministic run to
-                # run, so the same document can never land on two pages.
-                {"$sort": {"_relevance": 1, "id": 1}},
+                # `id` tiebreaker (unique per product) is required, not
+                # cosmetic: many products share the same tier+price, and
+                # Mongo does NOT guarantee a stable relative order for ties
+                # across separate query executions - with $skip/$limit
+                # pagination split across two independent aggregate() calls
+                # (the initial SSR page fetch, then ProductGridInfinite's
+                # separate "load more" fetch for the next page), a tied
+                # document could resolve to a different relative position
+                # each time and end up re-fetched on BOTH pages - visibly
+                # duplicated in the grid, since the frontend appends pages
+                # without deduping by id (production report, 2026-08-21:
+                # George searched "6150m", saw "Ambreiaj complet cuplare..."
+                # rendered twice). Sorting ties by `id` too makes the order
+                # fully deterministic run to run, so the same document can
+                # never land on two pages.
+                {"$sort": {"_stock_tier": 1, "price": -1, "id": 1}},
                 {"$skip": skip},
                 {"$limit": limit},
             ])
