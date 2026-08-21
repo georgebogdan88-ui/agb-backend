@@ -7836,16 +7836,18 @@ def _merged_order_sort_key(entry: dict):
     return datetime.min
 
 
-# ==================== ANALYTICS (sales + traffic/conversion) ====================
+# ==================== ANALYTICS (sales + traffic/conversion + live) ====================
 # Part 1 (sales) is derived entirely from EXISTING order data (db.orders +
 # db.shopify_order_history, via the same native/shopify merge helpers
-# above) - no new tracking needed. Part 2 (traffic/conversion) is brand new:
-# a public pageview beacon fired by agb-webshop
+# above) - no new tracking needed. Part 2 (traffic/conversion, plus "live"
+# further below) is brand new: a public pageview beacon fired by agb-webshop
 # (localStorage `agb_analytics_session_id`, NOT a cookie - matches this
 # app's cookie-less, localStorage-only session architecture) feeding
-# db.analytics_pageviews, plus a best-effort conversion link recorded in
-# create_order (see db.analytics_conversions and OrderCreate.analytics_
-# session_id above). Both admin-aggregation endpoints below are gated the
+# db.analytics_pageviews (also opportunistically tagged with Cloudflare's
+# CF-IPCountry/CF-IPCity edge headers, see track_pageview), plus a
+# best-effort conversion link recorded in create_order (see
+# db.analytics_conversions and OrderCreate.analytics_session_id above). All
+# three admin-aggregation endpoints below (sales/traffic/live) are gated the
 # same way as every other /admin/* route - see _require_admin.
 
 
@@ -8070,14 +8072,25 @@ class PageviewCreate(BaseModel):
 
 
 @api_router.post("/analytics/pageview", status_code=204)
-async def track_pageview(payload: PageviewCreate):
+async def track_pageview(payload: PageviewCreate, request: Request):
     """Public, unauthenticated pageview beacon. Always intended to respond
     fast and never block/break page rendering on the caller's side:
     session_id/path are the only two required fields (fast 400 if either is
     missing/blank after sanitizing, not FastAPI's default 422 page) -
     everything else is best-effort sanitized (length-capped, blank
     normalized to None) rather than strictly validated, and a DB failure is
-    swallowed (logged, not raised) rather than ever surfacing as a 500."""
+    swallowed (logged, not raised) rather than ever surfacing as a 500.
+
+    Also opportunistically captures coarse geolocation from Cloudflare's
+    edge headers (Render puts Cloudflare in front of every *.onrender.com
+    domain, so these should reach this backend on real traffic - NOT yet
+    empirically confirmed post-deploy; see GET /admin/analytics/live, which
+    is what "live traffic" is built on). `request.headers` is
+    case-insensitive (same as the X-Forwarded-For read in _client_ip
+    above), so the exact casing Cloudflare sends doesn't matter. Read
+    defensively: a missing header just yields None here via
+    _sanitize_analytics_field - never raises, never blocks the pageview
+    write on a dev/local request or a proxy that doesn't set it."""
     session_id = _sanitize_analytics_field(payload.session_id)
     path = _sanitize_analytics_field(payload.path)
     if not session_id or not path:
@@ -8091,6 +8104,8 @@ async def track_pageview(payload: PageviewCreate):
         "utm_source": _sanitize_analytics_field(payload.utm_source),
         "utm_medium": _sanitize_analytics_field(payload.utm_medium),
         "utm_campaign": _sanitize_analytics_field(payload.utm_campaign),
+        "country": _sanitize_analytics_field(request.headers.get("cf-ipcountry")),
+        "city": _sanitize_analytics_field(request.headers.get("cf-ipcity")),
         "created_at": datetime.utcnow(),
     }
     try:
@@ -8174,6 +8189,73 @@ async def admin_analytics_traffic(
         "unique_sessions": unique_sessions,
         "conversions": conversions,
         "conversion_rate": conversion_rate,
+    }
+
+
+# "Live" = a session whose LAST pageview happened within this many seconds.
+# No new heartbeat mechanism - reuses the exact same POST /analytics/pageview
+# beacon that already fires on every route change. Deliberate MVP tradeoff:
+# a visitor sitting motionless on one page for longer than this without
+# navigating again silently drops off the list - acceptable per product
+# decision, kept as a named constant so it's trivial to tune later.
+LIVE_SESSION_WINDOW_SECONDS = 5 * 60
+
+
+@api_router.get("/admin/analytics/live")
+async def admin_analytics_live(request: Request):
+    """Sessions currently "live" on the site - see LIVE_SESSION_WINDOW_SECONDS
+    above for the exact definition. One row per distinct session_id with at
+    least one db.analytics_pageviews entry inside the window, each showing
+    that session's MOST RECENT pageview only (path/country/city/last_seen -
+    not the full pageview history), newest activity first.
+
+    Deliberately exposes nothing beyond session_id - that id is a
+    client-generated, localStorage-only UUID (see agb-webshop's
+    analytics.ts) with no link to any user account/email, so this can't be
+    used to identify a specific customer even though it IS enough to tell
+    staff "someone is on /produse/x right now, coming from RO".
+
+    Mongo aggregation: $match the time window, $sort by created_at
+    descending BEFORE $group so each $first accumulator below picks that
+    session's most recent pageview - not an arbitrary one - then $sort the
+    grouped rows by last_seen descending. Reuses the same created_at index
+    as GET /admin/analytics/traffic (see startup_event); no dedicated index
+    needed for a 5-minute window.
+    """
+    await _require_admin(request)
+    now = datetime.utcnow()
+    cutoff = now - timedelta(seconds=LIVE_SESSION_WINDOW_SECONDS)
+
+    pipeline = [
+        {"$match": {"created_at": {"$gte": cutoff}}},
+        {"$sort": {"created_at": -1}},
+        {"$group": {
+            "_id": "$session_id",
+            "path": {"$first": "$path"},
+            "country": {"$first": "$country"},
+            "city": {"$first": "$city"},
+            "last_seen": {"$first": "$created_at"},
+        }},
+        {"$sort": {"last_seen": -1}},
+    ]
+    rows = await db.analytics_pageviews.aggregate(pipeline).to_list(length=None)
+
+    sessions = [
+        {
+            "session_id": row["_id"],
+            "path": row.get("path"),
+            "country": row.get("country"),
+            "city": row.get("city"),
+            "last_seen": row["last_seen"],
+            "seconds_ago": max(0, int((now - row["last_seen"]).total_seconds())),
+        }
+        for row in rows
+    ]
+
+    return {
+        "sessions": sessions,
+        "count": len(sessions),
+        "window_seconds": LIVE_SESSION_WINDOW_SECONDS,
     }
 
 
