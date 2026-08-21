@@ -3155,6 +3155,86 @@ async def _send_order_confirmation_email(order: Order) -> bool:
         return False
 
 
+async def _send_shipping_notification_email(order: Order) -> bool:
+    """Tells the customer their order shipped, with the FAN Courier AWB
+    number - fire-and-forget from admin_update_order_courier (PATCH
+    /admin/orders/{order_id}/courier), the instant staff generates the AWB
+    in agb-crm and it's pushed here (see that endpoint's own docstring).
+    Same Brevo provider/call pattern as _send_order_confirmation_email;
+    also mirrors into an in-app notification like
+    _send_stock_notification_email does, so a logged-in customer sees it
+    on the "Noutăți" bell too, not just by email.
+
+    Before this, the ONLY way a customer learned their order shipped was
+    checking their own account page - staff had been sending AWB numbers
+    manually over WhatsApp/email as a workaround (see GET .../courier-
+    tracking's docstring)."""
+    try:
+        if not BREVO_API_KEY:
+            logger.warning("BREVO_API_KEY not set - skipping shipping notification email for order %s", order.id)
+            return False
+
+        import sib_api_v3_sdk
+
+        configuration = sib_api_v3_sdk.Configuration()
+        configuration.api_key['api-key'] = BREVO_API_KEY
+        api_instance = sib_api_v3_sdk.TransactionalEmailsApi(sib_api_v3_sdk.ApiClient(configuration))
+
+        webshop_public_url = os.environ.get('WEBSHOP_PUBLIC_URL', 'http://localhost:3000').rstrip('/')
+        orders_url = f"{webshop_public_url}/cont/comenzi"
+
+        service_block = (
+            f'<p style="margin: 4px 0;">Serviciu: <strong>{html.escape(order.courier_service)}</strong></p>'
+            if order.courier_service else ""
+        )
+
+        html_content = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif; background-color: #f5f5f5; padding: 20px;">
+            <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 10px; overflow: hidden;">
+                <div style="background-color: #367c2b; padding: 20px; text-align: center;">
+                    <h1 style="color: #ffffff; margin: 0;">🚜 AGB Agroparts</h1>
+                </div>
+                <div style="padding: 30px; text-align: center;">
+                    <h2 style="color: #333;">📦 Comanda ta a fost expediată</h2>
+                    <p style="color: #666; line-height: 1.6;">Comanda <strong>#{html.escape(order.id)}</strong> este pe drum către tine.</p>
+                    <div style="margin: 20px 0; padding: 16px; background-color: #f5f5f5; border-radius: 8px; display: inline-block;">
+                        <p style="margin: 4px 0;">Număr AWB (FAN Courier): <strong>{html.escape(order.courier_awb_number)}</strong></p>
+                        {service_block}
+                    </div>
+                    <p style="color: #666; line-height: 1.6;">Poți urmări livrarea în timp real din contul tău.</p>
+                    <a href="{html.escape(orders_url)}" style="display: inline-block; margin-top: 10px; padding: 12px 28px; background-color: #367c2b; color: #ffffff; text-decoration: none; border-radius: 6px; font-weight: bold;">Urmărește coletul</a>
+                </div>
+                <div style="background-color: #f0f0f0; padding: 15px; text-align: center; font-size: 12px; color: #999;">
+                    <p>AGB Agroparts Solution S.R.L.</p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+
+        send_smtp_email = sib_api_v3_sdk.SendSmtpEmail(
+            to=[{"email": order.customer.email, "name": order.customer.name or order.customer.email}],
+            sender={"email": "noreply@agb-agroparts.ro", "name": "AGB Agroparts"},
+            subject=f"📦 Comanda ta #{order.id} a fost expediată - AGB Agroparts",
+            html_content=html_content
+        )
+
+        api_instance.send_transac_email(send_smtp_email)
+        logger.info(f"Shipping notification email sent to {order.customer.email} for order {order.id}")
+        await _create_user_notification(
+            order.customer.email, "order_shipped",
+            "Comanda ta a fost expediată",
+            f"Comanda #{order.id} este pe drum - AWB {order.courier_awb_number}",
+            product_url=orders_url,
+        )
+        return True
+
+    except Exception as e:
+        logger.error(f"Error sending shipping notification email for order {order.id}: {e}")
+        return False
+
+
 async def _create_user_notification(
     to_email: str,
     notif_type: str,
@@ -6954,6 +7034,7 @@ async def admin_update_order_courier(
     request: Request,
     order_id: str,
     payload: OrderCourierUpdate,
+    background_tasks: BackgroundTasks,
 ):
     """Receives the FAN Courier AWB number for an order once staff generates
     it in agb-crm (fire-and-forget push from CRM's generate_awb - see
@@ -6962,12 +7043,21 @@ async def admin_update_order_courier(
     their own account page (GET /auth/orders/{order_id}/courier-tracking
     below). Same admin-auth pattern as the neighboring PUT
     /admin/orders/{order_id}/items above - no separate mechanism for this
-    one endpoint."""
+    one endpoint.
+
+    Also fires the "your order shipped" email (see
+    _send_shipping_notification_email) - but only the first time an AWB is
+    set for this order (order_doc had none before this call), same
+    once-only guarantee CRM's generate_awb already enforces on its own side
+    (409 if courier_awb_number is already set) - so a stray duplicate push
+    can never re-notify a customer whose order already shipped."""
     admin = await _require_admin(request)
 
     order_doc = await db.orders.find_one({"id": order_id})
     if not order_doc:
         raise HTTPException(status_code=404, detail="Comanda nu a fost găsită")
+
+    is_first_awb = not order_doc.get("courier_awb_number")
 
     update_dict = {
         "courier_awb_number": payload.courier_awb_number,
@@ -6987,6 +7077,10 @@ async def admin_update_order_courier(
 
     updated = await db.orders.find_one({"id": order_id})
     updated.pop("_id", None)
+
+    if is_first_awb:
+        background_tasks.add_task(_send_shipping_notification_email, Order(**updated))
+
     return updated
 
 

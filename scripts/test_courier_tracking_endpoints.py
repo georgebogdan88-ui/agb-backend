@@ -1,9 +1,14 @@
 """
-Focused, standalone check for the 3 new pieces server.py gained for the
+Focused, standalone check for the pieces server.py gained for the
 courier-tracking-link feature:
   - Order.courier_awb_number / Order.courier_service fields (and that they
     flow through GET /auth/orders).
-  - PATCH /admin/orders/{order_id}/courier (admin_update_order_courier).
+  - PATCH /admin/orders/{order_id}/courier (admin_update_order_courier),
+    including that it queues _send_shipping_notification_email exactly
+    once per order (on the first AWB set, never on a repeat push) - see
+    scripts/test_shipping_notification_email.py for the email function's
+    own content/failure-mode coverage, same split as create_order vs.
+    _send_order_confirmation_email in test_order_confirmation_email.py.
   - GET /auth/orders/{order_id}/courier-tracking (get_order_courier_tracking).
 
 Not a pytest suite - mirrors scripts/test_admin_customer_account_lookup.py's
@@ -43,6 +48,7 @@ os.environ.setdefault("DB_NAME", "fake_db_for_import_only")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import mongomock_motor  # noqa: E402
+from starlette.background import BackgroundTasks  # noqa: E402
 from starlette.requests import Request  # noqa: E402
 import server  # noqa: E402
 
@@ -130,7 +136,7 @@ async def scenario_a0_admin_endpoint_actually_requires_auth():
     await fresh_db()
     payload = server.OrderCourierUpdate(courier_awb_number="AWB1")
     try:
-        await server.admin_update_order_courier(make_request(bearer_value=None), "order-x", payload)
+        await server.admin_update_order_courier(make_request(bearer_value=None), "order-x", payload, BackgroundTasks())
         check("a0) missing admin auth rejected", False, "no exception raised")
     except server.HTTPException as e:
         check("a0) missing admin auth -> 401", e.status_code == 401, f"got {e.status_code}")
@@ -142,7 +148,8 @@ async def scenario_a_admin_sets_fields_on_existing_order():
     try:
         await seed_order(db, "order-1", "client@example.com")
         payload = server.OrderCourierUpdate(courier_awb_number="AWB-555", courier_service="Standard")
-        result = await server.admin_update_order_courier(make_request(), "order-1", payload)
+        bt = BackgroundTasks()
+        result = await server.admin_update_order_courier(make_request(), "order-1", payload, bt)
         check("a) response has courier_awb_number", result.get("courier_awb_number") == "AWB-555", result)
         check("a) response has courier_service", result.get("courier_service") == "Standard", result)
 
@@ -154,6 +161,29 @@ async def scenario_a_admin_sets_fields_on_existing_order():
         check("a) audit log entry written", audit is not None, audit)
         if audit:
             check("a) audit log 'after' has the new AWB", audit.get("after", {}).get("courier_awb_number") == "AWB-555", audit)
+
+        queued_funcs = [task.func for task in bt.tasks]
+        check("a) shipping notification email queued (first AWB on this order)",
+              server._send_shipping_notification_email in queued_funcs, queued_funcs)
+    finally:
+        server._require_admin = original
+
+
+async def scenario_a2_no_duplicate_email_when_courier_fields_pushed_again():
+    """A second PATCH against an order that already has an AWB (e.g. a stray
+    retry of CRM's fire-and-forget push) must still update the fields, but
+    must NOT re-queue the shipping email - the customer already got notified
+    once when the order first shipped."""
+    db = await fresh_db()
+    original = patch_require_admin()
+    try:
+        await seed_order(db, "order-1b", "client@example.com", courier_awb_number="AWB-555", courier_service="Standard")
+        payload = server.OrderCourierUpdate(courier_awb_number="AWB-555", courier_service="Standard - Cont Colector")
+        bt = BackgroundTasks()
+        result = await server.admin_update_order_courier(make_request(), "order-1b", payload, bt)
+        check("a2) courier_service still updates on a repeat push",
+              result.get("courier_service") == "Standard - Cont Colector", result)
+        check("a2) shipping notification email NOT re-queued on repeat push", len(bt.tasks) == 0, bt.tasks)
     finally:
         server._require_admin = original
 
@@ -164,7 +194,7 @@ async def scenario_b_admin_courier_service_optional():
     try:
         await seed_order(db, "order-2", "client2@example.com")
         payload = server.OrderCourierUpdate(courier_awb_number="AWB-777")
-        result = await server.admin_update_order_courier(make_request(), "order-2", payload)
+        result = await server.admin_update_order_courier(make_request(), "order-2", payload, BackgroundTasks())
         check("b) courier_service defaults to None when omitted", result.get("courier_service") is None, result)
     finally:
         server._require_admin = original
@@ -176,7 +206,7 @@ async def scenario_c_admin_order_not_found():
     try:
         payload = server.OrderCourierUpdate(courier_awb_number="AWB-1")
         try:
-            await server.admin_update_order_courier(make_request(), "does-not-exist", payload)
+            await server.admin_update_order_courier(make_request(), "does-not-exist", payload, BackgroundTasks())
             check("c) missing order rejected", False, "no exception raised")
         except server.HTTPException as e:
             check("c) missing order -> 404", e.status_code == 404, f"got {e.status_code}")
@@ -319,6 +349,7 @@ async def scenario_l_order_model_defaults_none_for_old_orders():
 async def main():
     await scenario_a0_admin_endpoint_actually_requires_auth()
     await scenario_a_admin_sets_fields_on_existing_order()
+    await scenario_a2_no_duplicate_email_when_courier_fields_pushed_again()
     await scenario_b_admin_courier_service_optional()
     await scenario_c_admin_order_not_found()
     await scenario_d_tracking_no_auth_header()
