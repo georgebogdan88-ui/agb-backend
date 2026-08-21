@@ -1980,25 +1980,50 @@ async def get_products(
 
         query = build_products_query(search, product_type, collection, vendor)
 
-        # Execute query
-        cursor = db.shopify_products.find(query)
-        if sort and sort in SORT_FIELDS:
-            field, direction = SORT_FIELDS[sort]
-            cursor = cursor.sort(field, direction)
-        cursor = cursor.skip(skip).limit(limit)
-        products = await cursor.to_list(limit)
-
-        # Sort by relevance if searching and no explicit sort was requested -
-        # an explicit sort (price/title) takes priority over relevance.
         if search and not sort:
+            # Relevance ranking (title match / description match / in-stock)
+            # done via aggregation, BEFORE $skip/$limit - fixed 2026-08-21
+            # (George: searched "cupla rapida", a genuinely in-stock match
+            # showed buried among supplier_stock ones instead of near the
+            # top). The previous version fetched one already-paginated page
+            # with .find().skip().limit() and only re-sorted THAT page in
+            # Python afterward - relevance could never promote a product
+            # across a page boundary, only reshuffle within whichever
+            # arbitrary page Mongo's natural order happened to put it on.
+            # Same weights/semantics as before (title -10, description -5,
+            # in-stock -1, ascending sort = most-relevant first), just
+            # computed in the database before paging instead of after.
             search_normalized = normalize_text(search)
-            products.sort(
-                key=lambda p: (
-                    -10 if search_normalized in p.get("title_normalized", "") else 0,
-                    -5 if search_normalized in p.get("description_normalized", "") else 0,
-                    -1 if p.get("stock", 0) > 0 else 0
-                )
-            )
+            pattern = re.escape(search_normalized)
+            cursor = db.shopify_products.aggregate([
+                {"$match": query},
+                {"$addFields": {
+                    "_relevance": {
+                        "$add": [
+                            {"$cond": [
+                                {"$regexMatch": {"input": {"$ifNull": ["$title_normalized", ""]}, "regex": pattern}},
+                                -10, 0,
+                            ]},
+                            {"$cond": [
+                                {"$regexMatch": {"input": {"$ifNull": ["$description_normalized", ""]}, "regex": pattern}},
+                                -5, 0,
+                            ]},
+                            {"$cond": [{"$gt": [{"$ifNull": ["$stock", 0]}, 0]}, -1, 0]},
+                        ]
+                    }
+                }},
+                {"$sort": {"_relevance": 1}},
+                {"$skip": skip},
+                {"$limit": limit},
+            ])
+            products = await cursor.to_list(limit)
+        else:
+            cursor = db.shopify_products.find(query)
+            if sort and sort in SORT_FIELDS:
+                field, direction = SORT_FIELDS[sort]
+                cursor = cursor.sort(field, direction)
+            cursor = cursor.skip(skip).limit(limit)
+            products = await cursor.to_list(limit)
 
         return [Product(**apply_cloudflare_rollout(p)) for p in products]
 
@@ -5758,7 +5783,21 @@ async def _apply_product_update(product_id: str, product_data: ProductUpdate) ->
             update_dict["cloudflare_rollout"] = False
     if "title" in update_dict:
         update_dict["title_normalized"] = normalize_text(update_dict["title"])
-        update_dict["handle"] = slugify(update_dict["title"])
+        # `handle` is NOT regenerated here on a title edit (fixed
+        # 2026-08-21 - George: editing a product, then refreshing its own
+        # page, 404'd). It used to be, unconditionally, on every title
+        # change - silently breaking the product's public /produse/{handle}
+        # URL (bookmarks, already-shared links, anything Google indexed)
+        # every time staff edited a title, which defeats the entire point
+        # of today's id->handle migration (stable, meaningful URLs). This is
+        # also the root cause behind the 165 Shopify/local handle mismatches
+        # found earlier today - historical title edits silently drifting the
+        # handle away from what Shopify (and any existing link) still has.
+        # Only backfills `handle` when the product genuinely has none yet
+        # (verified: 0 products currently lack one, but this stays as a
+        # defensive fallback rather than assuming that never changes).
+        if not existing.get("handle"):
+            update_dict["handle"] = slugify(update_dict["title"])
     if "description" in update_dict:
         update_dict["description"] = sanitize_description_html(update_dict["description"])
         update_dict["description_normalized"] = normalize_text(update_dict["description"])
