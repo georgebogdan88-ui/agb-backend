@@ -2268,6 +2268,24 @@ async def find_product_by_id_or_handle(product_id: str, projection: Optional[Dic
         product = await db.shopify_products.find_one({"handle": product_id}, projection)
     return product
 
+
+_STOCK_STATUS_TIER = {"in_stock": 0, "out_of_stock": 1, "supplier_stock": 2}
+
+
+def _stock_sort_key(item: dict) -> tuple:
+    """Same ordering as GET /products' search results (George, 2026-08-22):
+    in_stock first (highest price first within that group - a reasonable
+    proxy for OEM over aftermarket, see build_products_query's own sort
+    stage for the full rationale), then out_of_stock, then supplier_stock,
+    then anything else. Used to sort the small, already-fetched Python
+    lists behind "Posibil să ai nevoie și de" (complementary) and
+    "Echivalente" (equivalents) on the product page - those aren't Mongo
+    aggregations (just a loop of find_one calls over an admin-curated id
+    list), so sorting the resulting list in Python here is simpler than
+    building a second aggregation pipeline for the same handful of items."""
+    tier = _STOCK_STATUS_TIER.get(item.get("stock_status"), 3)
+    return (tier, -(item.get("price") or 0.0))
+
 @api_router.get("/products/{product_id}/complementary")
 async def get_complementary_products(product_id: str):
     """Get complementary and related products.
@@ -2306,6 +2324,7 @@ async def get_complementary_products(product_id: str):
                 "sku": ref_product.get("sku"),
                 "recommended_quantity": 1,
             })
+        complementary.sort(key=_stock_sort_key)
         return {"complementary": complementary, "related": []}
 
     try:
@@ -2517,6 +2536,7 @@ async def get_equivalent_products(product_id: str):
             "vendor": ref_product.get("vendor"),
             "recommended_quantity": 1,
         })
+    equivalents.sort(key=_stock_sort_key)
     return {"equivalents": equivalents}
 
 def parse_metafield_product(node: dict) -> dict:
