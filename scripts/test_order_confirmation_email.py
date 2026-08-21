@@ -96,9 +96,13 @@ def make_order_data(product_id="p1", quantity=2, product_name="Piesă test"):
     # never re-derives it server-side (only price is re-derived), so an item
     # missing it here isn't representative of a real request and was
     # tripping sync_order_to_crm's "denumire" validation on the CRM side.
+    # price: OrderCreate now validates items via OrderItemCreate (security
+    # audit, 2026-08-21), which requires it even though create_order()
+    # overwrites it server-side - a placeholder here is fine since this
+    # script never calls create_order(), only constructs OrderCreate directly.
     return server.OrderCreate(
         session_id="sess-1",
-        items=[{"product_id": product_id, "product_name": product_name, "quantity": quantity}],
+        items=[{"product_id": product_id, "product_name": product_name, "quantity": quantity, "price": 0.0}],
         customer=server.CustomerInfo(
             name="Ion Popescu",
             email="ion@example.com",

@@ -10,7 +10,7 @@ import os
 import logging
 import html
 from pathlib import Path
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, EmailStr
 from typing import List, Optional, Literal, Dict, Deque, Set, Any
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -61,7 +61,11 @@ SHOPIFY_API_VERSION = os.environ.get('SHOPIFY_API_VERSION', '2024-01')
 SHOPIFY_WEBHOOK_SECRET = os.environ.get('SHOPIFY_WEBHOOK_SECRET', '')
 
 # Shopify Admin API OAuth Configuration
-SHOPIFY_CLIENT_ID = os.environ.get('SHOPIFY_CLIENT_ID', '38d338d6b94e38743c88c38ece3b6b21')
+# No hardcoded fallback (security audit, 2026-08-21) - matches
+# SHOPIFY_CLIENT_SECRET's fail-empty pattern below. A real Client ID as a
+# silent default meant an environment that forgot to set this would silently
+# start OAuth flows against the production app instead of failing loudly.
+SHOPIFY_CLIENT_ID = os.environ.get('SHOPIFY_CLIENT_ID', '')
 SHOPIFY_CLIENT_SECRET = os.environ.get('SHOPIFY_CLIENT_SECRET', '')
 SHOPIFY_ADMIN_TOKEN = os.environ.get('SHOPIFY_ADMIN_TOKEN', '')  # Will be set after OAuth
 
@@ -322,6 +326,28 @@ class CustomerInfo(BaseModel):
     company_address_judet: Optional[str] = None
     company_address_cod_postal: Optional[str] = None
 
+# Added 2026-08-21 (security audit) - OrderCreate.items/Order.items were
+# List[dict], which accepts ANY JSON shape (including nested Mongo-operator
+# objects like {"$ne": null}) for product_id/quantity. _get_authoritative_price
+# and _reserve_stock_for_order both pass product_id straight into a
+# db.shopify_products query filter, so an unvalidated dict there is a NoSQL
+# operator-injection path. Mirrors the field shape already used correctly by
+# CartItemCreate above and OrderItemInput (order-editing) elsewhere in this
+# file - Pydantic now rejects anything that doesn't match at the request
+# boundary, before either function ever sees it.
+#
+# product_image is Optional, unlike CartItemCreate/OrderItemInput - checked
+# against the real mobile app contract (agb-shopify/packages/api/src/server/
+# orders.ts) before making this required: mobile's order-creation payload has
+# never included it, only product_id/product_name/quantity/price. Requiring
+# it here would have 422'd every real mobile checkout.
+class OrderItemCreate(BaseModel):
+    product_id: str
+    product_name: str
+    product_image: Optional[str] = None
+    price: float
+    quantity: int
+
 class Order(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     session_id: str
@@ -355,7 +381,7 @@ class Order(BaseModel):
 
 class OrderCreate(BaseModel):
     session_id: str
-    items: List[dict]
+    items: List[OrderItemCreate]
     customer: CustomerInfo
     subtotal: float
     shipping: float = 25.0
@@ -379,7 +405,13 @@ CURRENT_TERMS_VERSION = "2026-08-09"
 
 
 class UserRegister(BaseModel):
-    email: str
+    # EmailStr (security audit, 2026-08-21) - fresh registration input, safe
+    # to require real email format going forward. Deliberately NOT applied to
+    # UserLogin/ShopifyCustomerLogin below: those must keep matching whatever
+    # is already stored for existing accounts (some may predate any format
+    # enforcement, e.g. old Shopify imports), and login's exact-match lookup
+    # isn't the vulnerable path anyway (see ForgotPasswordRequest below).
+    email: EmailStr
     password: str
     name: str
     phone: str
@@ -611,7 +643,14 @@ async def _find_user_by_token(token: str, allow_shopify_access_token: bool = Fal
     When `allow_shopify_access_token` is set, also matches on the user's
     stored Shopify customer access token, matching the handful of endpoints
     (equipment CRUD) that have always accepted either credential type as a
-    bearer token.
+    bearer token - now bounded by `shopify_access_token_expires_at` when
+    present (security audit, 2026-08-21; token itself previously had no TTL
+    at all). Same never-force-expire-existing-sessions philosophy as the
+    native-token migration above: accounts that logged in via the legacy
+    Shopify path before this field existed have no
+    shopify_access_token_expires_at yet, so they're left matching
+    unconditionally rather than getting silently logged out the moment this
+    ships - they'll get a real expiry the next time they log in that way.
     """
     or_clauses = [
         {"tokens": token},
@@ -619,7 +658,14 @@ async def _find_user_by_token(token: str, allow_shopify_access_token: bool = Fal
         {"tokens": {"$elemMatch": {"token": token, "expires_at": {"$gt": datetime.utcnow()}}}},
     ]
     if allow_shopify_access_token:
-        or_clauses.append({"shopify_access_token": token})
+        or_clauses.append({
+            "shopify_access_token": token,
+            "$or": [
+                {"shopify_access_token_expires_at": {"$exists": False}},
+                {"shopify_access_token_expires_at": None},
+                {"shopify_access_token_expires_at": {"$gt": datetime.utcnow()}},
+            ],
+        })
     user = await db.users.find_one({"$or": or_clauses})
     if user and user.get("is_deleted"):
         # A deleted account's session tokens are cleared on deletion (see
@@ -705,6 +751,12 @@ LOGIN_IP_EMAIL_LIMIT, LOGIN_IP_EMAIL_WINDOW_SECONDS = 10, 15 * 60   # 10 / 15 mi
 LOGIN_IP_LIMIT, LOGIN_IP_WINDOW_SECONDS = 30, 15 * 60               # 30 / 15 min per IP (catches email-rotation)
 REGISTER_IP_LIMIT, REGISTER_IP_WINDOW_SECONDS = 5, 60 * 60          # 5 / hour per IP
 FORGOT_PASSWORD_IP_LIMIT, FORGOT_PASSWORD_IP_WINDOW_SECONDS = 5, 60 * 60  # 5 / hour per IP
+# Added 2026-08-21 (security audit) - every sibling auth endpoint
+# (register/login/forgot-password) rate-limits before doing anything;
+# reset-password was the one gap. The reset token itself is a
+# secrets.token_urlsafe(32) (effectively unguessable), so this is
+# defense-in-depth rather than the primary protection.
+RESET_PASSWORD_IP_LIMIT, RESET_PASSWORD_IP_WINDOW_SECONDS = 10, 15 * 60  # 10 / 15 min per IP
 ADMIN_ACTION_LIMIT, ADMIN_ACTION_WINDOW_SECONDS = 10, 60 * 60       # 10 / hour per admin, per protected action
 ACCOUNT_DELETE_LIMIT, ACCOUNT_DELETE_WINDOW_SECONDS = 5, 15 * 60    # 5 / 15 min per account (password re-check)
 
@@ -3438,17 +3490,22 @@ async def create_order(order_data: OrderCreate, request: Request, background_tas
             discount_percent = current_user.get("b2b_discount_percent")
 
     for item in order_data.items:
-        item["price"] = await _get_authoritative_price(item.get("product_id"), discount_percent)
-    order_data.subtotal = sum(item["price"] * item.get("quantity", 1) for item in order_data.items)
+        item.price = await _get_authoritative_price(item.product_id, discount_percent)
+    order_data.subtotal = sum(item.price * item.quantity for item in order_data.items)
     order_data.shipping = 25.0
     order_data.total = order_data.subtotal + order_data.shipping
+    # order_data.dict() recursively converts the now-validated
+    # List[OrderItemCreate] into plain List[dict] too - reused for both the
+    # stock check below and the Order(...) construction so items are only
+    # converted once.
+    order_dict = order_data.dict()
     # Atomic check-and-decrement of stock for every line item, all-or-
     # nothing across the whole order - must happen after pricing (so a bad
     # product_id already 400'd via _get_authoritative_price above) and
     # before the order is actually persisted, so a rejected order never
     # gets written to db.orders at all.
-    await _reserve_stock_for_order(order_data.items)
-    order = Order(**order_data.dict())
+    await _reserve_stock_for_order(order_dict["items"])
+    order = Order(**order_dict)
     await db.orders.insert_one(order.dict())
     await db.cart.delete_many({"session_id": order_data.session_id})
 
@@ -3812,7 +3869,11 @@ async def register_user(user_data: UserRegister, background_tasks: BackgroundTas
     }
 
 class ForgotPasswordRequest(BaseModel):
-    email: str
+    # EmailStr (security audit, 2026-08-21) - this specific email value gets
+    # forwarded into an outbound Shopify Admin API search query
+    # (_find_shopify_customer_by_email below) - a plain str let
+    # search-syntax/query-breaking characters through unvalidated.
+    email: EmailStr
 
 class ResetPasswordRequest(BaseModel):
     token: str
@@ -3892,7 +3953,12 @@ async def _find_shopify_customer_by_email(email: str) -> Optional[dict]:
         return None
     store = os.environ.get('SHOPIFY_STORE', '43ca3c-3.myshopify.com')
     headers = {"Content-Type": "application/json", "X-Shopify-Access-Token": admin_token}
-    search_url = f"https://{store}/admin/api/{SHOPIFY_ADMIN_API_VERSION}/customers/search.json?query=email:{email}"
+    # URL-encoded (security audit, 2026-08-21) - defense in depth alongside
+    # ForgotPasswordRequest now requiring EmailStr: without this, an
+    # unencoded email could carry Shopify search-query syntax
+    # (AND/OR/wildcards) straight into this outbound query.
+    from urllib.parse import quote
+    search_url = f"https://{store}/admin/api/{SHOPIFY_ADMIN_API_VERSION}/customers/search.json?query=email:{quote(email, safe='')}"
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(search_url, headers=headers, timeout=15.0)
@@ -3965,8 +4031,12 @@ async def forgot_password(request: ForgotPasswordRequest, http_request: Request)
 
 
 @api_router.post("/auth/reset-password")
-async def reset_password(request: ResetPasswordRequest):
+async def reset_password(request: ResetPasswordRequest, http_request: Request):
     """Consume a reset token minted by /auth/forgot-password and set a new password."""
+    _enforce_rate_limit(
+        f"reset-password:ip:{_client_ip(http_request)}", RESET_PASSWORD_IP_LIMIT, RESET_PASSWORD_IP_WINDOW_SECONDS,
+        "Prea multe încercări. Încearcă din nou mai târziu.",
+    )
     if len(request.new_password) < 6:
         raise HTTPException(status_code=400, detail="Parola trebuie să aibă minim 6 caractere")
 
@@ -3982,89 +4052,20 @@ async def reset_password(request: ResetPasswordRequest):
     # (all devices get logged out and must sign in again with the new
     # password) - this endpoint never hands the caller a fresh session token
     # to keep using, so there's no "device" to preserve here anyway.
+    # shopify_access_token unset alongside tokens[] (security audit,
+    # 2026-08-21) - same reasoning as /auth/logout-all: it's an equally-valid
+    # bearer credential for equipment/order-history/favorites and must not
+    # survive a "someone reset my password" event.
     await db.users.update_one(
         {"id": user["id"]},
         {
             "$set": {"password_hash": await hash_password(request.new_password), "tokens": []},
-            "$unset": {"reset_token": "", "reset_token_expires": "", "token": ""},
+            "$unset": {"reset_token": "", "reset_token_expires": "", "token": "", "shopify_access_token": "", "shopify_access_token_expires_at": ""},
         }
     )
 
     return {"message": "Parola a fost schimbată cu succes"}
 
-
-@api_router.get("/reset-password", response_class=HTMLResponse)
-async def reset_password_page(token: str = ""):
-    """Minimal, self-contained password reset form. No separate web frontend
-    exists yet for the future storefront, so this is served directly by the
-    API — same idiom as /privacy-policy below."""
-    html_content = f"""
-    <!DOCTYPE html>
-    <html lang="ro">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Resetare parolă - AGB Agroparts</title>
-        <style>
-            body {{ font-family: Arial, sans-serif; max-width: 420px; margin: 60px auto; padding: 20px; }}
-            h1 {{ color: #367c2b; font-size: 22px; }}
-            label {{ display: block; margin-top: 16px; color: #333; font-size: 14px; }}
-            input {{ width: 100%; padding: 10px; margin-top: 6px; border: 1px solid #ccc; border-radius: 6px; box-sizing: border-box; }}
-            button {{ margin-top: 24px; width: 100%; background-color: #367c2b; color: #fff; border: none; padding: 12px; border-radius: 6px; font-size: 15px; cursor: pointer; }}
-            #message {{ margin-top: 16px; font-size: 14px; }}
-            .error {{ color: #b00020; }}
-            .success {{ color: #367c2b; }}
-        </style>
-    </head>
-    <body>
-        <h1>🚜 Resetare parolă</h1>
-        <form id="reset-form">
-            <label for="password">Parolă nouă</label>
-            <input type="password" id="password" minlength="6" required>
-            <label for="confirm">Confirmă parola</label>
-            <input type="password" id="confirm" minlength="6" required>
-            <button type="submit">Schimbă parola</button>
-        </form>
-        <div id="message"></div>
-        <script>
-            const token = {token!r};
-            const form = document.getElementById('reset-form');
-            const messageEl = document.getElementById('message');
-            form.addEventListener('submit', async (e) => {{
-                e.preventDefault();
-                const password = document.getElementById('password').value;
-                const confirm = document.getElementById('confirm').value;
-                messageEl.className = '';
-                if (password !== confirm) {{
-                    messageEl.textContent = 'Parolele nu coincid.';
-                    messageEl.className = 'error';
-                    return;
-                }}
-                try {{
-                    const resp = await fetch('/api/auth/reset-password', {{
-                        method: 'POST',
-                        headers: {{ 'Content-Type': 'application/json' }},
-                        body: JSON.stringify({{ token: token, new_password: password }})
-                    }});
-                    const data = await resp.json();
-                    if (resp.ok) {{
-                        messageEl.textContent = data.message;
-                        messageEl.className = 'success';
-                        form.style.display = 'none';
-                    }} else {{
-                        messageEl.textContent = data.detail || 'A apărut o eroare.';
-                        messageEl.className = 'error';
-                    }}
-                }} catch (err) {{
-                    messageEl.textContent = 'A apărut o eroare de rețea.';
-                    messageEl.className = 'error';
-                }}
-            }});
-        </script>
-    </body>
-    </html>
-    """
-    return HTMLResponse(content=html_content)
 
 async def _legacy_shopify_login_and_migrate(email: str, password: str, existing_user: Optional[dict]) -> dict:
     """Fallback path for accounts created before local auth existed (or any
@@ -4103,10 +4104,14 @@ async def _legacy_shopify_login_and_migrate(email: str, password: str, existing_
         )
 
         data = response.json()
-        logger.info(f"Shopify customer login response: {data}")
-
         result = data.get("data", {}).get("customerAccessTokenCreate", {})
         errors = result.get("customerUserErrors", [])
+        # Never log `data` itself - customerAccessToken.accessToken inside it
+        # is a live, long-lived bearer credential (security audit, 2026-08-21).
+        logger.info(
+            "Shopify customer login attempt: errors=%s, got_token=%s",
+            bool(errors), bool(result.get("customerAccessToken", {}).get("accessToken")),
+        )
 
         if errors:
             raise HTTPException(status_code=401, detail="Email sau parolă incorectă")
@@ -4116,6 +4121,22 @@ async def _legacy_shopify_login_and_migrate(email: str, password: str, existing_
             raise HTTPException(status_code=401, detail="Email sau parolă incorectă")
 
         shopify_access_token = customer_token.get("accessToken")
+        # Persisted below and checked in _find_user_by_token (security audit,
+        # 2026-08-21) - previously only the raw token was stored, with no
+        # expiry, so a leaked value stayed valid forever. Shopify already
+        # returns this in the mutation above; it just wasn't being read.
+        shopify_access_token_expires_at = None
+        raw_expires_at = customer_token.get("expiresAt")
+        if raw_expires_at:
+            try:
+                # Stripped to naive UTC (tzinfo=None) - every other
+                # expires_at/datetime.utcnow() comparison in this file is
+                # naive; mixing aware and naive datetimes raises TypeError.
+                shopify_access_token_expires_at = datetime.fromisoformat(
+                    raw_expires_at.replace("Z", "+00:00")
+                ).astimezone(timezone.utc).replace(tzinfo=None)
+            except ValueError:
+                logger.warning("Unparseable Shopify customerAccessToken expiresAt: %r", raw_expires_at)
 
     # Get customer details from Shopify
     customer_query = """
@@ -4190,6 +4211,7 @@ async def _legacy_shopify_login_and_migrate(email: str, password: str, existing_
         "is_shopify_customer": True,
         "shopify_customer_id": shopify_customer_id,
         "shopify_access_token": shopify_access_token,
+        "shopify_access_token_expires_at": shopify_access_token_expires_at,
         "updated_at": datetime.utcnow()
     }
 
@@ -4705,6 +4727,7 @@ async def delete_current_user_account(request: Request, delete_data: AccountDele
                 # are dropped too - no reason to keep advertising this
                 # (now-anonymized) account as Shopify-linked.
                 "shopify_access_token": None,
+                "shopify_access_token_expires_at": None,
                 "shopify_customer_id": None,
                 "is_shopify_customer": False,
                 # Equipment (machine serial/model records) has no
@@ -4758,6 +4781,17 @@ async def logout_user(request: Request):
             {"token": token},
             {"$unset": {"token": ""}}
         )
+        # Same idempotent, no-lookup pattern as the two steps above, for the
+        # case where the token being logged out IS a Shopify customer
+        # access token (security audit, 2026-08-21) - _find_user_by_token
+        # (allow_shopify_access_token=True) accepts it as an equally-valid
+        # bearer credential for equipment/order-history/favorites, so
+        # leaving it live after logout would mean "log out" only actually
+        # revoked a native session, never a Shopify-credentialed one.
+        await db.users.update_one(
+            {"shopify_access_token": token},
+            {"$unset": {"shopify_access_token": "", "shopify_access_token_expires_at": ""}},
+        )
     return {"message": "Deconectat cu succes"}
 
 
@@ -4779,7 +4813,12 @@ async def logout_all_devices(request: Request):
 
     await db.users.update_one(
         {"id": user["id"]},
-        {"$set": {"tokens": []}, "$unset": {"token": ""}},
+        # shopify_access_token unset alongside tokens[] (security audit,
+        # 2026-08-21) - it's an equally-valid bearer credential for
+        # equipment/order-history/favorites (_find_user_by_token,
+        # allow_shopify_access_token=True), so "log out everywhere" must
+        # revoke it too, not just native sessions.
+        {"$set": {"tokens": []}, "$unset": {"token": "", "shopify_access_token": "", "shopify_access_token_expires_at": ""}},
     )
     return {"message": "Toate sesiunile au fost deconectate cu succes"}
 
@@ -8395,7 +8434,10 @@ async def get_shopify_customer_notes(user_email: str) -> str:
         }
         
         # Use REST API for customer search - more reliable
-        search_url = f"https://{store}/admin/api/2024-01/customers/search.json?query=email:{user_email}"
+        # URL-encoded (security audit, 2026-08-21) - same reasoning as
+        # _find_shopify_customer_by_email above.
+        from urllib.parse import quote
+        search_url = f"https://{store}/admin/api/2024-01/customers/search.json?query=email:{quote(user_email, safe='')}"
         logger.info(f"Shopify search URL: {search_url}")
         
         async with httpx.AsyncClient() as client:
@@ -9634,259 +9676,6 @@ async def shopify_oauth_start(request: Request):
     """
     
     return HTMLResponse(content=html_content)
-
-# DISABLED - Using the callback at the end of the file instead
-# @api_router.get("/shopify/callback")
-async def shopify_oauth_callback_OLD(
-    code: Optional[str] = None,
-    shop: Optional[str] = None,
-    error: Optional[str] = None,
-    error_description: Optional[str] = None
-):
-    """DISABLED - Handle Shopify OAuth callback - exchange code for access token"""
-    
-    if error:
-        logger.error(f"Shopify OAuth error: {error} - {error_description}")
-        return HTMLResponse(content=f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Eroare - AGB Agroparts</title>
-            <style>
-                body {{
-                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                    display: flex;
-                    justify-content: center;
-                    align-items: center;
-                    min-height: 100vh;
-                    background: #f5f5f5;
-                }}
-                .container {{
-                    text-align: center;
-                    background: white;
-                    padding: 40px;
-                    border-radius: 10px;
-                    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-                    max-width: 500px;
-                }}
-                h1 {{ color: #d32f2f; }}
-                .error {{ color: #666; }}
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <h1>❌ Eroare OAuth</h1>
-                <p class="error">{error}: {error_description}</p>
-                <p><a href="/api/shopify/auth">Încearcă din nou</a></p>
-            </div>
-        </body>
-        </html>
-        """, status_code=400)
-    
-    if not code:
-        logger.error("No authorization code received")
-        return HTMLResponse(content="""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Eroare - AGB Agroparts</title>
-            <style>
-                body {
-                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                    display: flex;
-                    justify-content: center;
-                    align-items: center;
-                    min-height: 100vh;
-                    background: #f5f5f5;
-                }
-                .container {
-                    text-align: center;
-                    background: white;
-                    padding: 40px;
-                    border-radius: 10px;
-                    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-                }
-                h1 { color: #d32f2f; }
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <h1>❌ Eroare</h1>
-                <p>Nu s-a primit codul de autorizare de la Shopify.</p>
-                <p><a href="/api/shopify/auth">Încearcă din nou</a></p>
-            </div>
-        </body>
-        </html>
-        """, status_code=400)
-    
-    # Exchange code for access token
-    shop_domain = shop or SHOPIFY_STORE.replace('.myshopify.com', '')
-    if '.myshopify.com' in shop_domain:
-        shop_domain = shop_domain.replace('.myshopify.com', '')
-    
-    token_url = f"https://{shop_domain}.myshopify.com/admin/oauth/access_token"
-    
-    payload = {
-        "client_id": SHOPIFY_CLIENT_ID,
-        "client_secret": SHOPIFY_CLIENT_SECRET,
-        "code": code
-    }
-    
-    try:
-        async with httpx.AsyncClient() as client:
-            # IMPORTANT: Shopify requires form-urlencoded data, NOT JSON!
-            response = await client.post(token_url, data=payload, timeout=30.0)
-            
-            logger.info(f"Token exchange response status: {response.status_code}")
-            logger.info(f"Token exchange response: {response.text}")
-            
-            if response.status_code != 200:
-                return HTMLResponse(content=f"""
-                <!DOCTYPE html>
-                <html>
-                <head>
-                    <title>Eroare - AGB Agroparts</title>
-                    <style>
-                        body {{
-                            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                            display: flex;
-                            justify-content: center;
-                            align-items: center;
-                            min-height: 100vh;
-                            background: #f5f5f5;
-                        }}
-                        .container {{
-                            text-align: center;
-                            background: white;
-                            padding: 40px;
-                            border-radius: 10px;
-                            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-                            max-width: 600px;
-                        }}
-                        h1 {{ color: #d32f2f; }}
-                        pre {{ background: #f5f5f5; padding: 10px; border-radius: 5px; overflow-x: auto; }}
-                    </style>
-                </head>
-                <body>
-                    <div class="container">
-                        <h1>❌ Eroare la obținerea tokenului</h1>
-                        <p>Status: {response.status_code}</p>
-                        <pre>{response.text}</pre>
-                        <p><a href="/api/shopify/auth">Încearcă din nou</a></p>
-                    </div>
-                </body>
-                </html>
-                """, status_code=400)
-            
-            data = response.json()
-            access_token = data.get("access_token")
-            scopes = data.get("scope", "")
-            
-            if not access_token:
-                return HTMLResponse(content="""
-                <!DOCTYPE html>
-                <html>
-                <head>
-                    <title>Eroare - AGB Agroparts</title>
-                </head>
-                <body>
-                    <h1>❌ Nu s-a primit token-ul de acces</h1>
-                    <p><a href="/api/shopify/auth">Încearcă din nou</a></p>
-                </body>
-                </html>
-                """, status_code=400)
-            
-            # Save token to database
-            await save_shopify_admin_token(access_token, scopes)
-            
-            # Show success page
-            return HTMLResponse(content=f"""
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <title>Succes! - AGB Agroparts</title>
-                <style>
-                    body {{
-                        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                        display: flex;
-                        justify-content: center;
-                        align-items: center;
-                        min-height: 100vh;
-                        background: linear-gradient(135deg, #e8f5e9 0%, #c8e6c9 100%);
-                    }}
-                    .container {{
-                        text-align: center;
-                        background: white;
-                        padding: 40px 60px;
-                        border-radius: 15px;
-                        box-shadow: 0 4px 20px rgba(0,0,0,0.15);
-                        max-width: 500px;
-                    }}
-                    h1 {{ color: #367c2b; }}
-                    .success-icon {{ font-size: 60px; margin-bottom: 20px; }}
-                    .scopes {{ 
-                        background: #f5f5f5; 
-                        padding: 15px; 
-                        border-radius: 8px; 
-                        margin: 20px 0;
-                        text-align: left;
-                    }}
-                    .scopes strong {{ color: #367c2b; }}
-                    p {{ color: #555; line-height: 1.6; }}
-                </style>
-            </head>
-            <body>
-                <div class="container">
-                    <div class="success-icon">✅</div>
-                    <h1>Conectare reușită!</h1>
-                    <p>Aplicația AGB Agroparts a fost conectată cu succes la magazinul tău Shopify.</p>
-                    <div class="scopes">
-                        <strong>Permisiuni acordate:</strong><br>
-                        {scopes.replace(',', ', ')}
-                    </div>
-                    <p>Acum comenzile plasate în aplicație vor apărea în panoul tău Shopify!</p>
-                    <p style="margin-top: 30px; font-size: 14px; color: #888;">
-                        Poți închide această fereastră.
-                    </p>
-                </div>
-            </body>
-            </html>
-            """)
-            
-    except Exception as e:
-        logger.error(f"OAuth callback error: {e}")
-        return HTMLResponse(content=f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Eroare - AGB Agroparts</title>
-            <style>
-                body {{
-                    font-family: Arial, sans-serif;
-                    display: flex;
-                    justify-content: center;
-                    align-items: center;
-                    min-height: 100vh;
-                    background: #f5f5f5;
-                }}
-                .container {{
-                    text-align: center;
-                    background: white;
-                    padding: 40px;
-                    border-radius: 10px;
-                }}
-                h1 {{ color: #d32f2f; }}
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <h1>❌ Eroare</h1>
-                <p>A apărut o eroare: {str(e)}</p>
-                <p><a href="/api/shopify/auth">Încearcă din nou</a></p>
-            </div>
-        </body>
-        </html>
-        """, status_code=500)
 
 @api_router.get("/shopify/status")
 async def get_shopify_oauth_status():
