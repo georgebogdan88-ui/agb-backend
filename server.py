@@ -1,5 +1,5 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Query, BackgroundTasks, Request, UploadFile, File, Form, Body
-from fastapi.responses import HTMLResponse, FileResponse, Response, RedirectResponse
+from fastapi.responses import HTMLResponse, FileResponse, Response, RedirectResponse, JSONResponse
 from fastapi.encoders import jsonable_encoder
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
@@ -4164,19 +4164,30 @@ async def _legacy_shopify_login_and_migrate(email: str, password: str, existing_
         )
 
         data = response.json()
-        result = data.get("data", {}).get("customerAccessTokenCreate", {})
+        # `or {}` at each level: Shopify sets "customerAccessToken" to an
+        # explicit `null` (not an absent key) whenever customerUserErrors is
+        # populated (e.g. wrong password) - dict.get(key, default) only
+        # falls back to `default` when the key is ABSENT, not when it's
+        # present with value None, so a bare `.get(key, {})` still crashes
+        # with AttributeError on every wrong-password attempt for accounts
+        # without a local password hash (production incident, 2026-08-21 -
+        # George: login showed "Nu s-a putut contacta serverul" instead of
+        # "Email sau parolă incorectă", because the unhandled 500 this threw
+        # has no CORS headers - see build_products_query's fix above for the
+        # same underlying dict.get pitfall).
+        result = (data.get("data") or {}).get("customerAccessTokenCreate") or {}
         errors = result.get("customerUserErrors", [])
         # Never log `data` itself - customerAccessToken.accessToken inside it
         # is a live, long-lived bearer credential (security audit, 2026-08-21).
         logger.info(
             "Shopify customer login attempt: errors=%s, got_token=%s",
-            bool(errors), bool(result.get("customerAccessToken", {}).get("accessToken")),
+            bool(errors), bool((result.get("customerAccessToken") or {}).get("accessToken")),
         )
 
         if errors:
             raise HTTPException(status_code=401, detail="Email sau parolă incorectă")
 
-        customer_token = result.get("customerAccessToken", {})
+        customer_token = result.get("customerAccessToken") or {}
         if not customer_token or not customer_token.get("accessToken"):
             raise HTTPException(status_code=401, detail="Email sau parolă incorectă")
 
@@ -4245,7 +4256,7 @@ async def _legacy_shopify_login_and_migrate(email: str, password: str, existing_
         )
 
         customer_data = response.json()
-        customer = customer_data.get("data", {}).get("customer")
+        customer = (customer_data.get("data") or {}).get("customer")
 
         if not customer:
             raise HTTPException(status_code=401, detail="Nu s-au putut obține datele contului")
@@ -9961,6 +9972,34 @@ app.add_middleware(
     # GET /auth/me/export's suggested-filename download to actually work.
     expose_headers=["Content-Disposition"],
 )
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception):
+    """Any exception NOT already handled as an HTTPException reaches here
+    instead of Starlette's default ServerErrorMiddleware - which sits
+    OUTSIDE CORSMiddleware in the ASGI stack (added before user middleware,
+    see Starlette's build_middleware_stack) and so returns its bare 500
+    with NO CORS headers at all. The browser then blocks the webshop/app's
+    fetch() from ever reading that response - indistinguishable, from
+    fetch()'s point of view, from the backend being completely unreachable
+    (production incident, 2026-08-21: a bug deep in the legacy-Shopify
+    login fallback crashed with an AttributeError, and every affected user
+    saw "Nu s-a putut contacta serverul" instead of any real message, login
+    or not - see _legacy_shopify_login_and_migrate's fix above for that
+    specific bug). Registering a handler for the base Exception class makes
+    FastAPI's ExceptionMiddleware (which DOES sit inside CORSMiddleware)
+    catch it and return this response normally instead of re-raising past
+    CORSMiddleware - so from here on, ANY future unhandled crash still at
+    least reaches the client as a real, CORS-visible 500 rather than a
+    silent connection failure. Sentry still captures the original exception
+    either way (its Starlette/FastAPI integration instruments at the ASGI
+    level, independent of this handler)."""
+    logger.error(f"Unhandled exception on {request.method} {request.url.path}: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "A apărut o eroare neașteptată pe server. Încearcă din nou."},
+    )
 
 # ==================== AUTO-SYNC BACKGROUND TASK ====================
 
