@@ -757,6 +757,17 @@ FORGOT_PASSWORD_IP_LIMIT, FORGOT_PASSWORD_IP_WINDOW_SECONDS = 5, 60 * 60  # 5 / 
 # secrets.token_urlsafe(32) (effectively unguessable), so this is
 # defense-in-depth rather than the primary protection.
 RESET_PASSWORD_IP_LIMIT, RESET_PASSWORD_IP_WINDOW_SECONDS = 10, 15 * 60  # 10 / 15 min per IP
+# Added 2026-08-21 (security audit) - login:ip:* and login:ip-email:* above
+# are both keyed by IP, so a distributed attacker rotating source IPs (or
+# spoofing X-Forwarded-For before the fix above) could stay under both
+# buckets indefinitely while still hammering ONE target account across many
+# IPs. This bucket is per-EMAIL only, IP-independent, closing that gap - but
+# deliberately soft (added delay, never an outright 429/lockout, see
+# _soft_throttle_account_login below): a hard per-account block would let
+# anyone who merely knows a customer's email address lock them out on
+# purpose, which is worse than the gap it would close.
+ACCOUNT_LOGIN_SOFT_LIMIT, ACCOUNT_LOGIN_SOFT_WINDOW_SECONDS = 20, 60 * 60  # 20 / hour per account, IP-independent
+ACCOUNT_LOGIN_SOFT_MAX_DELAY_SECONDS = 4  # cap so a legitimate owner is never stuck waiting long
 ADMIN_ACTION_LIMIT, ADMIN_ACTION_WINDOW_SECONDS = 10, 60 * 60       # 10 / hour per admin, per protected action
 ACCOUNT_DELETE_LIMIT, ACCOUNT_DELETE_WINDOW_SECONDS = 5, 15 * 60    # 5 / 15 min per account (password re-check)
 
@@ -771,10 +782,21 @@ def _client_ip(request: Request) -> str:
     singled out) or, worse, a limit shared by every real user at once. This
     reads X-Forwarded-For directly instead and only falls back to
     request.client.host when there's no such header (e.g. local dev with
-    no proxy in front)."""
+    no proxy in front).
+
+    Reads the LAST entry, not the first (security audit, 2026-08-21 -
+    previously read index 0, which is exactly wrong here). Render does not
+    strip/replace a client-supplied X-Forwarded-For - it APPENDS its own
+    observed connecting IP to whatever the client already sent. Confirmed
+    empirically against the live production backend: with a spoofed
+    X-Forwarded-For rotated on every request, 7/7 requests to the 5/hour
+    forgot-password limit succeeded (no 429 ever); with no spoofed header,
+    the 6th and 7th correctly 429'd. So position 0 is client-controlled and
+    unusable for this; the last entry is the one Render itself appended,
+    which a client cannot influence."""
     forwarded = request.headers.get("x-forwarded-for")
     if forwarded:
-        return forwarded.split(",")[0].strip()
+        return forwarded.split(",")[-1].strip()
     return request.client.host if request.client else "unknown"
 
 
@@ -789,6 +811,19 @@ def _enforce_rate_limit(key: str, limit: int, window_seconds: float, message: st
             detail=message,
             headers={"Retry-After": str(retry_after)},
         )
+
+
+async def _soft_throttle_account_login(email: str) -> None:
+    """IP-independent per-account login throttle (security audit,
+    2026-08-21) - see ACCOUNT_LOGIN_SOFT_LIMIT above for why this delays
+    instead of blocking. Called BEFORE password verification, same as the
+    IP-keyed buckets, so the added latency itself (not just an eventual
+    429) is what slows down a distributed guessing attempt."""
+    retry_after = _rate_limiter.hit(
+        f"login:account-soft:{email}", ACCOUNT_LOGIN_SOFT_LIMIT, ACCOUNT_LOGIN_SOFT_WINDOW_SECONDS,
+    )
+    if retry_after is not None:
+        await asyncio.sleep(min(retry_after, ACCOUNT_LOGIN_SOFT_MAX_DELAY_SECONDS))
 
 # ==================== ADMIN AUDIT LOG ====================
 # Append-only trail of every admin action that mutates data (product/order/
@@ -4350,6 +4385,10 @@ async def _authenticate_user(email: str, password: str, request: Request) -> dic
         f"login:ip-email:{ip}:{email}", LOGIN_IP_EMAIL_LIMIT, LOGIN_IP_EMAIL_WINDOW_SECONDS,
         "Prea multe încercări de autentificare pentru acest cont. Încearcă din nou mai târziu.",
     )
+    # IP-independent: closes the rotating-IP gap the two buckets above can't
+    # catch on their own (security audit, 2026-08-21) - see
+    # ACCOUNT_LOGIN_SOFT_LIMIT for why this delays instead of blocking.
+    await _soft_throttle_account_login(email)
     existing_user = await db.users.find_one({"email": email})
 
     # Deleted accounts (see POST /auth/me/delete) are rejected outright,
