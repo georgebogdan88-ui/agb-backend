@@ -36,10 +36,20 @@ import sentry_sdk
 
 import courier_fan
 from scripts.generate_seo_metadata import generate_seo_fields
+from infisical_bootstrap import load_secrets_from_infisical
 
 ROOT_DIR = Path(__file__).parent
 # Load .env but don't override existing environment variables (important for Render deployment)
 load_dotenv(ROOT_DIR / '.env', override=False)
+
+# Infisical secrets manager (opt-in, fail-safe): only does anything if
+# INFISICAL_CLIENT_ID/INFISICAL_CLIENT_SECRET are set in the environment
+# (they are NOT set on production Render today - George will add them
+# explicitly when ready). Runs after load_dotenv() above so that any value
+# already present in .env/the process environment keeps priority over
+# Infisical (see infisical_bootstrap.py). Must run before any of the
+# os.environ reads below (MONGO_URL, BREVO_API_KEY, etc.).
+load_secrets_from_infisical()
 
 # MongoDB connection
 # maxPoolSize explicit (was left at the driver default of 100) - this
