@@ -20,11 +20,14 @@ a read-only audit):
      SHOPIFY_ADMIN_TOKEN value (was logging admin_token[:10]) - just a
      boolean presence log now.
   4. New _is_production_environment() gate, wired into all 9 Brevo-sending
-     functions right after their existing `if not BREVO_API_KEY` check -
-     step A only (unset ENVIRONMENT still defaults to True/"send", so
-     production email sending is NOT affected by this change until George
-     explicitly sets ENVIRONMENT=production on every real Render service
-     and step B - flipping the missing-var default - is done separately).
+     functions right after their existing `if not BREVO_API_KEY` check.
+     Step B (2026-08-22, this file's current version): George confirmed
+     ENVIRONMENT=production is now explicitly set on the real production
+     Render service (agb-backend) and deliberately NOT set on
+     agb-backend-staging, so the missing-var default has been flipped to
+     False (fail-safe: an environment that forgets to set ENVIRONMENT no
+     longer sends real customer emails by default - it must opt in with
+     ENVIRONMENT=production).
 
 Not a pytest suite - mirrors scripts/test_order_confirmation_email.py's and
 scripts/test_gdpr_export_and_delete.py's approach (this repo still has no
@@ -51,23 +54,33 @@ Covers:
       is shared across both /integrations/* routes (a POST to
       /integrations/equipment-from-crm from the same already-exhausted IP
       also gets 429).
-  (c) _is_production_environment: ENVIRONMENT unset -> True (unchanged
-      behavior vs. before this gate existed), ENVIRONMENT="production" ->
-      True, ENVIRONMENT="staging" -> False, ENVIRONMENT="" (present but
-      empty) -> True (treated same as unset).
+  (c) _is_production_environment: ENVIRONMENT unset -> False (fail-safe
+      default, Step B), ENVIRONMENT="production" -> True, ENVIRONMENT=
+      "staging" -> False, ENVIRONMENT="" (present but empty) -> False
+      (treated same as unset).
   (d) Regression guard: _send_order_confirmation_email does NOT call Brevo
-      when ENVIRONMENT="staging" (returns False), but DOES call Brevo (and
-      returns True) when ENVIRONMENT is unset - explicitly proving this
-      change does not silently stop production email sending today.
+      when ENVIRONMENT="staging" (returns False) NOR when ENVIRONMENT is
+      unset (returns False - this is the Step B behavior flip itself), but
+      DOES call Brevo (and returns True) when ENVIRONMENT="production" is
+      explicitly set - explicitly proving the real production service
+      (which has ENVIRONMENT=production set on Render) is unaffected by
+      this change.
   (e) All 9 Brevo-sending functions (_send_order_confirmation_email,
       _send_shipping_notification_email, _send_marketing_email,
       _send_stock_notification_email, _send_new_order_staff_notification,
       send_password_reset_email, send_shopify_migration_email,
       send_abandoned_cart_email, send_blog_notification_email) are wired to
-      the same gate: each returns False and never touches Brevo when
-      ENVIRONMENT="staging" (with BREVO_API_KEY configured, so the gate
-      under test - not the pre-existing BREVO_API_KEY check - is what's
-      actually being exercised).
+      the same gate, checked for THREE ENVIRONMENT values (with
+      BREVO_API_KEY configured, so the gate under test - not the
+      pre-existing BREVO_API_KEY check - is what's actually being
+      exercised):
+        - "staging" -> each returns falsy, Brevo never called (unchanged).
+        - "production" -> each returns truthy, Brevo IS called (critical
+          regression guard: proves today's real production behavior, since
+          Render's agb-backend service has ENVIRONMENT=production set).
+        - unset -> each returns falsy, Brevo never called (NEW behavior:
+          proves the fail-safe default protects any service - e.g.
+          agb-backend-staging - that doesn't set ENVIRONMENT at all).
   (f) get_admin_access_token() log output no longer contains any substring
       of the real token value (captures the logger output and asserts the
       test token string is absent), for both the env-var and
@@ -238,13 +251,13 @@ async def scenario_b_integrations_rate_limited_per_ip():
 
 
 def scenario_c_is_production_environment():
-    """(c) _is_production_environment(): unset -> True (unchanged default),
-    "production" -> True, "staging" -> False, "" (present but empty) ->
-    True (treated the same as unset)."""
+    """(c) _is_production_environment(): unset -> False (fail-safe default,
+    Step B), "production" -> True, "staging" -> False, "" (present but
+    empty) -> False (treated the same as unset)."""
     original = os.environ.get("ENVIRONMENT", None)
     try:
         os.environ.pop("ENVIRONMENT", None)
-        check("c) ENVIRONMENT unset -> True (unchanged default)", server._is_production_environment() is True)
+        check("c) ENVIRONMENT unset -> False (fail-safe default)", server._is_production_environment() is False)
 
         os.environ["ENVIRONMENT"] = "production"
         check('c) ENVIRONMENT="production" -> True', server._is_production_environment() is True)
@@ -253,7 +266,7 @@ def scenario_c_is_production_environment():
         check('c) ENVIRONMENT="staging" -> False', server._is_production_environment() is False)
 
         os.environ["ENVIRONMENT"] = ""
-        check('c) ENVIRONMENT="" (present but empty) -> True', server._is_production_environment() is True)
+        check('c) ENVIRONMENT="" (present but empty) -> False', server._is_production_environment() is False)
     finally:
         if original is None:
             os.environ.pop("ENVIRONMENT", None)
@@ -279,6 +292,16 @@ def restore_brevo_send(original):
 
 
 def sample_order():
+    # courier_awb_number is set here (even though most scenarios below never
+    # exercise the shipping-notification path) because scenario e's
+    # ENVIRONMENT="production" case DOES call _send_shipping_notification_email,
+    # which unconditionally does html.escape(order.courier_awb_number) - a
+    # None default there raises inside that function's try/except and makes
+    # it silently return False, which would be indistinguishable from a
+    # gate-driven skip. Real callers (admin_update_order_courier) always set
+    # this before invoking the send function, so a populated value here
+    # matches that real usage instead of accidentally exercising a
+    # courier_awb_number=None edge case this file isn't testing.
     return server.Order(
         session_id="sess-env-gate",
         items=[{"product_id": "p1", "product_name": "Piesă test", "quantity": 1, "price": 50.0}],
@@ -287,14 +310,18 @@ def sample_order():
             address="Str. Exemplu 1", city="Cluj-Napoca", county="Cluj", postal_code="400000",
         ),
         subtotal=50.0, shipping=25.0, total=75.0, payment_method="ramburs",
+        courier_awb_number="AWB-ENV-GATE-TEST", courier_service="Standard",
     )
 
 
 async def scenario_d_regression_guard_order_confirmation_email():
-    """(d) Explicit regression guard: staging skips the send entirely
-    (Brevo never called), but ENVIRONMENT unset still sends exactly like
-    before this change existed - the exact "did we just silently break
-    production email" check this task called for."""
+    """(d) Explicit regression guard: staging AND unset ENVIRONMENT both
+    skip the send entirely (Brevo never called) - unset now matches
+    staging's fail-safe behavior (Step B flip) - while ENVIRONMENT=
+    "production" explicitly set still sends exactly as before - the exact
+    "did we just silently break real production email" check this task
+    called for, now pointed at the actual value Render's agb-backend
+    service has (ENVIRONMENT=production), not at "unset"."""
     await fresh_db()
     original_key = server.BREVO_API_KEY
     original_env = os.environ.get("ENVIRONMENT", None)
@@ -308,10 +335,17 @@ async def scenario_d_regression_guard_order_confirmation_email():
         check("d) ENVIRONMENT=staging -> _send_order_confirmation_email returns False", result is False, result)
         check("d) ENVIRONMENT=staging -> Brevo never called", calls == [], calls)
 
+        calls.clear()
         os.environ.pop("ENVIRONMENT", None)
         result2 = await server._send_order_confirmation_email(order)
-        check("d) ENVIRONMENT unset -> _send_order_confirmation_email returns True (unchanged)", result2 is True, result2)
-        check("d) ENVIRONMENT unset -> Brevo WAS called (production behavior unaffected)", len(calls) == 1, calls)
+        check("d) ENVIRONMENT unset -> _send_order_confirmation_email returns False (Step B fail-safe flip)", result2 is False, result2)
+        check("d) ENVIRONMENT unset -> Brevo never called (staging-like services no longer send)", calls == [], calls)
+
+        calls.clear()
+        os.environ["ENVIRONMENT"] = "production"
+        result3 = await server._send_order_confirmation_email(order)
+        check('d) ENVIRONMENT="production" -> _send_order_confirmation_email returns True (real prod unaffected)', result3 is True, result3)
+        check('d) ENVIRONMENT="production" -> Brevo WAS called', len(calls) == 1, calls)
     finally:
         restore_brevo_send(original_send)
         server.BREVO_API_KEY = original_key
@@ -321,11 +355,20 @@ async def scenario_d_regression_guard_order_confirmation_email():
             os.environ["ENVIRONMENT"] = original_env
 
 
-async def scenario_e_all_nine_send_functions_gated():
+async def scenario_e_all_nine_send_functions_gated(env_value, expect_send, label):
     """(e) Every one of the 9 Brevo-sending functions is wired to the same
     gate: with BREVO_API_KEY configured (so it's specifically the new env
-    gate under test, not the pre-existing key check) and
-    ENVIRONMENT="staging", each returns falsy and Brevo is never invoked."""
+    gate under test, not the pre-existing key check), for a given
+    ENVIRONMENT value (env_value=None means unset), either all 9 send
+    (expect_send=True) or all 9 skip without ever touching Brevo
+    (expect_send=False). Called three times from main() below with:
+      - env_value="staging", expect_send=False (unchanged behavior).
+      - env_value="production", expect_send=True (NEW/critical: proves the
+        real production service, which has ENVIRONMENT=production set on
+        Render, is unaffected by the Step B flip).
+      - env_value=None (unset), expect_send=False (NEW: proves the
+        fail-safe default protects any service - e.g. agb-backend-staging
+        - that never sets ENVIRONMENT)."""
     await fresh_db()
     original_key = server.BREVO_API_KEY
     original_env = os.environ.get("ENVIRONMENT", None)
@@ -334,7 +377,10 @@ async def scenario_e_all_nine_send_functions_gated():
     calls = []
     original_send = patch_brevo_send(lambda email: calls.append(email))
     try:
-        os.environ["ENVIRONMENT"] = "staging"
+        if env_value is None:
+            os.environ.pop("ENVIRONMENT", None)
+        else:
+            os.environ["ENVIRONMENT"] = env_value
 
         functions = [
             ("_send_order_confirmation_email", lambda: server._send_order_confirmation_email(order)),
@@ -357,8 +403,12 @@ async def scenario_e_all_nine_send_functions_gated():
         for name, thunk in functions:
             calls.clear()
             result = await thunk()
-            check(f"e) {name}: ENVIRONMENT=staging -> returns falsy", not result, result)
-            check(f"e) {name}: ENVIRONMENT=staging -> Brevo never called", calls == [], calls)
+            if expect_send:
+                check(f"e-{label}) {name}: ENVIRONMENT={env_value!r} -> returns truthy", bool(result), result)
+                check(f"e-{label}) {name}: ENVIRONMENT={env_value!r} -> Brevo WAS called", len(calls) == 1, calls)
+            else:
+                check(f"e-{label}) {name}: ENVIRONMENT={env_value!r} -> returns falsy", not result, result)
+                check(f"e-{label}) {name}: ENVIRONMENT={env_value!r} -> Brevo never called", calls == [], calls)
     finally:
         restore_brevo_send(original_send)
         server.BREVO_API_KEY = original_key
@@ -422,7 +472,9 @@ async def main():
     await scenario_b_integrations_rate_limited_per_ip()
     scenario_c_is_production_environment()
     await scenario_d_regression_guard_order_confirmation_email()
-    await scenario_e_all_nine_send_functions_gated()
+    await scenario_e_all_nine_send_functions_gated("staging", expect_send=False, label="staging")
+    await scenario_e_all_nine_send_functions_gated("production", expect_send=True, label="production")
+    await scenario_e_all_nine_send_functions_gated(None, expect_send=False, label="unset")
     await scenario_f_admin_token_log_never_leaks_a_fraction()
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")

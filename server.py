@@ -75,23 +75,24 @@ BREVO_API_KEY = os.environ.get('BREVO_API_KEY', '')
 
 def _is_production_environment() -> bool:
     """Gate for whether real customer-facing emails (Brevo) should actually
-    be sent from this process. Step A of a deliberate 2-step rollout
+    be sent from this process. Step B of a deliberate 2-step rollout
     (security audit, 2026-08-22):
 
     - ENVIRONMENT="production" -> True.
     - ENVIRONMENT set to anything else (e.g. "staging") -> False.
-    - ENVIRONMENT unset (every service today, as of this writing) -> True,
-      i.e. the SAME behavior as before this gate existed. This is
-      deliberate: no Render service has ENVIRONMENT set yet, so flipping
-      this default to False here would silently stop production email
-      sending. Step B (flipping the missing-var default to False) happens
-      in a separate change, only after ENVIRONMENT=production is confirmed
-      explicitly set on every real production service in Render - do not
-      change this default without that confirmation.
+    - ENVIRONMENT unset/empty -> False (fail-safe default). Step A
+      temporarily made this case True to match pre-gate behavior while
+      no Render service had ENVIRONMENT set. That has since been
+      confirmed: ENVIRONMENT=production is now explicitly set on the
+      real production service (agb-backend) in Render, and deliberately
+      NOT set on agb-backend-staging. With that confirmed, the
+      missing-var default flips to False here so any environment that
+      forgets to set ENVIRONMENT (e.g. staging) fails safe by NOT
+      sending real emails, instead of silently sending them.
     """
     value = os.environ.get("ENVIRONMENT", "")
     if not value:
-        return True
+        return False
     return value == "production"
 
 # CRM Integration Configuration (fire-and-forget order sync to agb-crm)

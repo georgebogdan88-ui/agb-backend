@@ -54,6 +54,14 @@ from unittest.mock import AsyncMock, patch
 
 os.environ.setdefault("MONGO_URL", "mongodb://fake-for-import-only/")
 os.environ.setdefault("DB_NAME", "fake_db_for_import_only")
+# _is_production_environment() (security audit, 2026-08-22, Step B) now
+# defaults to False when ENVIRONMENT is unset/empty - this file tests
+# send_shopify_migration_email's own send/skip/error logic via
+# _run_shopify_migration_bulk_send, not that env gate (see
+# scripts/test_security_webhook_ratelimit_env_gate.py for that), so force
+# it explicitly here to keep exercising the actual send path regardless of
+# what ENVIRONMENT happens to be in whatever shell runs this script.
+os.environ["ENVIRONMENT"] = "production"
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
