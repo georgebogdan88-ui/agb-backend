@@ -245,7 +245,12 @@ async def scenario_d_creates_missing_accounts_only_for_eligible_clients():
             request=make_request(method="POST", path="/admin/customers/migrate-shopify-bulk", with_auth=True),
             background_tasks=bt,
         )
-        check("d) queued counts only the 2 eligible clients", result == {"queued": 2}, result)
+        # 2026-08-22: response gained eligible_total/remaining_after_this_
+        # batch/daily_cap_reached alongside the original "queued" key (see
+        # scripts/test_migration_bulk_daily_cap.py for dedicated coverage of
+        # that cap logic) - this script only asserts the pre-existing
+        # "queued" contract still holds, not the full dict shape.
+        check("d) queued counts only the 2 eligible clients", result.get("queued") == 2, result)
         await bt()  # run _run_shopify_migration_bulk_send
 
         check("d) both eligible recipients emailed",
@@ -301,7 +306,7 @@ async def scenario_e_no_resend_when_already_sent():
             request=make_request(method="POST", path="/admin/customers/migrate-shopify-bulk", with_auth=True),
             background_tasks=bt,
         )
-        check("e) already-emailed client excluded -> queued == 0", result == {"queued": 0}, result)
+        check("e) already-emailed client excluded -> queued == 0", result.get("queued") == 0, result)
         await bt()
         check("e) no email attempted (no spam on repeated click)", sent_to == [], sent_to)
     finally:
@@ -339,7 +344,7 @@ async def scenario_f_one_failed_send_does_not_block_the_rest():
             request=make_request(method="POST", path="/admin/customers/migrate-shopify-bulk", with_auth=True),
             background_tasks=bt,
         )
-        check("f) all 3 new candidates queued", result == {"queued": 3}, result)
+        check("f) all 3 new candidates queued", result.get("queued") == 3, result)
         await bt()
 
         check("f) unaffected recipients still emailed despite one failure",

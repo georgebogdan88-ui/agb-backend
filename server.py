@@ -801,6 +801,16 @@ ACCOUNT_DELETE_LIMIT, ACCOUNT_DELETE_WINDOW_SECONDS = 5, 15 * 60    # 5 / 15 min
 # from CRM, not end users) - purely a backstop against abuse of a leaked key,
 # not a limit meant to ever affect normal CRM traffic.
 INTEGRATIONS_IP_LIMIT, INTEGRATIONS_IP_WINDOW_SECONDS = 60, 60      # 60 / minute per IP
+# Added 2026-08-22 - caps how many "set your password" Shopify migration
+# emails POST /admin/customers/migrate-shopify-bulk is allowed to actually
+# send out in any rolling 24h window, no matter how many times (or with how
+# many eligible candidates) staff presses the button in CRM - re-clicking it
+# is always safe, this just throttles outbound volume so ~290 eligible
+# customers trickle out over several days instead of landing as one burst.
+# Deliberately reuses the existing db.users.migration_email_sent_at field
+# (already the per-recipient anti-resend marker) as the rolling-window
+# counter instead of introducing a separate "day number"/counter document.
+DAILY_MIGRATION_EMAIL_CAP = 50
 
 
 def _client_ip(request: Request) -> str:
@@ -9122,7 +9132,7 @@ async def _run_shopify_migration_bulk_send(candidates: list) -> None:
 @api_router.post("/admin/customers/migrate-shopify-bulk")
 async def admin_migrate_shopify_bulk(request: Request, background_tasks: BackgroundTasks):
     """Bulk-trigger the "set your password on the new site" migration email
-    for every db.clients row that doesn't have a fully migrated local
+    for eligible db.clients rows that don't have a fully migrated local
     account yet - NEVER run automatically or on a schedule; this only ever
     fires when a staff member explicitly hits the button in CRM (which is
     expected to show its own confirmation dialog before calling this).
@@ -9134,15 +9144,35 @@ async def admin_migrate_shopify_bulk(request: Request, background_tasks: Backgro
     have migration_email_sent_at set (never re-send to someone already
     emailed - safe to click this button repeatedly with no spam risk).
 
-    Responds immediately with {"queued": N} - account creation and the
-    actual Brevo sends happen afterwards in _run_shopify_migration_bulk_send,
-    handed off via BackgroundTasks so this request never blocks on ~hundreds
-    of outbound emails."""
+    On top of that, actual sends are capped at DAILY_MIGRATION_EMAIL_CAP per
+    rolling 24h window, counted directly off how many db.users documents
+    have migration_email_sent_at within the last 24h - no separate "day
+    number"/counter state. Only the first `remaining_today` eligible
+    candidates (in the same order they're found today, unchanged) are hand-
+    ed off; the rest stay eligible for the next click, whenever that is -
+    with ~290 eligible customers this naturally spreads sends over several
+    days if the button is pressed once a day. This is independent of (and
+    complementary to) the per-admin _enforce_rate_limit above: that limits
+    how often staff can PRESS the button, this limits how many emails
+    actually go out.
+
+    Responds immediately with {"queued": N, "eligible_total": M,
+    "remaining_after_this_batch": M - N, "daily_cap_reached": bool} -
+    account creation and the actual Brevo sends happen afterwards in
+    _run_shopify_migration_bulk_send, handed off via BackgroundTasks so this
+    request never blocks on outbound emails. If the daily cap is already
+    exhausted, queued is 0 and background_tasks.add_task is never called at
+    all."""
     admin = await _require_admin(request)
     _enforce_rate_limit(
         f"admin:migrate-shopify-bulk:{admin['id']}", ADMIN_ACTION_LIMIT, ADMIN_ACTION_WINDOW_SECONDS,
         "Prea multe porniri de migrare în bloc recent. Încearcă din nou mai târziu.",
     )
+
+    sent_last_24h = await db.users.count_documents({
+        "migration_email_sent_at": {"$gte": datetime.utcnow() - timedelta(hours=24)}
+    })
+    remaining_today = max(0, DAILY_MIGRATION_EMAIL_CAP - sent_last_24h)
 
     clients = await db.clients.find({}).to_list(None)
     candidates = []
@@ -9170,15 +9200,25 @@ async def admin_migrate_shopify_bulk(request: Request, background_tasks: Backgro
             "shopify_customer_id": client.get("shopify_customer_id"),
         })
 
-    if candidates:
-        background_tasks.add_task(_run_shopify_migration_bulk_send, candidates)
+    eligible_total = len(candidates)
+    batch = candidates[:remaining_today] if remaining_today > 0 else []
+
+    if batch:
+        background_tasks.add_task(_run_shopify_migration_bulk_send, batch)
+
+    result = {
+        "queued": len(batch),
+        "eligible_total": eligible_total,
+        "remaining_after_this_batch": eligible_total - len(batch),
+        "daily_cap_reached": remaining_today == 0,
+    }
 
     await _write_audit_log(
         request, admin, action="customers.migrate_shopify_bulk_trigger", resource_type="user",
-        after={"queued": len(candidates)},
+        after=result,
     )
 
-    return {"queued": len(candidates)}
+    return result
 
 
 # ==================== ABANDONED CART EMAILS ====================
