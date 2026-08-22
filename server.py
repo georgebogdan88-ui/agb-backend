@@ -72,6 +72,28 @@ SHOPIFY_ADMIN_TOKEN = os.environ.get('SHOPIFY_ADMIN_TOKEN', '')  # Will be set a
 # Brevo Email Configuration
 BREVO_API_KEY = os.environ.get('BREVO_API_KEY', '')
 
+
+def _is_production_environment() -> bool:
+    """Gate for whether real customer-facing emails (Brevo) should actually
+    be sent from this process. Step A of a deliberate 2-step rollout
+    (security audit, 2026-08-22):
+
+    - ENVIRONMENT="production" -> True.
+    - ENVIRONMENT set to anything else (e.g. "staging") -> False.
+    - ENVIRONMENT unset (every service today, as of this writing) -> True,
+      i.e. the SAME behavior as before this gate existed. This is
+      deliberate: no Render service has ENVIRONMENT set yet, so flipping
+      this default to False here would silently stop production email
+      sending. Step B (flipping the missing-var default to False) happens
+      in a separate change, only after ENVIRONMENT=production is confirmed
+      explicitly set on every real production service in Render - do not
+      change this default without that confirmation.
+    """
+    value = os.environ.get("ENVIRONMENT", "")
+    if not value:
+        return True
+    return value == "production"
+
 # CRM Integration Configuration (fire-and-forget order sync to agb-crm)
 CRM_API_URL = os.environ.get('CRM_API_URL', '')
 CRM_INTEGRATION_KEY = os.environ.get('CRM_INTEGRATION_KEY', '')
@@ -770,6 +792,14 @@ ACCOUNT_LOGIN_SOFT_LIMIT, ACCOUNT_LOGIN_SOFT_WINDOW_SECONDS = 20, 60 * 60  # 20 
 ACCOUNT_LOGIN_SOFT_MAX_DELAY_SECONDS = 4  # cap so a legitimate owner is never stuck waiting long
 ADMIN_ACTION_LIMIT, ADMIN_ACTION_WINDOW_SECONDS = 10, 60 * 60       # 10 / hour per admin, per protected action
 ACCOUNT_DELETE_LIMIT, ACCOUNT_DELETE_WINDOW_SECONDS = 5, 15 * 60    # 5 / 15 min per account (password re-check)
+# Added 2026-08-22 (security audit) - the /integrations/* routes below are
+# already authenticated with X-Integration-Key (_require_crm_integration_key,
+# fails closed with 401), but that key is a single long-lived shared secret
+# with no per-caller rotation, so if it ever leaked there was nothing to cap
+# request volume. Deliberately generous (this is server-to-server traffic
+# from CRM, not end users) - purely a backstop against abuse of a leaked key,
+# not a limit meant to ever affect normal CRM traffic.
+INTEGRATIONS_IP_LIMIT, INTEGRATIONS_IP_WINDOW_SECONDS = 60, 60      # 60 / minute per IP
 
 
 def _client_ip(request: Request) -> str:
@@ -3146,6 +3176,9 @@ async def _send_order_confirmation_email(order: Order) -> bool:
         if not BREVO_API_KEY:
             logger.warning("BREVO_API_KEY not set - skipping order confirmation email for order %s", order.id)
             return False
+        if not _is_production_environment():
+            logger.info("Not production (ENVIRONMENT set to non-production) - skipping order confirmation email for order %s", order.id)
+            return False
 
         import sib_api_v3_sdk
 
@@ -3236,6 +3269,9 @@ async def _send_shipping_notification_email(order: Order) -> bool:
     try:
         if not BREVO_API_KEY:
             logger.warning("BREVO_API_KEY not set - skipping shipping notification email for order %s", order.id)
+            return False
+        if not _is_production_environment():
+            logger.info("Not production (ENVIRONMENT set to non-production) - skipping shipping notification email for order %s", order.id)
             return False
 
         import sib_api_v3_sdk
@@ -3356,6 +3392,9 @@ async def _send_marketing_email(to_email: str, to_name: Optional[str], product: 
     try:
         if not BREVO_API_KEY:
             logger.warning("BREVO_API_KEY not set - skipping marketing email to %s", to_email)
+            return False
+        if not _is_production_environment():
+            logger.info("Not production (ENVIRONMENT set to non-production) - skipping marketing email to %s", to_email)
             return False
 
         import sib_api_v3_sdk
@@ -3692,6 +3731,9 @@ async def _send_stock_notification_email(
         if not BREVO_API_KEY:
             logger.warning("BREVO_API_KEY not set - skipping stock notification email to %s", to_email)
             return False
+        if not _is_production_environment():
+            logger.info("Not production (ENVIRONMENT set to non-production) - skipping stock notification email to %s", to_email)
+            return False
 
         import sib_api_v3_sdk
         from urllib.parse import quote
@@ -3904,6 +3946,9 @@ async def _send_new_order_staff_notification(order: Order) -> bool:
     try:
         if not BREVO_API_KEY:
             logger.warning("BREVO_API_KEY not set - skipping new-order staff notification for order %s", order.id)
+            return False
+        if not _is_production_environment():
+            logger.info("Not production (ENVIRONMENT set to non-production) - skipping new-order staff notification for order %s", order.id)
             return False
 
         import sib_api_v3_sdk
@@ -4399,6 +4444,9 @@ async def send_password_reset_email(recipient_email: str, recipient_name: str, r
     try:
         if not BREVO_API_KEY:
             logger.warning("BREVO_API_KEY not set - skipping password reset email")
+            return False
+        if not _is_production_environment():
+            logger.info("Not production (ENVIRONMENT set to non-production) - skipping password reset email")
             return False
 
         import sib_api_v3_sdk
@@ -8905,6 +8953,9 @@ async def send_shopify_migration_email(recipient_email: str, recipient_name: str
         if not BREVO_API_KEY:
             logger.warning("BREVO_API_KEY not set - skipping Shopify migration email")
             return False
+        if not _is_production_environment():
+            logger.info("Not production (ENVIRONMENT set to non-production) - skipping Shopify migration email")
+            return False
 
         import sib_api_v3_sdk
 
@@ -9127,6 +9178,9 @@ async def send_abandoned_cart_email(recipient_email: str, recipient_name: str, c
     try:
         if not BREVO_API_KEY:
             logger.warning("BREVO_API_KEY not set - skipping abandoned cart email")
+            return False
+        if not _is_production_environment():
+            logger.info("Not production (ENVIRONMENT set to non-production) - skipping abandoned cart email")
             return False
 
         import sib_api_v3_sdk
@@ -9995,6 +10049,10 @@ async def receive_equipment_from_crm(request: Request, payload: EquipmentFromCrm
     an outbound one back at CRM for the same tractor.
     """
     _require_crm_integration_key(request)
+    _enforce_rate_limit(
+        f"integrations:ip:{_client_ip(request)}", INTEGRATIONS_IP_LIMIT, INTEGRATIONS_IP_WINDOW_SECONDS,
+        "Prea multe cereri către /integrations/*. Încearcă din nou mai târziu.",
+    )
 
     user = None
     if payload.client_email:
@@ -10063,6 +10121,10 @@ async def receive_equipment_delete_from_crm(request: Request, equipment_id: str)
     phone/email lookup is needed, unlike the create/update endpoint above.
     """
     _require_crm_integration_key(request)
+    _enforce_rate_limit(
+        f"integrations:ip:{_client_ip(request)}", INTEGRATIONS_IP_LIMIT, INTEGRATIONS_IP_WINDOW_SECONDS,
+        "Prea multe cereri către /integrations/*. Încearcă din nou mai târziu.",
+    )
 
     user = await db.users.find_one({"equipment.id": equipment_id})
     if not user:
@@ -10389,9 +10451,13 @@ async def get_user_favorites(request: Request):
 async def verify_shopify_webhook(request: Request) -> bool:
     """Verify that webhook request is from Shopify"""
     if not SHOPIFY_WEBHOOK_SECRET:
-        # If no secret configured, accept all webhooks (development mode)
-        logger.warning("SHOPIFY_WEBHOOK_SECRET not configured - accepting webhook without verification")
-        return True
+        # Fail CLOSED (same pattern as _require_admin / _require_crm_bff_service_key):
+        # an unconfigured secret must never be reachable by "just don't sign the
+        # request" the way a bad signature would be blocked. Without this, an
+        # unauthenticated caller could hit POST /api/webhooks/shopify (e.g. a
+        # products/delete topic) and wipe catalog data.
+        logger.error("SHOPIFY_WEBHOOK_SECRET not configured - rejecting webhook (fail closed)")
+        return False
     
     hmac_header = request.headers.get("X-Shopify-Hmac-SHA256", "")
     body = await request.body()
@@ -11309,12 +11375,12 @@ async def get_admin_access_token():
     # First check environment variable directly
     admin_token = os.environ.get('SHOPIFY_ADMIN_TOKEN', '')
     if admin_token:
-        logger.info(f"Using SHOPIFY_ADMIN_TOKEN from env: {admin_token[:10]}...")
+        logger.info("SHOPIFY_ADMIN_TOKEN prezent" if admin_token else "SHOPIFY_ADMIN_TOKEN absent")
         return admin_token
-    
+
     # Fallback to global variable
     if SHOPIFY_ADMIN_TOKEN:
-        logger.info(f"Using SHOPIFY_ADMIN_TOKEN from global: {SHOPIFY_ADMIN_TOKEN[:10]}...")
+        logger.info("SHOPIFY_ADMIN_TOKEN prezent" if SHOPIFY_ADMIN_TOKEN else "SHOPIFY_ADMIN_TOKEN absent")
         return SHOPIFY_ADMIN_TOKEN
     
     # Then check database
@@ -12318,6 +12384,9 @@ async def send_blog_notification_email(recipient_email: str, recipient_name: str
     try:
         if not BREVO_API_KEY:
             logger.warning("BREVO_API_KEY not set - skipping email")
+            return False
+        if not _is_production_environment():
+            logger.info("Not production (ENVIRONMENT set to non-production) - skipping blog notification email")
             return False
         
         import sib_api_v3_sdk
