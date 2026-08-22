@@ -1108,6 +1108,36 @@ async def fetch_shopify_products_page(after: Optional[str] = None) -> dict:
         
         return response.json()
 
+def _auto_derived_stock_status(stock: Optional[int], current_status: Optional[str] = None) -> Optional[str]:
+    """Single shared rule for every code path that derives `stock_status`
+    automatically from a numeric `stock` (as opposed to a staff member
+    explicitly picking a status themselves): whenever stock is at or below
+    0, stock_status must become "supplier_stock" - never "out_of_stock",
+    never left as a stale "in_stock", never anything else. This is a
+    deliberate policy (George, 2026-08-22): a product found with
+    stock=0/stock_status="in_stock" (a data inconsistency, likely left over
+    from the last unit selling or a manual edit) produced a visibly broken
+    product page ("Toate cele 0 bucăți sunt în coș"). "out_of_stock" as an
+    automatic outcome is retired entirely - it now only exists as a value
+    staff can still choose explicitly (see _apply_product_update, which
+    only skips calling this when the SAME request also explicitly sets
+    stock_status itself).
+
+    Returns "supplier_stock" when a change is needed, or None when nothing
+    should be touched (stock is None/positive, or status is already
+    "supplier_stock") - callers only need to $set stock_status when this
+    returns a non-None value.
+
+    Every caller of this (checkout decrement, admin edits without an
+    explicit stock_status, Shopify webhook/full-resync parsing) is exactly
+    the set of paths identified as writing `stock` - see the callers below
+    and _apply_product_update, _decrement_stock_once, update_single_product."""
+    if stock is None or stock > 0:
+        return None
+    if current_status == "supplier_stock":
+        return None
+    return "supplier_stock"
+
 def parse_shopify_node(node: dict) -> dict:
     """Parse a Shopify product node into our format"""
     # Get all images
@@ -1120,13 +1150,11 @@ def parse_shopify_node(node: dict) -> dict:
     
     stock = 0
     sku = None
-    available_for_sale = False
     if node.get("variants", {}).get("edges"):
         variant = node["variants"]["edges"][0]["node"]
         stock = variant.get("quantityAvailable") or 0
         sku = variant.get("sku")
-        available_for_sale = variant.get("availableForSale", False)
-    
+
     price = 0.0
     currency = "RON"
     if node.get("priceRange", {}).get("minVariantPrice"):
@@ -1148,32 +1176,21 @@ def parse_shopify_node(node: dict) -> dict:
                 compatible_models.append(m)
     
     product_id = node["id"].replace("gid://shopify/Product/", "")
-    
-    # Determine stock status
-    # "În stoc furnizor" for products with 0 stock but availableForSale=true (Continue selling enabled)
-    stock_status = "in_stock" if stock > 0 else "out_of_stock"
-    tags = node.get("tags", [])
-    
-    # If stock is 0 but product is still availableForSale, it means "Continue selling when out of stock" is enabled
-    if stock == 0 and available_for_sale:
-        stock_status = "supplier_stock"
-    
-    # Also check if product has supplier stock mention in description or tags
-    desc_lower = description.lower()
-    if stock == 0 and ("contactati pentru oferta" in desc_lower or 
-                       "stoc furnizor" in desc_lower or 
-                       "pretul actual poate varia" in desc_lower or
-                       "la comanda" in desc_lower or
-                       "disponibil la comanda" in desc_lower):
-        stock_status = "supplier_stock"
-    
-    # Also check for specific product types that are usually available on order
     product_type = node.get("productType", "")
-    if stock == 0 and product_type and product_type.lower() in ["nou", "aftermarket"]:
-        # Check if it's a new product without stock - likely supplier stock
-        if price > 0:
-            stock_status = "supplier_stock"
-    
+
+    # Determine stock status. Every product parsed here comes from Shopify
+    # (webhook or full resync) with no staff-entered stock_status to
+    # respect - this is always an automatic derivation, so the shared rule
+    # in _auto_derived_stock_status applies unconditionally: stock<=0 is
+    # ALWAYS "supplier_stock" (backorder-from-supplier, still orderable),
+    # never "out_of_stock" and never left "in_stock". This used to try to
+    # distinguish "supplier_stock" from a plain "out_of_stock" via
+    # availableForSale/description keywords/productType heuristics, but
+    # George's 2026-08-22 call retired "out_of_stock" as an automatic
+    # outcome entirely (see _auto_derived_stock_status's own docstring), so
+    # those heuristics no longer change the outcome and were removed.
+    stock_status = "in_stock" if stock > 0 else _auto_derived_stock_status(stock)
+
     return {
         "id": product_id,
         "title": title,
@@ -1189,7 +1206,7 @@ def parse_shopify_node(node: dict) -> dict:
         "product_type": product_type,
         "vendor": node.get("vendor"),
         "stock": stock,
-        "stock_status": stock_status,  # "in_stock", "out_of_stock", "supplier_stock"
+        "stock_status": stock_status,  # "in_stock" or "supplier_stock" - see _auto_derived_stock_status
         "sku": sku,
         "compatible_models": compatible_models,
         "synced_at": datetime.utcnow()
@@ -2962,10 +2979,11 @@ async def _decrement_stock_once(quantities: Dict[str, int], session) -> List[str
     and the update $inc's stock down by that quantity in the same
     operation, so a single product's decrement is always race-safe against
     concurrent checkouts on its own, transaction or not. When stock lands
-    exactly on 0, stock_status also flips to "out_of_stock" in the same
-    pass - unless it's "supplier_stock" (backorder-from-supplier, still
-    orderable at 0 stock - see _shopify_product_to_dict), which must not be
-    overwritten by a plain zero-stock decrement.
+    exactly on 0, stock_status also flips to "supplier_stock" in the same
+    pass (see _auto_derived_stock_status - a checkout decrement is always
+    an automatic derivation, never a staff choice, so the shared rule
+    applies unconditionally) - unless it's already "supplier_stock", which
+    is a no-op.
 
     Returns the list of product_ids that did NOT have enough stock (or
     don't exist). Does not itself decide what to do about a non-empty
@@ -2982,10 +3000,11 @@ async def _decrement_stock_once(quantities: Dict[str, int], session) -> List[str
         if result is None:
             insufficient.append(product_id)
             continue
-        if result["stock"] == 0 and result.get("stock_status") != "supplier_stock":
+        forced_status = _auto_derived_stock_status(result["stock"], result.get("stock_status"))
+        if forced_status:
             await db.shopify_products.update_one(
                 {"id": product_id},
-                {"$set": {"stock_status": "out_of_stock"}},
+                {"$set": {"stock_status": forced_status}},
                 session=session,
             )
     return insufficient
@@ -3002,12 +3021,13 @@ async def _compensate_stock(quantities: Dict[str, int], succeeded: List[str]) ->
             {"$inc": {"stock": quantities[product_id]}},
         )
         # Best-effort: if this put stock back above 0, flip stock_status
-        # back off "out_of_stock" so a rolled-back item doesn't get stuck
-        # looking unavailable. Not atomic with the $inc above (fallback
-        # path only - see _reserve_stock_for_order), but this is a rollback
-        # of our own just-made change, not a customer-facing race.
+        # back off "supplier_stock" (the value _decrement_stock_once just
+        # auto-set moments ago, above) so a rolled-back item doesn't get
+        # stuck looking like a backorder. Not atomic with the $inc above
+        # (fallback path only - see _reserve_stock_for_order), but this is a
+        # rollback of our own just-made change, not a customer-facing race.
         product = await db.shopify_products.find_one({"id": product_id}, {"stock": 1, "stock_status": 1})
-        if product and product.get("stock", 0) > 0 and product.get("stock_status") == "out_of_stock":
+        if product and product.get("stock", 0) > 0 and product.get("stock_status") == "supplier_stock":
             await db.shopify_products.update_one(
                 {"id": product_id},
                 {"$set": {"stock_status": "in_stock"}},
@@ -6088,6 +6108,20 @@ async def admin_create_product(request: Request, product_data: ProductCreate):
     now = datetime.utcnow()
     collections = build_collections(product_data.product_type, product_data.category, [])
     sanitized_description = sanitize_description_html(product_data.description)
+    # Same auto-derivation rule as every other stock-writing path (see
+    # _auto_derived_stock_status) - if the admin explicitly picked a
+    # stock_status while creating this product, that choice wins (even if
+    # it results in e.g. "in_stock" at stock=0). Otherwise, a freshly
+    # created product defaults to "in_stock"/"supplier_stock" derived from
+    # `stock` alone, rather than being left with stock_status=None (the
+    # ProductCreate default) the way ProductForm's "create" flow could
+    # previously leave it if staff didn't touch that field.
+    if product_data.stock_status is not None:
+        stock_status = product_data.stock_status
+    elif product_data.stock > 0:
+        stock_status = "in_stock"
+    else:
+        stock_status = _auto_derived_stock_status(product_data.stock) or "supplier_stock"
     product = {
         "id": product_id,
         "title": product_data.title,
@@ -6106,7 +6140,7 @@ async def admin_create_product(request: Request, product_data: ProductCreate):
         "product_type": product_data.product_type,
         "vendor": product_data.vendor,
         "stock": product_data.stock,
-        "stock_status": product_data.stock_status,
+        "stock_status": stock_status,
         "sku": product_data.sku,
         "compatible_models": product_data.compatible_models,
         "compatible_engines": product_data.compatible_engines,
@@ -6277,6 +6311,20 @@ async def _apply_product_update(
     # unchanged data - so every call here is a real edit and always stamps
     # updated_at, regardless of which fields the patch actually touched.
     update_dict["updated_at"] = datetime.utcnow()
+
+    # Automatic zero-stock -> supplier_stock enforcement (George,
+    # 2026-08-22, prompted by a live product found with stock=0 and
+    # stock_status="in_stock" that broke its product page). Only kicks in
+    # when THIS request touches `stock` (not e.g. a price-only edit) AND
+    # does NOT itself already set stock_status explicitly - "stock_status"
+    # is only present in update_dict here if product_data.stock_status
+    # was non-None, i.e. the admin genuinely chose it in this same request,
+    # which always wins over the automatic rule (see
+    # _auto_derived_stock_status's own docstring for the full policy).
+    if "stock" in update_dict and "stock_status" not in update_dict:
+        forced_status = _auto_derived_stock_status(update_dict["stock"], existing.get("stock_status"))
+        if forced_status:
+            update_dict["stock_status"] = forced_status
 
     if update_dict:
         await db.shopify_products.update_one({"id": product_id}, {"$set": update_dict})
@@ -6843,6 +6891,15 @@ async def admin_update_product(product_id: str, request: Request, product_data: 
         # Not a stored field itself (see _apply_product_update) - it's what
         # actually changes on the document when either of these is set.
         candidate_fields.append("collections")
+    if "stock" in candidate_fields and "stock_status" not in candidate_fields:
+        # stock_status wasn't itself submitted, but _apply_product_update
+        # may have force-set it to "supplier_stock" as a side effect of this
+        # same request (see its own auto-derivation block) - include it as a
+        # diff candidate so that automatic flip shows up in the audit log
+        # too, not just the stock number. _diff_changed_fields only adds it
+        # to before/after if the value actually changed, so this is a no-op
+        # whenever the auto-derivation didn't fire (e.g. stock stayed > 0).
+        candidate_fields.append("stock_status")
     before, after = _diff_changed_fields(existing, updated, candidate_fields)
 
     await _write_audit_log(
