@@ -33,6 +33,16 @@ but that's the same cached module object from sys.modules, so patching the
 class method here affects the real call site with no network access ever
 made either way.
 
+create_order() also queues sync_order_to_crm as a background task alongside
+the confirmation email, and scenario (a) below actually runs the queued
+background tasks via `await bt()` (to prove the email failure doesn't affect
+the order). That means sync_order_to_crm's real httpx.AsyncClient POST to
+CRM_API_URL would otherwise fire for real. patch_crm_config/restore_crm_config
+below mirror the exact same pattern used in
+scripts/test_checkout_invoice_toggle.py to swap server.CRM_API_URL and
+server.httpx.AsyncClient for fakes for the duration of that scenario, so no
+real network call to CRM (prod or otherwise) is ever made by this script.
+
 Run (from repo root): python scripts/test_order_confirmation_email.py
 """
 import asyncio
@@ -77,6 +87,57 @@ async def fresh_db():
     server.client = mock_client
     server.db = mock_db
     return mock_db
+
+
+class _FakeResponse:
+    def __init__(self, status_code=200, text="OK"):
+        self.status_code = status_code
+        self.text = text
+
+
+class _FakeAsyncClient:
+    """Captures every POST payload instead of hitting the network, same as
+    scripts/test_checkout_invoice_toggle.py's helper of the same name -
+    duplicated here (not imported) since this repo has no shared test-utils
+    module yet."""
+
+    captured = []
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def post(self, url, json=None, headers=None):
+        _FakeAsyncClient.captured.append({"url": url, "json": json, "headers": headers})
+        return _FakeResponse(status_code=200, text="OK")
+
+
+def patch_crm_config():
+    """Point server's module-level CRM_API_URL/CRM_INTEGRATION_KEY (read
+    directly, not via os.environ, inside sync_order_to_crm) at fake test
+    values, and swap httpx.AsyncClient for the capturing fake, so running
+    the queued sync_order_to_crm background task never hits the real CRM.
+    Returns the originals so callers can restore them."""
+    original_url = server.CRM_API_URL
+    original_key = server.CRM_INTEGRATION_KEY
+    original_client_cls = server.httpx.AsyncClient
+    server.CRM_API_URL = "https://fake-crm.example/api"
+    server.CRM_INTEGRATION_KEY = "fake-integration-key"
+    server.httpx.AsyncClient = _FakeAsyncClient
+    _FakeAsyncClient.captured = []
+    return original_url, original_key, original_client_cls
+
+
+def restore_crm_config(originals):
+    original_url, original_key, original_client_cls = originals
+    server.CRM_API_URL = original_url
+    server.CRM_INTEGRATION_KEY = original_key
+    server.httpx.AsyncClient = original_client_cls
 
 
 async def seed_product(db, product_id, stock=10, price=100.0, title="Piesă test"):
@@ -147,6 +208,7 @@ async def scenario_a_order_succeeds_even_if_email_send_raises():
     original_key = server.BREVO_API_KEY
     server.BREVO_API_KEY = "fake-test-key"
     original_send = patch_brevo_send(lambda email: (_ for _ in ()).throw(RuntimeError("simulated Brevo outage")))
+    original_crm_config = patch_crm_config()
     try:
         order_data = make_order_data("p1", quantity=2)
         bt = BackgroundTasks()
@@ -160,9 +222,12 @@ async def scenario_a_order_succeeds_even_if_email_send_raises():
         # Now actually run the queued background tasks (sync_order_to_crm +
         # _send_order_confirmation_email), exactly as Starlette would after
         # sending the response - must not raise despite the mocked Brevo
-        # failure.
+        # failure. sync_order_to_crm is redirected to the fake CRM client via
+        # patch_crm_config() above, so this never makes a real network call.
         await bt()
         check("a) background tasks (incl. failing email send) ran without raising", True)
+        check("a) CRM sync call was captured by the fake client, not sent over the network",
+              len(_FakeAsyncClient.captured) == 1, _FakeAsyncClient.captured)
 
         # The order document itself must be completely unaffected by the
         # email failure - no fields mutated by the email path.
@@ -171,6 +236,7 @@ async def scenario_a_order_succeeds_even_if_email_send_raises():
     finally:
         restore_brevo_send(original_send)
         server.BREVO_API_KEY = original_key
+        restore_crm_config(original_crm_config)
 
 
 async def scenario_b_confirmation_email_task_is_queued_alongside_crm_sync():
