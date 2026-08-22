@@ -95,14 +95,17 @@ async def scenario_a_sufficient_stock():
 
 async def scenario_b_exact_last_unit():
     """(b) order for exactly the last unit succeeds and stock hits 0 with
-    stock_status flipped to out_of_stock."""
+    stock_status auto-flipped to supplier_stock (George, 2026-08-22: a
+    product landing on 0 stock must never be silently left "in_stock" or
+    flipped to "out_of_stock" automatically - only "supplier_stock" is a
+    valid automatic outcome now, see _auto_derived_stock_status)."""
     db = await fresh_db()
     await seed_product(db, "p1", stock=1)
     items = [{"product_id": "p1", "quantity": 1, "price": 100.0}]
     await server._reserve_stock_for_order(items)
     doc = await db.shopify_products.find_one({"id": "p1"})
     check("b) stock reaches exactly 0", doc["stock"] == 0, f"got {doc['stock']}")
-    check("b) stock_status flips to out_of_stock", doc["stock_status"] == "out_of_stock", f"got {doc['stock_status']}")
+    check("b) stock_status auto-flips to supplier_stock", doc["stock_status"] == "supplier_stock", f"got {doc['stock_status']}")
 
 
 async def scenario_b2_supplier_stock_not_overwritten():
@@ -266,6 +269,31 @@ async def scenario_h_negative_quantity_rejected():
     check("h) stock NOT inflated", doc["stock"] == 5, f"got {doc['stock']}")
 
 
+async def scenario_i_rollback_flips_supplier_stock_back_to_in_stock():
+    """(extra) multi-item order where the first item's decrement lands
+    exactly on 0 (auto-flipping it to supplier_stock), then a later item
+    fails and the whole order rolls back via _compensate_stock - the first
+    item's stock must be restored AND its stock_status must flip back to
+    in_stock (not get stuck looking like a permanent backorder), mirroring
+    the same "out_of_stock" rollback this used to test before the
+    2026-08-22 supplier_stock policy change."""
+    db = await fresh_db()
+    await seed_product(db, "p1", stock=1)  # will hit exactly 0
+    await seed_product(db, "p2", stock=1)  # insufficient for the requested qty
+    items = [
+        {"product_id": "p1", "quantity": 1, "price": 100.0},
+        {"product_id": "p2", "quantity": 5, "price": 50.0},
+    ]
+    try:
+        await server._reserve_stock_for_order(items)
+        check("i) HTTPException raised", False, "no exception raised")
+    except server.HTTPException:
+        pass
+    doc1 = await db.shopify_products.find_one({"id": "p1"})
+    check("i) rolled-back item's stock restored to 1", doc1["stock"] == 1, f"got {doc1['stock']}")
+    check("i) rolled-back item's stock_status restored to in_stock", doc1["stock_status"] == "in_stock", f"got {doc1['stock_status']}")
+
+
 async def main():
     await scenario_a_sufficient_stock()
     await scenario_b_exact_last_unit()
@@ -277,6 +305,7 @@ async def main():
     await scenario_f_nonexistent_product()
     await scenario_g_no_transaction_support_fallback_confirmed()
     await scenario_h_negative_quantity_rejected()
+    await scenario_i_rollback_flips_supplier_stock_back_to_in_stock()
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
