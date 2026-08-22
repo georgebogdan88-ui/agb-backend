@@ -48,6 +48,19 @@ Covers:
       depends on server.py's logging.basicConfig() call, which happens later
       in module import order; this only proves the log call itself fires
       with the right count, not stdout visibility).
+  (f) Hard timeout: infisical_sdk's HTTP calls don't support a native
+      timeout (verified by reading infisical_requests.py in the installed
+      package - no timeout= on session.get/post), so a hung/slow response
+      from app.infisical.com could otherwise block the calling thread
+      forever. login() is mocked to sleep past a (patched-down, small)
+      INFISICAL_FETCH_TIMEOUT_SECONDS -> load_secrets_from_infisical() must
+      still return within a bounded, short time (not wait for the slow call
+      to actually finish), return 0, log a warning that explicitly mentions
+      "TIMEOUT" (distinguishable from a generic failure in Render's logs),
+      and leave os.environ untouched for the keys that would have been
+      populated. The real (production) INFISICAL_FETCH_TIMEOUT_SECONDS is
+      never used in this test - only a small patched value - so the test
+      itself stays fast.
 
 Run (from repo root): python scripts/test_infisical_bootstrap.py
 """
@@ -55,6 +68,7 @@ import io
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -318,6 +332,78 @@ def scenario_e_success_logs_info_with_count():
         _restore_env(env_snapshot)
 
 
+def scenario_f_hard_timeout_does_not_hang():
+    """(f) login() takes longer than the (patched-down) timeout plafon ->
+    load_secrets_from_infisical() must still return promptly (bounded by the
+    small patched plafon, not by the slow call's actual duration), returning
+    0, logging a warning that explicitly says TIMEOUT, and leaving os.environ
+    untouched. INFISICAL_FETCH_TIMEOUT_SECONDS is patched down to a small
+    value so this test doesn't wait for the real production plafon."""
+    env_snapshot = _snapshot_env(INFISICAL_ENV_KEYS + FAKE_SECRET_KEYS)
+    _clear(INFISICAL_ENV_KEYS + FAKE_SECRET_KEYS)
+    os.environ["INFISICAL_CLIENT_ID"] = "fake-client-id"
+    os.environ["INFISICAL_CLIENT_SECRET"] = "fake-client-secret"
+
+    # Small values so the test itself stays fast - never the real 10s
+    # production plafon (INFISICAL_FETCH_TIMEOUT_SECONDS is patched down for
+    # the duration of this scenario only).
+    TEST_TIMEOUT_SECONDS = 0.5
+    SLOW_LOGIN_SECONDS = 1.2
+
+    def slow_login(**kwargs):
+        time.sleep(SLOW_LOGIN_SECONDS)
+        return None
+
+    mock_instance = MagicMock()
+    mock_instance.auth.universal_auth.login.side_effect = slow_login
+    # Configured so that IF the leaked background thread eventually finishes
+    # after the test has already moved on, it hits a harmless empty-list
+    # path instead of iterating over an unconfigured MagicMock attribute.
+    mock_instance.secrets.list_secrets.return_value = make_mock_response([])
+
+    try:
+        logger = logging.getLogger("infisical_bootstrap")
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        logger.addHandler(handler)
+        previous_level = logger.level
+        logger.setLevel(logging.INFO)
+        try:
+            with patch("infisical_sdk.InfisicalSDKClient", return_value=mock_instance), \
+                 patch.object(infisical_bootstrap, "INFISICAL_FETCH_TIMEOUT_SECONDS", TEST_TIMEOUT_SECONDS):
+                start = time.monotonic()
+                result = infisical_bootstrap.load_secrets_from_infisical()
+                elapsed = time.monotonic() - start
+            log_output = stream.getvalue()
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(previous_level)
+
+        check("f) returns 0 when the fetch call hangs past the timeout plafon", result == 0, result)
+        check(
+            "f) returns promptly (bounded by the patched plafon), not by the slow call's full duration",
+            elapsed < SLOW_LOGIN_SECONDS,
+            f"elapsed={elapsed:.3f}s (slow login={SLOW_LOGIN_SECONDS}s, plafon={TEST_TIMEOUT_SECONDS}s)",
+        )
+        check(
+            "f) warning log explicitly mentions TIMEOUT (distinguishable from a generic failure)",
+            "TIMEOUT" in log_output,
+            log_output,
+        )
+        check(
+            "f) no fake secret keys were written to os.environ",
+            all(k not in os.environ for k in FAKE_SECRET_KEYS), dict(os.environ),
+        )
+    finally:
+        # Let the leaked background thread (still sleeping inside
+        # slow_login) finish naturally before moving on, so it can't bleed
+        # into a later scenario's log capture/env snapshot, and so the
+        # interpreter doesn't stall at exit waiting for concurrent.futures
+        # to join it.
+        time.sleep(SLOW_LOGIN_SECONDS)
+        _restore_env(env_snapshot)
+
+
 def main():
     scenario_a_not_configured_no_action()
     scenario_a2_partial_config_no_action()
@@ -326,6 +412,7 @@ def main():
     scenario_d_login_exception_does_not_crash()
     scenario_d2_list_secrets_exception_does_not_crash()
     scenario_e_success_logs_info_with_count()
+    scenario_f_hard_timeout_does_not_hang()
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:

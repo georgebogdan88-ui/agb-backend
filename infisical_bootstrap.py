@@ -21,13 +21,32 @@ Complet opt-in si fail-safe:
     trebuie niciodata sa opreasca pornirea serverului. La esec, comportamentul
     e identic cu "Infisical nici nu ar fi configurat" (fallback total la
     .env / mediul existent).
+  - Plafon dur de timp: pachetul infisicalsdk (verificat direct in
+    infisical_requests.py din venv/Lib/site-packages/infisical_sdk/) NU
+    seteaza niciun timeout pe cererile HTTP interne (session.get/post) catre
+    app.infisical.com. Fara o limita explicita, un raspuns agatat ar putea
+    bloca la nesfarsit thread-ul principal si, odata cu el, pornirea
+    intregului server. De aceea secventa login()+list_secrets() ruleaza
+    intr-un thread separat (ThreadPoolExecutor) cu un termen-limita dur
+    (INFISICAL_FETCH_TIMEOUT_SECONDS) - daca e depasit, comportamentul e
+    identic cu orice alta eroare: warning logat, return 0, pornirea
+    serverului continua neblocata. Thread-ul de fundal poate ramane activ
+    in continuare daca apelul chiar nu revine niciodata (Python nu suporta
+    omorarea fortata a thread-urilor native) - e un compromis acceptat,
+    important e ca procesul principal nu ramane blocat.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import os
 
 logger = logging.getLogger(__name__)
+
+# Plafon dur (wall-clock) pentru intreaga secventa login() + list_secrets().
+# Suficient pentru o cerere HTTP normala la pornire, dar nu atat cat sa
+# intarzie vizibil un deploy daca Infisical raspunde lent/deloc.
+INFISICAL_FETCH_TIMEOUT_SECONDS = 10
 
 # Proiectul Infisical "AGB Agroparts Solution" - ID-ul de proiect NU e secret
 # (vizibil oricui are acces la proiect in dashboard-ul Infisical), doar
@@ -62,7 +81,11 @@ def load_secrets_from_infisical() -> int:
     environment_slug = os.environ.get("INFISICAL_ENVIRONMENT", DEFAULT_INFISICAL_ENVIRONMENT)
     secret_path = os.environ.get("INFISICAL_SECRET_PATH", DEFAULT_INFISICAL_SECRET_PATH)
 
-    try:
+    def _fetch_and_apply_secrets() -> int:
+        """Ruleaza in thread-ul de fundal - login() + list_secrets() +
+        aplicarea rezultatelor in os.environ. Izolata intr-o functie proprie
+        ca sa poata fi trimisa in ThreadPoolExecutor si supusa unui plafon
+        dur de timp (SDK-ul nu suporta timeout nativ pe cererile HTTP)."""
         from infisical_sdk import InfisicalSDKClient
 
         client = InfisicalSDKClient(host=INFISICAL_HOST)
@@ -92,6 +115,20 @@ def load_secrets_from_infisical() -> int:
             loaded, project_id, environment_slug, secret_path,
         )
         return loaded
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="infisical-fetch")
+    try:
+        future = executor.submit(_fetch_and_apply_secrets)
+        return future.result(timeout=INFISICAL_FETCH_TIMEOUT_SECONDS)
+    except concurrent.futures.TimeoutError:
+        logger.warning(
+            "Infisical: mecanism configurat (INFISICAL_CLIENT_ID/SECRET prezente), dar incarcarea "
+            "secretelor a DEPASIT plafonul de %ds fara raspuns (TIMEOUT) - continui cu .env / mediul "
+            "existent, fara sa opresc pornirea. Thread-ul de fundal poate ramane activ in continuare "
+            "daca apelul chiar nu revine niciodata, dar procesul principal NU este blocat.",
+            INFISICAL_FETCH_TIMEOUT_SECONDS,
+        )
+        return 0
     except Exception as exc:  # noqa: BLE001 - orice eroare aici NU trebuie sa opreasca pornirea serverului
         logger.warning(
             "Infisical: mecanism configurat (INFISICAL_CLIENT_ID/SECRET prezente), dar incarcarea "
@@ -99,3 +136,10 @@ def load_secrets_from_infisical() -> int:
             "Detaliu: %s", exc,
         )
         return 0
+    finally:
+        # wait=False: NU asteptam ca thread-ul de fundal sa se termine (asta
+        # ar anula intreg scopul plafonului de mai sus, mai ales pe ramura de
+        # timeout, unde thread-ul chiar nu a revenit inca). Thread-ul poate
+        # ramane "leaked" daca apelul chiar nu se termina niciodata - acceptat
+        # explicit, Python nu suporta omorarea fortata a thread-urilor native.
+        executor.shutdown(wait=False)
