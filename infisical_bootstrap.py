@@ -114,6 +114,15 @@ def load_secrets_from_infisical() -> int:
             "Infisical: %d secret(e) incarcate din proiectul %s (environment=%s, path=%s)",
             loaded, project_id, environment_slug, secret_path,
         )
+        # print() redundant, necesar pentru ca acest apel ruleaza inainte de
+        # logging.basicConfig() din server.py - fara handler configurat,
+        # logger.info (nivel INFO) e inghitit silentios de handler-ul
+        # "last resort" al Python (care arata doar WARNING+), deci mesajul
+        # de succes ar deveni invizibil in logurile Render fara acest print.
+        print(
+            f"Infisical: {loaded} secret(e) incarcate din proiectul {project_id} "
+            f"(environment={environment_slug}, path={secret_path})"
+        )
         return loaded
 
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="infisical-fetch")
@@ -128,6 +137,7 @@ def load_secrets_from_infisical() -> int:
             "daca apelul chiar nu revine niciodata, dar procesul principal NU este blocat.",
             INFISICAL_FETCH_TIMEOUT_SECONDS,
         )
+        print(f"Infisical: TIMEOUT dupa {INFISICAL_FETCH_TIMEOUT_SECONDS}s, continui fara Infisical.")
         return 0
     except Exception as exc:  # noqa: BLE001 - orice eroare aici NU trebuie sa opreasca pornirea serverului
         logger.warning(
@@ -135,6 +145,7 @@ def load_secrets_from_infisical() -> int:
             "secretelor a esuat - continui cu .env / mediul existent, fara sa opresc pornirea. "
             "Detaliu: %s", exc,
         )
+        print(f"Infisical: EROARE la incarcare ({exc!r}), continui fara Infisical.")
         return 0
     finally:
         # wait=False: NU asteptam ca thread-ul de fundal sa se termine (asta
