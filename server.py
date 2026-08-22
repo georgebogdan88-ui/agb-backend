@@ -2732,6 +2732,28 @@ async def _get_authoritative_price(product_id: str, discount_percent: Optional[f
         price = round(price * (1 - discount_percent / 100), 2)
     return price
 
+async def _resolve_cart_session_id(candidate: Optional[str]) -> str:
+    """A cart session_id must originate from us, not be accepted blindly
+    from whatever a client (webshop/mobile) sends on its first cart
+    interaction - otherwise anyone could hand-pick their own id instead of
+    getting an unguessable one. If `candidate` already matches a cart or
+    order this server previously created/recognizes, reuse it as-is so an
+    already-active session keeps working (a live cart, a returning session
+    tied to a past order, or the id from an abandoned-cart email link).
+    Otherwise mint a fresh cryptographically-random id - same
+    secrets.token_urlsafe(32) primitive already used for password-reset
+    tokens elsewhere in this file - and return that instead. The caller
+    (add_to_cart) persists items under whatever id this returns, and the
+    response always carries the real id back to the client, which must
+    store/reuse it for later calls rather than keep resending its own
+    guess."""
+    if candidate:
+        if await db.cart.find_one({"session_id": candidate}, {"_id": 1}):
+            return candidate
+        if await db.orders.find_one({"session_id": candidate}, {"_id": 1}):
+            return candidate
+    return secrets.token_urlsafe(32)
+
 @api_router.get("/cart/{session_id}", response_model=List[CartItem])
 async def get_cart(session_id: str):
     """Get cart items for a session"""
@@ -2741,6 +2763,11 @@ async def get_cart(session_id: str):
 @api_router.post("/cart", response_model=CartItem)
 async def add_to_cart(item: CartItemCreate, request: Request):
     """Add item to cart"""
+    # Never trust a client-supplied session_id outright - see
+    # _resolve_cart_session_id. Must run before the existing-item lookup
+    # below so both read and write use the same (possibly replaced) id.
+    item.session_id = await _resolve_cart_session_id(item.session_id)
+
     # Resolve the logged-in user, if any, purely to stamp user_email for the
     # abandoned-cart email job below - same tolerant pattern as create_order
     # (missing/invalid token just means an anonymous cart, same as today).
@@ -4090,9 +4117,6 @@ async def create_order(order_data: OrderCreate, request: Request, background_tas
     background_tasks.add_task(_send_new_order_staff_notification, order)
     return order
 
-# NOTE: must stay registered *before* GET /orders/{session_id} below - same
-# literal-path-before-wildcard ordering gotcha as elsewhere in this file,
-# otherwise "mobile" would be swallowed as a session_id.
 @api_router.get("/orders/mobile")
 async def get_mobile_orders(request: Request, limit: int = 50):
     """Get orders created from the mobile app"""
@@ -4102,19 +4126,14 @@ async def get_mobile_orders(request: Request, limit: int = 50):
         order["_id"] = str(order["_id"])
     return orders
 
-@api_router.get("/orders/{session_id}", response_model=List[Order])
-async def get_orders(session_id: str):
-    """Get orders for a session"""
-    orders = await db.orders.find({"session_id": session_id}).sort("created_at", -1).to_list(100)
-    return [Order(**order) for order in orders]
-
-@api_router.get("/order/{order_id}", response_model=Order)
-async def get_order(order_id: str):
-    """Get a single order by ID"""
-    order = await db.orders.find_one({"id": order_id})
-    if not order:
-        raise HTTPException(status_code=404, detail="Comandă negăsită")
-    return Order(**order)
+# NOTE: GET /orders/{session_id} and GET /order/{order_id} used to live here,
+# unauthenticated (anyone who knew/guessed a session_id or order_id could
+# read a customer's full profile - name, email, phone, address, CUI).
+# Removed 2026-08-22 security audit: confirmed dead - no caller in
+# agb-webshop or agb-shopify/apps/mobile (mobile's OrdersScreen uses the
+# authenticated /auth/orders via fetchMyOrders; CheckoutScreen reads the
+# confirmation straight from the POST /orders response). Authenticated
+# admin lookup-by-id still exists at GET /admin/orders/{order_id} below.
 
 # ==================== SHOPIFY CHECKOUT ====================
 
