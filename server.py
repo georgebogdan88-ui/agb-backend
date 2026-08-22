@@ -12350,7 +12350,6 @@ async def debug_shopify_token(request: Request):
     return {
         "has_shopify_admin_token": has_token,
         "token_length": len(SHOPIFY_ADMIN_TOKEN) if SHOPIFY_ADMIN_TOKEN else 0,
-        "token_prefix": SHOPIFY_ADMIN_TOKEN[:10] + "..." if has_token else "NOT SET"
     }
 
 @api_router.get("/debug/customer-notes/{email}")
